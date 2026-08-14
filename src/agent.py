@@ -10,7 +10,7 @@
   analyze_hit(molecule_name)   : 对特定分子给出基于对接结果的解读
 
 这展示了"Agent 能自动编排 CADD 流水线并解释结果"的能力,
-也是简历里"LLM Agent 层"的核心。
+也是项目里"LLM Agent 层"的核心。
 """
 import json
 import sys

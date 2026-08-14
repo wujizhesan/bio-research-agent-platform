@@ -2,7 +2,6 @@
 
 一个在 Windows 上真实跑通的 **CADD（计算机辅助药物设计）虚拟筛选项目**：
 用 AutoDock Vina + RDKit 对 EGFR 靶点做分子对接筛选，外加一层 Agent 编排。
-可作为简历里"生物 + AI/Agent"方向的作品，用于投递 CADD/生信/医药数字化岗。
 
 ## 项目要解决什么
 
