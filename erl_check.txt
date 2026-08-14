@@ -1,3 +1,0 @@
-erlotinib SMILES 无法解析,需要修正
-
-对比错误糖分子: LogP=-3.61 芳环=0

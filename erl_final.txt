@@ -1,7 +1,0 @@
-Traceback (most recent call last):
-  File "<string>", line 14, in <module>
-UnicodeEncodeError: 'gbk' codec can't encode character '\u2705' in position 40: illegal multibyte sequence
-erlotinib (PubChem CID 176870) 解析 OK
-  分子式: C22H23N3O4
-  LogP=3.41 芳环数=2
-  HBD=1 HBA=7

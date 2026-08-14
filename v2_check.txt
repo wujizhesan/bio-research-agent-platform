@@ -1,5 +1,0 @@
-库 ok, 分子数: 17
-  [ML] 留一交叉验证 accuracy=1.00 AUC=1.00
-[viz] 打分图: output\vs_plot.png
-[viz] Top hit 结构图: output\top_mol.png
-ML+可视化 OK
