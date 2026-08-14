@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 运行产物
+output/
+*.log
+
+# 数据(大文件,不入 git;用脚本重新下载)
+data/*.pdb
+data/*.sdf
+data/pdbqt_*/
+
+# Vina exe(可从官方 release 重新下载,避免二进制入 git)
+tools/vina_*.exe
+
+# 密钥
+config.local.yaml
+.env

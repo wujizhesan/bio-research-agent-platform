@@ -1,0 +1,22 @@
+# CADD 虚拟筛选流水线配置
+receptor:
+  pdb_id: 4hjo          # EGFR 靶点 PDB ID
+  pdb_path: data/4hjo.pdb
+  box_center: [24.77, 9.19, 0.00]   # 来自 4HJO 共晶配体 AQ4 质心
+  box_size: [18.0, 18.0, 18.0]      # 结合口袋尺寸(Å),Vina 默认
+
+vina:
+  exe: tools/vina_1.2.7_win.exe
+  exhaustiveness: 6     # 搜索充分度,越大越准越慢(正式可调 8-16)
+
+library:
+  data_module: src/library_data.py   # 分子库定义(正/负对照)
+
+output:
+  dir: output
+  csv: top_hits.csv
+  report: report.md
+
+llm:                    # 可选的 LLM Agent 层(需可用 API key)
+  base_url: https://opencode.ai/zen/go
+  model: deepseek-v4-flash

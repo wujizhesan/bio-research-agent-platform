@@ -1,0 +1,14 @@
+  erlotinib   CID=176870 C22H23N3O4 LogP=3.4 芳环=2 HBD=1 -> OK
+  gefitinib   CID=123631 C22H24ClFN4O3 LogP=4.3 芳环=2 HBD=1 -> OK
+  osimertinib CID=71496458 C28H33N7O2 LogP=4.5 芳环=2 HBD=2 -> OK
+  afatinib    CID=10184653 C24H25ClFN5O3 LogP=4.4 芳环=2 HBD=2 -> OK
+  lapatinib   CID=208908 C29H26ClFN4O4S LogP=6.1 芳环=3 HBD=2 -> 可疑
+  icotinib    CID=22024915 C22H21N3O4 LogP=3.2 芳环=2 HBD=1 -> OK
+
+已验证的 EGFR 抑制剂: 6 个
+  erlotinib: COCCOC1=C(C=C2C(=C1)C(=NC=N2)NC3=CC=CC(=C3)C#C)OCCOC
+  gefitinib: COC1=C(C=C2C(=C1)N=CN=C2NC3=CC(=C(C=C3)F)Cl)OCCCN4CCOCC4
+  osimertinib: CN1C=C(C2=CC=CC=C21)C3=NC(=NC=C3)NC4=C(C=C(C(=C4)NC(=O)C=C)N(C)CCN(C)C)OC
+  afatinib: CN(C)CC=CC(=O)NC1=C(C=C2C(=C1)C(=NC=N2)NC3=CC(=C(C=C3)F)Cl)OC4CCOC4
+  lapatinib: CS(=O)(=O)CCNCC1=CC=C(O1)C2=CC3=C(C=C2)N=CN=C3NC4=CC(=C(C=C4)OCC5=CC(=CC=C5)F)Cl
+  icotinib: C#CC1=CC(=CC=C1)NC2=NC=NC3=CC4=C(C=C32)OCCOCCOCCO4

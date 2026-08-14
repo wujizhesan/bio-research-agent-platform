@@ -1,0 +1,7 @@
+erlotinib: CID=176870
+gefitinib: CID=123631
+osimertinib: CID=71496458
+afatinib: CID=10184653
+lapatinib: CID=208908
+icotinib: CID=22024915
+Ãû³Æ->CID Íê³É: {'erlotinib': 176870, 'gefitinib': 123631, 'osimertinib': 71496458, 'afatinib': 10184653, 'lapatinib': 208908, 'icotinib': 22024915}

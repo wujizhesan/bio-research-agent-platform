@@ -1,0 +1,18 @@
+=== 库: 17 个(活性 7 + 非活性 10) ===
+  [ACT] erlotinib        LogP=3.4  COCCOC1=C(C=C2C(=C1)C(=NC=N2)NC3=CC=CC(=C3)C#C)OCCOC
+  [ACT] gefitinib        LogP=4.3  COC1=C(C=C2C(=C1)N=CN=C2NC3=CC(=C(C=C3)F)Cl)OCCCN4CCOCC
+  [ACT] osimertinib      LogP=4.5  CN1C=C(C2=CC=CC=C21)C3=NC(=NC=C3)NC4=C(C=C(C(=C4)NC(=O)
+  [ACT] afatinib         LogP=4.4  CN(C)CC=CC(=O)NC1=C(C=C2C(=C1)C(=NC=N2)NC3=CC(=C(C=C3)F
+  [ACT] lapatinib        LogP=6.1  CS(=O)(=O)CCNCC1=CC=C(O1)C2=CC3=C(C=C2)N=CN=C3NC4=CC(=C
+  [ACT] icotinib         LogP=3.2  C#CC1=CC(=CC=C1)NC2=NC=NC3=CC4=C(C=C32)OCCOCCOCCO4
+  [ACT] AQ4              LogP=3.4  COCCOc1cc2c(cc1OCCOC)ncnc2Nc3cccc(c3)C#C
+  [INACT] ASPIRIN          LogP=1.3  O=C(C)Oc1ccccc1C(=O)O
+  [INACT] CAFFEINE         LogP=-1.0  CN1C=NC2=C1C(=O)N(C(=O)N2C)C
+  [INACT] ANILINE          LogP=1.3  Nc1ccccc1
+  [INACT] BENZAMIDE        LogP=0.8  NC(=O)c1ccccc1
+  [INACT] N_ACETYL_ANILINE LogP=1.6  CC(=O)NC1=CC=CC=C1
+  [INACT] ISOQUINOLINE     LogP=2.2  c1ccc2cnccc2c1
+  [INACT] NAPHTHALENE      LogP=2.8  c1ccc2ccccc2c1
+  [INACT] BIPHENYL         LogP=3.4  c1ccc(cc1)c1ccccc1
+  [INACT] PYRIDINE         LogP=1.1  c1ccncc1
+  [INACT] TOLUENE          LogP=2.0  Cc1ccccc1

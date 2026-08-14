@@ -1,0 +1,11 @@
+HTTP 200
+{
+ "PropertyTable": {
+  "Properties": [
+   {
+    "CID": 176870,
+    "ConnectivitySMILES": "COCCOC1=C(C=C2C(=C1)C(=NC=N2)NC3=CC=CC(=C3)C#C)OCCOC"
+   }
+  ]
+ }
+}

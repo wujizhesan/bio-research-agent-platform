@@ -1,0 +1,10 @@
+ERL: name=
+   SMILES=CCCCC(C(O)S(=O)(=O)O)N
+IRI: name=
+   SMILES=[NH3][Ir+3]([NH3])([NH3])([NH3])([NH3])[NH3]
+O2N: name=
+   SMILES=COc1ccc(cc1)C(c2ccc(cc2)OC)NC(=O)c3ccccc3CN(CC=C)Cc4ccc5c(c4C(=O)O)OCO5
+GEF: name=
+   SMILES=COc1cc(ccc1O)C2C3COC(C3CO2)c4ccc(c(c4)OC)O
+AQ4: name=
+   SMILES=COCCOc1cc2c(cc1OCCOC)ncnc2Nc3cccc(c3)C#C
