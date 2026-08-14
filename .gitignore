@@ -18,3 +18,6 @@ tools/vina_*.exe
 # 密钥
 config.local.yaml
 .env
+
+# 面试准备材料(仅本地学习,不公开)
+INTERVIEW_GUIDE.md
