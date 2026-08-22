@@ -1,5 +1,7 @@
 # Bio Research Agent Platform
 
+CI：GitHub Actions 会运行 Python 3.11/3.12 测试、Alembic 迁移、领域/工作流冒烟和 Docker 镜像构建。
+
 一个面向生物科研场景的可插拔 Agent 平台。平台通过统一的插件契约、领域注册表和工作流运行器，把 CADD、RNA-seq/Omics、mRNA 序列设计、文献证据和本地知识检索接入同一套 Agent 工具协议。
 
 许可证：MIT，见 [LICENSE](LICENSE)。
