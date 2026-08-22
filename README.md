@@ -52,6 +52,8 @@ alembic upgrade head
 
 `/metrics` 提供 Prometheus 格式的 HTTP 请求量、延迟、任务提交和任务状态指标。
 
+Redis Worker 单独在 `http://127.0.0.1:9000/metrics` 暴露队列深度、processing 深度、执行耗时、重试、缓存命中和当前执行数指标；可通过 `WORKER_METRICS_PUBLISHED_PORT` 修改本地端口。
+
 ```bash
 docker compose up --build
 curl http://127.0.0.1:8000/health

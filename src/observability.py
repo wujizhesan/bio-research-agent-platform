@@ -19,6 +19,41 @@ JOB_SUBMISSIONS = Counter(
 )
 JOB_STATUS = Gauge(
     'bio_agent_job_status',
-    'Latest observed job status, represented as one for the current status.',
+    'Latest observed job status, represented by one for the current status.',
     ['tool', 'status'],
+)
+REDIS_QUEUE_DEPTH = Gauge(
+    'bio_agent_redis_queue_depth',
+    'Current Redis job queue depth.',
+    ['namespace'],
+)
+REDIS_PROCESSING_DEPTH = Gauge(
+    'bio_agent_redis_processing_depth',
+    'Current Redis processing list depth.',
+    ['namespace'],
+)
+REDIS_JOB_EXECUTIONS = Counter(
+    'bio_agent_redis_job_executions_total',
+    'Redis worker job executions by final status.',
+    ['tool', 'status'],
+)
+REDIS_JOB_DURATION = Histogram(
+    'bio_agent_redis_job_duration_seconds',
+    'Redis worker job execution duration in seconds.',
+    ['tool'],
+)
+REDIS_JOB_RETRIES = Counter(
+    'bio_agent_redis_job_retries_total',
+    'Redis worker job retry attempts.',
+    ['tool'],
+)
+REDIS_RESULT_CACHE = Counter(
+    'bio_agent_redis_result_cache_total',
+    'Redis worker execution result cache outcomes.',
+    ['tool', 'outcome'],
+)
+REDIS_WORKER_ACTIVE = Gauge(
+    'bio_agent_redis_worker_active',
+    'Number of jobs currently executing in this Redis worker process.',
+    ['namespace'],
 )

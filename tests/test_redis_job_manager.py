@@ -3,6 +3,7 @@ import json
 from time import time
 import unittest
 from unittest.mock import patch
+from prometheus_client import generate_latest
 
 from src.redis_job_manager import RedisJobManager
 
@@ -68,6 +69,9 @@ class InMemoryRedis:
         self.lists[key] = kept
         return removed
 
+    def llen(self, key):
+        return len(self.lists[key])
+
     def close(self):
         return None
 
@@ -90,6 +94,10 @@ class RedisJobManagerTests(unittest.TestCase):
             stored = json.loads(redis.get(f'test:job:{first["job_id"]}'))
             self.assertEqual(stored['status'], 'completed')
             self.assertNotIn('_created_score', completed)
+            self.assertEqual(completed['attempts'], 1)
+            metrics = generate_latest().decode('utf-8')
+            self.assertIn('bio_agent_redis_job_executions_total', metrics)
+            self.assertIn('bio_agent_redis_result_cache_total', metrics)
         finally:
             manager.shutdown()
 

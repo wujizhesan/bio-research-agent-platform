@@ -11,9 +11,27 @@ from uuid import uuid4
 try:
     from .domain_registry import active_tool_specs, run_tool, tool_specs
     from .job_manager import TERMINAL_STATUSES
+    from .observability import (
+        REDIS_JOB_DURATION,
+        REDIS_JOB_EXECUTIONS,
+        REDIS_JOB_RETRIES,
+        REDIS_PROCESSING_DEPTH,
+        REDIS_QUEUE_DEPTH,
+        REDIS_RESULT_CACHE,
+        REDIS_WORKER_ACTIVE,
+    )
 except ImportError:
     from domain_registry import active_tool_specs, run_tool, tool_specs
     from job_manager import TERMINAL_STATUSES
+    from observability import (
+        REDIS_JOB_DURATION,
+        REDIS_JOB_EXECUTIONS,
+        REDIS_JOB_RETRIES,
+        REDIS_PROCESSING_DEPTH,
+        REDIS_QUEUE_DEPTH,
+        REDIS_RESULT_CACHE,
+        REDIS_WORKER_ACTIVE,
+    )
 
 
 def _now():
@@ -80,6 +98,7 @@ class RedisJobManager:
         output.pop('_worker_id', None)
         output.pop('_lease_until', None)
         output.pop('_execution_key', None)
+        output.pop('_started_epoch', None)
         if '_attempts' in record:
             output['attempts'] = record['_attempts']
         if record.get('_cancel_requested'):
@@ -130,6 +149,7 @@ class RedisJobManager:
             self.redis.set(self._idempotency_key(idempotency_key), job_id)
         self._save(record)
         self.redis.lpush(self._queue_key, job_id)
+        self._refresh_queue_metrics()
         return self._public_record(record)
 
     def submit(self, tool, arguments, idempotency_key=None):
@@ -215,11 +235,25 @@ class RedisJobManager:
             '_worker_id': self.worker_id,
             '_lease_until': time() + self.lease_seconds,
             '_attempts': int(record.get('_attempts', 0)) + 1,
+            '_started_epoch': time(),
         })
         self._save(record)
+        if record['_attempts'] > 1 or record.get('retry_of'):
+            REDIS_JOB_RETRIES.labels(record['tool']).inc()
+        REDIS_WORKER_ACTIVE.labels(self.namespace).inc()
 
     def _ack(self, job_id):
         self.redis.lrem(self._processing_key, 0, str(job_id))
+        self._refresh_queue_metrics()
+
+    def _refresh_queue_metrics(self):
+        try:
+            queue_size = self.redis.llen(self._queue_key)
+            processing_size = self.redis.llen(self._processing_key)
+        except Exception:
+            return
+        REDIS_QUEUE_DEPTH.labels(self.namespace).set(queue_size)
+        REDIS_PROCESSING_DEPTH.labels(self.namespace).set(processing_size)
 
     def _load_execution_result(self, execution_key):
         payload = self.redis.get(self._execution_result_key(execution_key))
@@ -261,9 +295,17 @@ class RedisJobManager:
         if current.get('_cancel_requested'):
             update = {'status': 'cancelled', 'finished_at': _now(), 'error': 'job cancelled by user'}
         current.update(update)
+        started_epoch = current.pop('_started_epoch', None)
+        if started_epoch is not None:
+            try:
+                REDIS_JOB_DURATION.labels(current['tool']).observe(max(time() - float(started_epoch), 0))
+            except (TypeError, ValueError):
+                pass
         current.pop('_worker_id', None)
         current.pop('_lease_until', None)
         self._save(current)
+        REDIS_JOB_EXECUTIONS.labels(current['tool'], current['status']).inc()
+        REDIS_WORKER_ACTIVE.labels(self.namespace).dec()
         return self._public_record(current)
 
     def recover_stale_jobs(self):
@@ -290,6 +332,7 @@ class RedisJobManager:
                     record.pop('error', None)
                     record.pop('_worker_id', None)
                     record.pop('_lease_until', None)
+                    record.pop('_started_epoch', None)
                     record.update({'status': 'queued', 'recovered_at': _now()})
                     self._save(record)
                     self.redis.lpush(self._queue_key, job_id)
@@ -297,6 +340,7 @@ class RedisJobManager:
                     recovered.append(job_id)
             except Exception:
                 continue
+        self._refresh_queue_metrics()
         return recovered
 
     def run_job(self, job_id):
@@ -316,7 +360,9 @@ class RedisJobManager:
         self._claim(record)
         cached = self._load_execution_result(record['_execution_key'])
         if cached is not None:
+            REDIS_RESULT_CACHE.labels(record['tool'], 'hit').inc()
             return self._finish(job_id, cached['result'])
+        REDIS_RESULT_CACHE.labels(record['tool'], 'miss').inc()
         try:
             result = run_tool(record['tool'], record.get('_arguments', {}))
             failed = isinstance(result, dict) and result.get('status') == 'error'
