@@ -63,6 +63,14 @@ curl http://127.0.0.1:8000/health
 
 Compose 会启动 FastAPI、PostgreSQL 和持久化数据卷；科学计算所需的大型受体、分子库和 Vina 可执行文件需要按项目说明另行挂载或准备。
 
+可用异步压测工具建立任务 API 基线：
+
+```bash
+python tools/load_test.py --base-url http://127.0.0.1:8000 --requests 50 --concurrency 10 --output output/load-test.json
+```
+
+报告包含提交延迟、终态延迟、完成率、错误分类和实际吞吐；建议先从小并发开始，再结合 Redis 队列深度和 Worker 指标逐步提高压力。
+
 Compose 同时提供 React 研究工作台，访问 `http://127.0.0.1:5173`；本地开发前端可运行：
 
 ```bash
