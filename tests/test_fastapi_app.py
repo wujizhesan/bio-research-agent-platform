@@ -70,6 +70,32 @@ class FastApiAppTests(unittest.TestCase):
             finally:
                 self._close_app(app)
 
+    def test_job_events_stream_reaches_terminal_state(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_events_') as raw:
+            app = self._app(raw)
+            try:
+                with TestClient(app) as client:
+                    response = client.post('/api/v1/jobs', json={'tool': 'research_catalog', 'arguments': {}})
+                    job_id = response.json()['job']['job_id']
+                    with client.stream('GET', f'/api/v1/jobs/{job_id}/events') as events:
+                        body = ''.join(events.iter_text())
+                        self.assertEqual(events.status_code, 200)
+                        self.assertEqual(events.headers['content-type'].split(';', 1)[0], 'text/event-stream')
+                    self.assertIn('event: job', body)
+                    self.assertIn('"status": "completed"', body)
+            finally:
+                self._close_app(app)
+
+    def test_job_events_returns_not_found(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_events_missing_') as raw:
+            app = self._app(raw)
+            try:
+                with TestClient(app) as client:
+                    response = client.get('/api/v1/jobs/missing/events')
+                    self.assertEqual(response.status_code, 404)
+            finally:
+                self._close_app(app)
+
 
 if __name__ == '__main__':
     unittest.main()

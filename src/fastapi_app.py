@@ -2,13 +2,16 @@
 from contextlib import asynccontextmanager
 import argparse
 import hmac
+import json
 import os
+import asyncio
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.responses import Response
@@ -145,6 +148,14 @@ def create_app(job_manager=None, plugin_manager=None, database=None):
     async def runs(limit: int = Query(default=20, ge=1, le=100)):
         return {'status': 'ok', 'runs': list_run_manifests(OUTPUT_ROOT, limit)}
 
+    async def read_job(job_id):
+        record = jobs.get(job_id)
+        if record is not None:
+            await db.upsert_job(record)
+            JOB_STATUS.labels(record['tool'], record['status']).set(1)
+            return record
+        return await db.get_job(job_id)
+
     @app.post('/api/v1/jobs', status_code=202, dependencies=[Depends(require_auth)], tags=['jobs'])
     async def submit_job(payload: JobCreate):
         try:
@@ -166,15 +177,47 @@ def create_app(job_manager=None, plugin_manager=None, database=None):
 
     @app.get('/api/v1/jobs/{job_id}', dependencies=[Depends(require_auth)], tags=['jobs'])
     async def get_job(job_id: str):
-        record = jobs.get(job_id)
-        if record is not None:
-            await db.upsert_job(record)
-            JOB_STATUS.labels(record['tool'], record['status']).set(1)
-        else:
-            record = await db.get_job(job_id)
+        record = await read_job(job_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f'job not found: {job_id}')
         return {'status': 'ok', 'job': record}
+
+    @app.get('/api/v1/jobs/{job_id}/events', dependencies=[Depends(require_auth)], tags=['jobs'])
+    async def job_events(
+        job_id: str,
+        interval_seconds: float = Query(default=0.2, ge=0.05, le=5),
+        timeout_seconds: float = Query(default=60, ge=1, le=300),
+    ):
+        if await read_job(job_id) is None:
+            raise HTTPException(status_code=404, detail=f'job not found: {job_id}')
+
+        async def stream():
+            last_signature = None
+            deadline = monotonic() + timeout_seconds
+            while True:
+                record = await read_job(job_id)
+                if record is None:
+                    payload = {'status': 'error', 'error': f'job not found: {job_id}'}
+                    yield f'event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n'
+                    return
+                signature = json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
+                if signature != last_signature:
+                    payload = {'status': 'ok', 'job': record}
+                    yield f'event: job\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n'
+                    last_signature = signature
+                if record.get('status') in {'completed', 'failed'}:
+                    return
+                if monotonic() >= deadline:
+                    payload = {'status': 'timeout', 'job': record}
+                    yield f'event: timeout\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n'
+                    return
+                await asyncio.sleep(interval_seconds)
+
+        return StreamingResponse(
+            stream(),
+            media_type='text/event-stream',
+            headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+        )
 
     @app.post('/api/v1/jobs/{job_id}/retry', status_code=202, dependencies=[Depends(require_auth)], tags=['jobs'])
     async def retry_job(job_id: str):

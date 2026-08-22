@@ -21,6 +21,8 @@ CADD 是当前最完整的科学计算领域实现，其他领域通过同一套
 
 平台同时提供 FastAPI 异步服务层，使用统一插件目录提交后台任务，并通过 OpenAPI 自动生成 `/docs`。本地直接运行时默认使用 SQLite 保存服务层任务读模型；Docker Compose 使用 PostgreSQL。
 
+提交后台任务后，可通过 `GET /api/v1/jobs/{job_id}/events` 使用 SSE 订阅状态变化，服务会推送 `queued`、`running` 和终态事件；接口支持 `interval_seconds`、`timeout_seconds` 查询参数。
+
 ```bash
 python -m pip install -e .
 bio-agent-api --port 8000
