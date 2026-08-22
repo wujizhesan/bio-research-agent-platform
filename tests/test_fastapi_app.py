@@ -36,6 +36,7 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(health.status_code, 200)
                     self.assertEqual(health.json()['database'], 'ok')
                     self.assertIn('/api/v1/jobs', client.get('/openapi.json').json()['paths'])
+                    self.assertIn('bio_agent_http_requests_total', client.get('/metrics').text)
             finally:
                 self._close_app(app)
 

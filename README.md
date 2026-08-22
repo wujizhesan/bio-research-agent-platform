@@ -26,6 +26,14 @@ bio-agent-api --port 8000
 
 服务启动后访问 `http://127.0.0.1:8000/docs`。配置 `CADD_API_TOKEN` 后，除 `/health` 外的 API 请求使用 `Authorization: Bearer <token>`。
 
+数据库迁移使用 Alembic：
+
+```bash
+alembic upgrade head
+```
+
+`/metrics` 提供 Prometheus 格式的 HTTP 请求量、延迟、任务提交和任务状态指标。
+
 ```bash
 docker compose up --build
 curl http://127.0.0.1:8000/health

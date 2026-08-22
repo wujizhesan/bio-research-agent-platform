@@ -78,8 +78,10 @@ class Database:
         self.sessions = async_sessionmaker(self.engine, class_=AsyncSession, expire_on_commit=False)
 
     async def init_schema(self):
-        async with self.engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
+        auto_create = os.environ.get('AUTO_CREATE_SCHEMA', 'true').lower() in {'1', 'true', 'yes'}
+        if auto_create:
+            async with self.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
 
     async def ping(self):
         async with self.engine.connect() as connection:

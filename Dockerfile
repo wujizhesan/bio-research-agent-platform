@@ -17,7 +17,9 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY . .
 
-RUN mkdir -p /app/output
+RUN mkdir -p /app/output \
+    && chmod +x /app/docker-entrypoint.sh
 
 EXPOSE 8000
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["uvicorn", "src.fastapi_app:app", "--host", "0.0.0.0", "--port", "8000"]

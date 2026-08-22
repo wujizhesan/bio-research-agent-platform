@@ -10,6 +10,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, sta
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from starlette.responses import Response
 
 try:
     from .api_server import list_run_manifests
@@ -17,12 +19,14 @@ try:
     from .domain_registry import active_tool_specs
     from .job_manager import JobManager
     from .plugin_manager import PluginManager
+    from .observability import HTTP_LATENCY, HTTP_REQUESTS, JOB_STATUS, JOB_SUBMISSIONS
 except ImportError:
     from api_server import list_run_manifests
     from database import Database
     from domain_registry import active_tool_specs
     from job_manager import JobManager
     from plugin_manager import PluginManager
+    from observability import HTTP_LATENCY, HTTP_REQUESTS, JOB_STATUS, JOB_SUBMISSIONS
 
 
 API_NAME = 'bio-research-agent-api'
@@ -98,6 +102,22 @@ def create_app(job_manager=None, plugin_manager=None, database=None):
         allow_headers=['Authorization', 'Content-Type'],
     )
 
+    @app.middleware('http')
+    async def metrics_middleware(request: Request, call_next):
+        from time import perf_counter
+        started = perf_counter()
+        response = None
+        try:
+            response = await call_next(request)
+            return response
+        finally:
+            if request.url.path != '/metrics':
+                route = request.scope.get('route')
+                path = getattr(route, 'path', request.url.path)
+                status_code = str(response.status_code if response is not None else 500)
+                HTTP_REQUESTS.labels(request.method, path, status_code).inc()
+                HTTP_LATENCY.labels(request.method, path).observe(perf_counter() - started)
+
     @app.get('/health', tags=['system'])
     async def health():
         try:
@@ -105,6 +125,10 @@ def create_app(job_manager=None, plugin_manager=None, database=None):
         except Exception as exc:
             return JSONResponse(status_code=503, content={'status': 'degraded', 'database': 'unavailable', 'error': str(exc)})
         return {'status': 'ok', 'service': API_NAME, 'version': API_VERSION, 'database': 'ok'}
+
+    @app.get('/metrics', dependencies=[Depends(require_auth)], tags=['system'])
+    async def metrics():
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     @app.get('/api/v1/plugins', dependencies=[Depends(require_auth)], tags=['catalog'])
     async def plugins_catalog():
@@ -128,6 +152,8 @@ def create_app(job_manager=None, plugin_manager=None, database=None):
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         await db.upsert_job(record)
+        JOB_SUBMISSIONS.labels(payload.tool).inc()
+        JOB_STATUS.labels(payload.tool, record['status']).set(1)
         return {'status': 'accepted', 'job': record}
 
     @app.get('/api/v1/jobs', dependencies=[Depends(require_auth)], tags=['jobs'])
@@ -135,6 +161,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None):
         records = jobs.list(limit)
         for record in records:
             await db.upsert_job(record)
+            JOB_STATUS.labels(record['tool'], record['status']).set(1)
         return {'status': 'ok', 'jobs': records}
 
     @app.get('/api/v1/jobs/{job_id}', dependencies=[Depends(require_auth)], tags=['jobs'])
@@ -142,6 +169,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None):
         record = jobs.get(job_id)
         if record is not None:
             await db.upsert_job(record)
+            JOB_STATUS.labels(record['tool'], record['status']).set(1)
         else:
             record = await db.get_job(job_id)
         if record is None:
@@ -155,6 +183,8 @@ def create_app(job_manager=None, plugin_manager=None, database=None):
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         await db.upsert_job(record)
+        JOB_SUBMISSIONS.labels(record['tool']).inc()
+        JOB_STATUS.labels(record['tool'], record['status']).set(1)
         return {'status': 'accepted', 'job': record}
 
     return app

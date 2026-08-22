@@ -24,8 +24,9 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}
       CADD_API_TOKEN: ${CADD_API_TOKEN:-change-me-in-development}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      AUTO_CREATE_SCHEMA: "false"
     ports:
-      - "8000:8000"
+      - "${API_PUBLISHED_PORT:-8000}:8000"
     volumes:
       - ./output:/app/output
 
