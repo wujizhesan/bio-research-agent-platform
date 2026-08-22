@@ -1,5 +1,6 @@
 import os
 import asyncio
+import json
 import tempfile
 import time
 import unittest
@@ -8,6 +9,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from src.audit_log import AuditLogger
 from src.database import Database
 from src.file_storage import LocalFileStorage
 from src.fastapi_app import create_app
@@ -16,12 +18,13 @@ from src.plugin_manager import PluginManager
 
 
 class FastApiAppTests(unittest.TestCase):
-    def _app(self, root, file_storage=None):
+    def _app(self, root, file_storage=None, audit_log=None):
         app = create_app(
             job_manager=JobManager(max_workers=1, store_path=Path(root) / 'jobs.sqlite3'),
             plugin_manager=PluginManager(state_path=Path(root) / 'plugins.json'),
             database=Database(f"sqlite+aiosqlite:///{(Path(root) / 'api.sqlite3').as_posix()}"),
             file_storage=file_storage,
+            audit_log=audit_log or AuditLogger(Path(root) / 'audit.jsonl'),
         )
         return app
 
@@ -71,6 +74,47 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(client.get('/api/v1/jobs').status_code, 200)
             finally:
                 self._close_app(app)
+
+    def test_jwt_login_and_role_permissions(self):
+        users = {
+            'alice': {'password': 'secret', 'roles': ['researcher']},
+            'admin': {'password': 'admin-secret', 'roles': ['admin']},
+        }
+        with tempfile.TemporaryDirectory(prefix='fastapi_jwt_') as raw:
+            env = {
+                'CADD_API_TOKEN': '',
+                'CADD_JWT_SECRET': 'test-secret-' * 4,
+                'CADD_AUTH_USERS_JSON': json.dumps(users),
+                'AUTH_TOKEN_TTL_SECONDS': '3600',
+            }
+            with patch.dict(os.environ, env, clear=False):
+                app = self._app(raw)
+                try:
+                    with TestClient(app) as client:
+                        self.assertEqual(client.get('/api/v1/plugins').status_code, 401)
+                        alice_response = client.post('/api/v1/auth/token', data={'username': 'alice', 'password': 'secret'})
+                        self.assertEqual(alice_response.status_code, 200)
+                        alice_token = alice_response.json()['access_token']
+                        alice_headers = {'Authorization': f'Bearer {alice_token}'}
+                        self.assertEqual(client.get('/api/v1/plugins', headers=alice_headers).status_code, 200)
+                        self.assertEqual(
+                            client.post('/api/v1/plugins/cadd/state', json={'enabled': False}, headers=alice_headers).status_code,
+                            403,
+                        )
+
+                        admin_response = client.post('/api/v1/auth/token', data={'username': 'admin', 'password': 'admin-secret'})
+                        self.assertEqual(admin_response.status_code, 200)
+                        admin_headers = {'Authorization': f"Bearer {admin_response.json()['access_token']}"}
+                        changed = client.post('/api/v1/plugins/cadd/state', json={'enabled': False}, headers=admin_headers)
+                        self.assertEqual(changed.status_code, 200)
+                        client.post('/api/v1/plugins/cadd/state', json={'enabled': True}, headers=admin_headers)
+
+                        events = [json.loads(line) for line in (Path(raw) / 'audit.jsonl').read_text(encoding='utf-8').splitlines()]
+                        self.assertIn('auth.login', {event['action'] for event in events})
+                        self.assertIn('plugin.state_change', {event['action'] for event in events})
+                        self.assertIn('admin', {event['actor'] for event in events})
+                finally:
+                    self._close_app(app)
 
     def test_idempotency_header_deduplicates_submission(self):
         with tempfile.TemporaryDirectory(prefix='fastapi_idempotency_') as raw:

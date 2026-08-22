@@ -23,6 +23,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}
       CADD_API_TOKEN: ${CADD_API_TOKEN:-change-me-in-development}
+      CADD_JWT_SECRET: ${CADD_JWT_SECRET:-}
+      CADD_AUTH_USERS_JSON: ${CADD_AUTH_USERS_JSON:-}
+      AUTH_TOKEN_TTL_SECONDS: ${AUTH_TOKEN_TTL_SECONDS:-3600}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
       UPLOAD_ROOT: ${UPLOAD_ROOT:-/app/output/uploads}
       UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-52428800}

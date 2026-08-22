@@ -1,7 +1,6 @@
 """FastAPI service adapter for the pluggable research Agent platform."""
 from contextlib import asynccontextmanager
 import argparse
-import hmac
 import json
 import os
 import asyncio
@@ -12,12 +11,15 @@ from typing import Any
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.responses import Response
 
 try:
     from .api_server import list_run_manifests
+    from .audit_log import AuditLogger
+    from .auth import AuthService, AuthenticationError, Principal
     from .database import Database
     from .domain_registry import active_tool_specs
     from .file_storage import LocalFileStorage
@@ -26,6 +28,8 @@ try:
     from .observability import HTTP_LATENCY, HTTP_REQUESTS, JOB_STATUS, JOB_SUBMISSIONS
 except ImportError:
     from api_server import list_run_manifests
+    from audit_log import AuditLogger
+    from auth import AuthService, AuthenticationError, Principal
     from database import Database
     from domain_registry import active_tool_specs
     from file_storage import LocalFileStorage
@@ -45,14 +49,21 @@ class JobCreate(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
 
 
+class PluginStateUpdate(BaseModel):
+    enabled: bool
+
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl='/api/v1/auth/token', auto_error=False)
+
+
 def _authorized(request: Request, authorization=None):
-    configured = os.environ.get('CADD_API_TOKEN')
-    if not configured or request.url.path == '/health':
+    if request.url.path == '/health':
         return True
-    scheme, _, supplied = (authorization or '').partition(' ')
-    return scheme.lower() == 'bearer' and bool(supplied.strip()) and hmac.compare_digest(
-        supplied.strip(), configured
-    )
+    try:
+        AuthService.from_env().authenticate(authorization)
+    except (AuthenticationError, ValueError):
+        return False
+    return True
 
 
 async def require_auth(request: Request, authorization: str | None = Header(default=None)):
@@ -72,13 +83,15 @@ def _public_specs(domain=None):
     ]
 
 
-def create_app(job_manager=None, plugin_manager=None, database=None, file_storage=None):
+def create_app(job_manager=None, plugin_manager=None, database=None, file_storage=None, audit_log=None):
     owned_job_manager = job_manager is None
     owned_plugin_manager = plugin_manager is None
     owned_database = database is None
     jobs = job_manager or JobManager(store_path=OUTPUT_ROOT / 'jobs.sqlite3')
     plugins = plugin_manager or PluginManager(state_path=OUTPUT_ROOT / 'plugin_state.json')
     db = database or Database()
+    auth = AuthService.from_env()
+    audit = audit_log or AuditLogger(OUTPUT_ROOT / 'audit.jsonl')
     configured_upload_root = os.environ.get('UPLOAD_ROOT')
     upload_root = Path(configured_upload_root) if configured_upload_root else OUTPUT_ROOT / 'uploads'
     if not upload_root.is_absolute():
@@ -107,6 +120,8 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
     app.state.plugin_manager = plugins
     app.state.database = db
     app.state.file_storage = storage
+    app.state.audit_log = audit
+    app.state.auth_service = auth
     origins = [item.strip() for item in os.environ.get(
         'CORS_ORIGINS',
         'http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174',
@@ -135,6 +150,24 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
                 HTTP_REQUESTS.labels(request.method, path, status_code).inc()
                 HTTP_LATENCY.labels(request.method, path).observe(perf_counter() - started)
 
+    async def current_principal(token: str | None = Depends(oauth2_scheme)):
+        authorization = f'Bearer {token}' if token else None
+        try:
+            return auth.authenticate(authorization)
+        except AuthenticationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=str(exc),
+                headers={'WWW-Authenticate': 'Bearer'},
+            ) from exc
+
+    def require_permission(permission):
+        async def dependency(principal: Principal = Depends(current_principal)):
+            if not auth.has_permission(principal, permission):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='insufficient permissions')
+            return principal
+        return dependency
+
     @app.get('/health', tags=['system'])
     async def health():
         try:
@@ -143,44 +176,74 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
             return JSONResponse(status_code=503, content={'status': 'degraded', 'database': 'unavailable', 'error': str(exc)})
         return {'status': 'ok', 'service': API_NAME, 'version': API_VERSION, 'database': 'ok'}
 
-    @app.get('/metrics', dependencies=[Depends(require_auth)], tags=['system'])
+    @app.post('/api/v1/auth/token', tags=['auth'])
+    async def issue_token(form_data: OAuth2PasswordRequestForm = Depends()):
+        try:
+            payload = auth.issue_token(form_data.username, form_data.password)
+        except AuthenticationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=str(exc),
+                headers={'WWW-Authenticate': 'Bearer'},
+            ) from exc
+        principal_data = payload['principal']
+        audit.record(
+            Principal(principal_data['sub'], tuple(principal_data['roles']), principal_data['auth_type']),
+            'auth.login',
+            'auth',
+            metadata={'auth_type': 'jwt'},
+        )
+        return payload
+
+    @app.get('/metrics', dependencies=[Depends(require_permission('metrics:read'))], tags=['system'])
     async def metrics():
         return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-    @app.get('/api/v1/plugins', dependencies=[Depends(require_auth)], tags=['catalog'])
+    @app.get('/api/v1/plugins', dependencies=[Depends(require_permission('catalog:read'))], tags=['catalog'])
     async def plugins_catalog():
         return {'status': 'ok', 'plugins': plugins.list()}
 
-    @app.get('/api/v1/tools', dependencies=[Depends(require_auth)], tags=['catalog'])
+    @app.get('/api/v1/tools', dependencies=[Depends(require_permission('catalog:read'))], tags=['catalog'])
     async def tools_catalog(domain: str = Query(default='all')):
         try:
             return {'status': 'ok', 'tools': _public_specs(domain)}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.get('/api/v1/runs', dependencies=[Depends(require_auth)], tags=['runs'])
+    @app.get('/api/v1/runs', dependencies=[Depends(require_permission('runs:read'))], tags=['runs'])
     async def runs(limit: int = Query(default=20, ge=1, le=100)):
         return {'status': 'ok', 'runs': list_run_manifests(OUTPUT_ROOT, limit)}
 
-    @app.post('/api/v1/files', status_code=201, dependencies=[Depends(require_auth)], tags=['files'])
-    async def upload_file(upload: UploadFile = File(...)):
+    @app.post('/api/v1/files', status_code=201, tags=['files'])
+    async def upload_file(
+        upload: UploadFile = File(...),
+        principal: Principal = Depends(require_permission('files:write')),
+    ):
         try:
             stored = await storage.save(upload)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         finally:
             await upload.close()
+        audit.record(
+            principal,
+            'file.upload',
+            'file',
+            stored.file_id,
+            {'filename': stored.filename, 'size_bytes': stored.size_bytes, 'sha256': stored.sha256},
+        )
         return {
             'status': 'uploaded',
             'file': storage.payload(stored, PROJECT_ROOT, f'/api/v1/files/{stored.file_id}'),
         }
 
-    @app.get('/api/v1/files/{file_id}', dependencies=[Depends(require_auth)], tags=['files'])
-    async def download_file(file_id: str):
+    @app.get('/api/v1/files/{file_id}', tags=['files'])
+    async def download_file(file_id: str, principal: Principal = Depends(require_permission('files:read'))):
         try:
             stored = storage.get(file_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=f'file not found: {file_id}') from exc
+        audit.record(principal, 'file.download', 'file', file_id, {'filename': stored.filename})
         return FileResponse(
             stored.path,
             media_type=stored.content_type,
@@ -196,10 +259,11 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
             return record
         return await db.get_job(job_id)
 
-    @app.post('/api/v1/jobs', status_code=202, dependencies=[Depends(require_auth)], tags=['jobs'])
+    @app.post('/api/v1/jobs', status_code=202, tags=['jobs'])
     async def submit_job(
         payload: JobCreate,
         idempotency_key: str | None = Header(default=None, alias='Idempotency-Key'),
+        principal: Principal = Depends(require_permission('jobs:write')),
     ):
         try:
             record = jobs.submit(payload.tool, payload.arguments, idempotency_key=idempotency_key)
@@ -209,9 +273,16 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         if not record.get('deduplicated'):
             JOB_SUBMISSIONS.labels(payload.tool).inc()
         JOB_STATUS.labels(payload.tool, record['status']).set(1)
+        audit.record(
+            principal,
+            'job.submit',
+            'job',
+            record['job_id'],
+            {'tool': payload.tool, 'deduplicated': bool(record.get('deduplicated'))},
+        )
         return {'status': 'deduplicated' if record.get('deduplicated') else 'accepted', 'job': record}
 
-    @app.get('/api/v1/jobs', dependencies=[Depends(require_auth)], tags=['jobs'])
+    @app.get('/api/v1/jobs', dependencies=[Depends(require_permission('jobs:read'))], tags=['jobs'])
     async def list_jobs(limit: int = Query(default=20, ge=1, le=100)):
         records = jobs.list(limit)
         for record in records:
@@ -219,14 +290,14 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
             JOB_STATUS.labels(record['tool'], record['status']).set(1)
         return {'status': 'ok', 'jobs': records}
 
-    @app.get('/api/v1/jobs/{job_id}', dependencies=[Depends(require_auth)], tags=['jobs'])
+    @app.get('/api/v1/jobs/{job_id}', dependencies=[Depends(require_permission('jobs:read'))], tags=['jobs'])
     async def get_job(job_id: str):
         record = await read_job(job_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f'job not found: {job_id}')
         return {'status': 'ok', 'job': record}
 
-    @app.get('/api/v1/jobs/{job_id}/events', dependencies=[Depends(require_auth)], tags=['jobs'])
+    @app.get('/api/v1/jobs/{job_id}/events', dependencies=[Depends(require_permission('jobs:read'))], tags=['jobs'])
     async def job_events(
         job_id: str,
         interval_seconds: float = Query(default=0.2, ge=0.05, le=5),
@@ -263,8 +334,8 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
             headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
         )
 
-    @app.post('/api/v1/jobs/{job_id}/cancel', status_code=202, dependencies=[Depends(require_auth)], tags=['jobs'])
-    async def cancel_job(job_id: str):
+    @app.post('/api/v1/jobs/{job_id}/cancel', status_code=202, tags=['jobs'])
+    async def cancel_job(job_id: str, principal: Principal = Depends(require_permission('jobs:write'))):
         try:
             record = jobs.cancel(job_id)
         except ValueError as exc:
@@ -272,11 +343,12 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
             raise HTTPException(status_code=status_code, detail=str(exc)) from exc
         await db.upsert_job(record)
         JOB_STATUS.labels(record['tool'], record['status']).set(1)
+        audit.record(principal, 'job.cancel', 'job', job_id, {'status': record['status']})
         response_status = 'already_terminal' if record['status'] in {'completed', 'failed', 'cancelled'} else 'cancelled' if record['status'] == 'cancelled' else 'cancellation_requested'
         return {'status': response_status, 'job': record}
 
-    @app.post('/api/v1/jobs/{job_id}/retry', status_code=202, dependencies=[Depends(require_auth)], tags=['jobs'])
-    async def retry_job(job_id: str):
+    @app.post('/api/v1/jobs/{job_id}/retry', status_code=202, tags=['jobs'])
+    async def retry_job(job_id: str, principal: Principal = Depends(require_permission('jobs:write'))):
         try:
             record = jobs.retry(job_id)
         except ValueError as exc:
@@ -284,7 +356,21 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         await db.upsert_job(record)
         JOB_SUBMISSIONS.labels(record['tool']).inc()
         JOB_STATUS.labels(record['tool'], record['status']).set(1)
+        audit.record(principal, 'job.retry', 'job', record['job_id'], {'retry_of': job_id})
         return {'status': 'accepted', 'job': record}
+
+    @app.post('/api/v1/plugins/{domain}/state', tags=['catalog'])
+    async def update_plugin_state(
+        domain: str,
+        payload: PluginStateUpdate,
+        principal: Principal = Depends(require_permission('plugins:write')),
+    ):
+        try:
+            plugin = plugins.set_enabled(domain, payload.enabled)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        audit.record(principal, 'plugin.state_change', 'plugin', domain, {'enabled': payload.enabled})
+        return {'status': 'ok', 'plugin': plugin}
 
     return app
 

@@ -32,7 +32,15 @@ python -m pip install -e .
 bio-agent-api --port 8000
 ```
 
-服务启动后访问 `http://127.0.0.1:8000/docs`。配置 `CADD_API_TOKEN` 后，除 `/health` 外的 API 请求使用 `Authorization: Bearer <token>`。
+服务启动后访问 `http://127.0.0.1:8000/docs`。开发环境可以配置 `CADD_API_TOKEN` 使用兼容的管理员 Token；生产环境建议配置至少 32 字符的 `CADD_JWT_SECRET` 和 `CADD_AUTH_USERS_JSON`，通过 `POST /api/v1/auth/token` 获取 JWT。角色支持 `admin`、`researcher` 和 `viewer`，任务提交、文件上传下载和插件状态变更会写入 `output/audit.jsonl`。
+
+JWT 用户配置示例：
+
+```json
+{"alice":{"password_hash":"pbkdf2_sha256$310000$<salt>$<digest>","roles":["researcher"]}}
+```
+
+`src.auth.hash_password("your-password")` 可以生成 PBKDF2 密码哈希。旧版明文 `password` 字段仅适合本地演示。
 
 数据库迁移使用 Alembic：
 
