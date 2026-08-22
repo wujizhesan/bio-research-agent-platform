@@ -2,7 +2,7 @@
 
 import asyncio
 import os
-from queue import Queue
+from queue import Empty, Queue
 from threading import Event, Thread
 
 try:
@@ -17,6 +17,14 @@ _STOP = object()
 class DatabaseStateWriter:
     def __init__(self, database_url=None):
         self.database_url = database_url or os.environ.get('DATABASE_URL')
+        try:
+            self.batch_size = max(int(os.environ.get('STATE_WRITER_BATCH_SIZE', '50')), 1)
+        except (TypeError, ValueError):
+            self.batch_size = 50
+        try:
+            self.batch_wait_seconds = max(float(os.environ.get('STATE_WRITER_BATCH_WAIT_MS', '20')) / 1000, 0)
+        except (TypeError, ValueError):
+            self.batch_wait_seconds = 0.02
         self._queue = Queue()
         self._ready = Event()
         self._error = None
@@ -40,12 +48,31 @@ class DatabaseStateWriter:
                 if record is _STOP:
                     self._queue.task_done()
                     break
+                batch = [record]
+                stop_requested = False
+                deadline = asyncio.get_running_loop().time() + self.batch_wait_seconds
+                while len(batch) < self.batch_size:
+                    timeout = deadline - asyncio.get_running_loop().time()
+                    if timeout <= 0:
+                        break
+                    try:
+                        next_record = await asyncio.to_thread(self._queue.get, True, timeout)
+                    except Empty:
+                        break
+                    if next_record is _STOP:
+                        self._queue.task_done()
+                        stop_requested = True
+                        break
+                    batch.append(next_record)
                 try:
-                    await database.upsert_job(record)
+                    await database.upsert_jobs(batch)
                 except Exception as exc:
                     self._error = exc
                 finally:
-                    self._queue.task_done()
+                    for _ in batch:
+                        self._queue.task_done()
+                if stop_requested:
+                    break
         except Exception as exc:
             self._error = exc
             self._ready.set()

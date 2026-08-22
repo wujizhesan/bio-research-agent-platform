@@ -66,6 +66,27 @@ def _row_values(record):
     }
 
 
+def _coalesced_values(records):
+    values = {}
+    for record in records:
+        values[record['job_id']] = _row_values(record)
+    return list(values.values())
+
+
+def _configured_int(name, default, minimum):
+    try:
+        return max(int(os.environ.get(name, default)), minimum)
+    except (TypeError, ValueError):
+        return default
+
+
+def _configured_float(name, default, minimum):
+    try:
+        return max(float(os.environ.get(name, default)), minimum)
+    except (TypeError, ValueError):
+        return default
+
+
 def _public_row(row):
     output = {
         'job_id': row.job_id,
@@ -88,7 +109,14 @@ class Database:
         self.url = normalize_database_url(url)
         if self.url.startswith('sqlite'):
             (PROJECT_ROOT / 'output').mkdir(parents=True, exist_ok=True)
-        self.engine = create_async_engine(self.url, pool_pre_ping=True)
+        engine_options = {'pool_pre_ping': True}
+        if self.url.startswith('postgresql'):
+            engine_options.update({
+                'pool_size': _configured_int('DB_POOL_SIZE', 10, 1),
+                'max_overflow': _configured_int('DB_MAX_OVERFLOW', 10, 0),
+                'pool_timeout': _configured_float('DB_POOL_TIMEOUT', 30.0, 1.0),
+            })
+        self.engine = create_async_engine(self.url, **engine_options)
         self.sessions = async_sessionmaker(self.engine, class_=AsyncSession, expire_on_commit=False)
 
     async def init_schema(self):
@@ -117,26 +145,36 @@ class Database:
             await connection.execute(text('SELECT 1'))
 
     async def upsert_job(self, record):
-        values = _row_values(record)
+        await self.upsert_jobs([record])
+
+    async def upsert_jobs(self, records):
+        values_list = _coalesced_values(records)
+        if not values_list:
+            return
+        if not self.url.startswith('postgresql'):
+            for values in values_list:
+                await self._upsert_sqlite_values(values)
+            return
         async with self.sessions() as session:
-            if self.url.startswith('postgresql'):
-                statement = postgres_insert(JobRow).values(**values)
-                updates = {
-                    key: getattr(statement.excluded, key)
-                    for key in values
-                    if key != 'job_id'
-                }
-                statement = statement.on_conflict_do_update(
-                    index_elements=[JobRow.job_id],
-                    set_=updates,
-                    where=or_(
-                        ~JobRow.status.in_(TERMINAL_STATUSES),
-                        statement.excluded.status.in_(TERMINAL_STATUSES),
-                    ),
-                )
-                await session.execute(statement)
-                await session.commit()
-                return
+            statement = postgres_insert(JobRow).values(values_list)
+            updates = {
+                key: getattr(statement.excluded, key)
+                for key in values_list[0]
+                if key != 'job_id'
+            }
+            statement = statement.on_conflict_do_update(
+                index_elements=[JobRow.job_id],
+                set_=updates,
+                where=or_(
+                    ~JobRow.status.in_(TERMINAL_STATUSES),
+                    statement.excluded.status.in_(TERMINAL_STATUSES),
+                ),
+            )
+            await session.execute(statement)
+            await session.commit()
+
+    async def _upsert_sqlite_values(self, values):
+        async with self.sessions() as session:
             row = await session.get(JobRow, values['job_id'])
             if row is None:
                 try:

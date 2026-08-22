@@ -17,6 +17,27 @@ from src.job_manager import JobManager
 from src.plugin_manager import PluginManager
 
 
+class RedisReadJobManager:
+    backend = 'redis'
+
+    def __init__(self):
+        self.read_count = 0
+
+    def get(self, job_id):
+        self.read_count += 1
+        return {
+            'job_id': job_id,
+            'tool': 'research_catalog',
+            'status': 'completed',
+            'created_at': '2026-08-23T00:00:00+00:00',
+            'result': {'status': 'ok'},
+            'attempts': 1,
+        }
+
+    def shutdown(self):
+        return None
+
+
 class FastApiAppTests(unittest.TestCase):
     def _app(self, root, file_storage=None, audit_log=None):
         app = create_app(
@@ -42,6 +63,24 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(health.json()['database'], 'ok')
                     self.assertIn('/api/v1/jobs', client.get('/openapi.json').json()['paths'])
                     self.assertIn('bio_agent_http_requests_total', client.get('/metrics').text)
+            finally:
+                self._close_app(app)
+
+    def test_redis_job_reads_use_redis_before_database(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_redis_read_') as raw:
+            manager = RedisReadJobManager()
+            app = create_app(
+                job_manager=manager,
+                plugin_manager=PluginManager(state_path=Path(raw) / 'plugins.json'),
+                database=Database(f"sqlite+aiosqlite:///{(Path(raw) / 'api.sqlite3').as_posix()}"),
+                audit_log=AuditLogger(Path(raw) / 'audit.jsonl'),
+            )
+            try:
+                with TestClient(app) as client:
+                    response = client.get('/api/v1/jobs/redis-job')
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json()['job']['status'], 'completed')
+                    self.assertEqual(manager.read_count, 1)
             finally:
                 self._close_app(app)
 

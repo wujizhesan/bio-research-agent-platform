@@ -270,16 +270,17 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
 
     async def read_job(job_id):
         if app.state.job_backend == 'redis':
-            record = await db.get_job(job_id)
+            try:
+                record = jobs.get(job_id)
+            except Exception:
+                record = None
             if record is not None:
                 JOB_STATUS.labels(record['tool'], record['status']).set(1)
                 return record
-            record = jobs.get(job_id)
+            record = await db.get_job(job_id)
             if record is not None:
-                await db.upsert_job(record)
                 JOB_STATUS.labels(record['tool'], record['status']).set(1)
-                return await db.get_job(job_id) or record
-            return None
+            return record
         record = jobs.get(job_id)
         if record is not None:
             await db.upsert_job(record)

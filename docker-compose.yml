@@ -32,6 +32,9 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
       CADD_API_TOKEN: ${CADD_API_TOKEN:-change-me-in-development}
       CADD_JWT_SECRET: ${CADD_JWT_SECRET:-}
       CADD_AUTH_USERS_JSON: ${CADD_AUTH_USERS_JSON:-}
@@ -70,6 +73,9 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
       CADD_API_TOKEN: ${CADD_API_TOKEN:-change-me-in-development}
       CADD_JWT_SECRET: ${CADD_JWT_SECRET:-}
       CADD_AUTH_USERS_JSON: ${CADD_AUTH_USERS_JSON:-}
@@ -80,6 +86,8 @@ services:
       JOB_RESULT_TTL_SECONDS: ${JOB_RESULT_TTL_SECONDS:-86400}
       RUN_MIGRATIONS: "false"
       AUTO_CREATE_SCHEMA: "false"
+      STATE_WRITER_BATCH_SIZE: ${STATE_WRITER_BATCH_SIZE:-50}
+      STATE_WRITER_BATCH_WAIT_MS: ${STATE_WRITER_BATCH_WAIT_MS:-20}
       WORKER_METRICS_HOST: ${WORKER_METRICS_HOST:-0.0.0.0}
       WORKER_METRICS_PORT: ${WORKER_METRICS_PORT:-9000}
       MRNA_FORGE_ROOT: ${MRNA_FORGE_ROOT:-}
