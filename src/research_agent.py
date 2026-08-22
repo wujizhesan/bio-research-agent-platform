@@ -62,6 +62,11 @@ RESEARCH_PRESETS = {
         'domains': ['omics', 'literature', 'knowledge', 'sequence'],
         'description': 'RNA-seq analysis, local evidence retrieval, knowledge retrieval, report generation and mRNA sequence design.',
     },
+    'rnaseq_research_agent': {
+        'path': 'examples/workflows/rnaseq_research_agent.yaml',
+        'domains': ['omics'],
+        'description': 'End-to-end RNA-seq analysis with differential expression, pathway enrichment, evidence retrieval and a traceable report.',
+    },
 }
 
 

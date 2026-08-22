@@ -1,0 +1,11 @@
+name: rnaseq-research-agent-demo
+steps:
+  - id: omics_analysis
+    tool: omics_run_analysis
+    args:
+      expression_csv: examples/rnaseq/expression.csv
+      metadata_csv: examples/rnaseq/metadata.csv
+      gene_sets_csv: examples/rnaseq/gene_sets.csv
+      output_dir: output/rnaseq_research_agent
+      evidence_csv: examples/rnaseq/evidence.csv
+      evidence_provider: local

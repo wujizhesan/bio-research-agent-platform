@@ -1,6 +1,7 @@
 import unittest
 
 from src.domain_registry import available_domains, run_tool
+from src.workflow_runner import load_workflow
 
 
 class ResearchAgentTests(unittest.TestCase):
@@ -22,6 +23,7 @@ class ResearchAgentTests(unittest.TestCase):
         presets = run_tool('research_presets', {})
         self.assertEqual(presets['status'], 'ok')
         self.assertEqual(presets['presets'][0]['id'], 'bgi_research_demo')
+        self.assertIn('rnaseq_research_agent', {item['id'] for item in presets['presets']})
         result = run_tool('research_run_preset', {
             'preset': 'bgi_research_demo',
             'dry_run': True,
@@ -32,6 +34,15 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(result['selected_domains'], ['omics', 'literature', 'knowledge', 'sequence'])
         self.assertEqual(result['manifest']['completed_steps'], 8)
         self.assertEqual(result['report']['status'], 'ok')
+        omics_result = run_tool('research_run_preset', {
+            'preset': 'rnaseq_research_agent',
+            'dry_run': True,
+            'output_path': 'output/test_rnaseq_preset_manifest.json',
+            'report_path': 'output/test_rnaseq_preset_report.md',
+        })
+        self.assertEqual(omics_result['status'], 'planned')
+        self.assertEqual(omics_result['selected_domains'], ['omics'])
+        self.assertEqual(omics_result['manifest']['completed_steps'], 1)
 
     def test_research_execute_dry_run_is_domain_scoped(self):
         workflow = {
@@ -52,6 +63,17 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(result['selected_domains'], ['sequence'])
         self.assertEqual(result['manifest']['completed_steps'], 1)
         self.assertTrue(result['provenance']['dry_run'])
+
+    def test_rnaseq_agent_workflow_is_dry_runnable(self):
+        result = run_tool('research_execute', {
+            'workflow': load_workflow('examples/workflows/rnaseq_research_agent.yaml'),
+            'domains': ['omics'],
+            'dry_run': True,
+            'output_path': 'output/test_rnaseq_agent_manifest.json',
+        })
+        self.assertEqual(result['status'], 'planned')
+        self.assertEqual(result['selected_domains'], ['omics'])
+        self.assertEqual(result['manifest']['completed_steps'], 1)
 
 
 if __name__ == '__main__':

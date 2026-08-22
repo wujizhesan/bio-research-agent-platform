@@ -133,6 +133,9 @@ python -m venv .venv
 .venv/Scripts/python -m src.workflow_runner --workflow examples/workflows/rnaseq.yaml --dry-run --out output/workflow_demo_dry/workflow_manifest.json
 .venv/Scripts/python -m src.workflow_runner --workflow examples/workflows/rnaseq.yaml --out output/workflow_demo/workflow_manifest.json
 
+# End-to-end RNA-seq research Agent workflow
+.venv/Scripts/python -m src.workflow_runner --workflow examples/workflows/rnaseq_research_agent.yaml --out output/rnaseq_research_agent/workflow_manifest.json
+
 # Use live UniProt or PubMed evidence with a local response cache
 .venv/Scripts/python -m src.omics_agent --expression examples/rnaseq/expression.csv --metadata examples/rnaseq/metadata.csv --gene-sets examples/rnaseq/gene_sets.csv --evidence-provider uniprot --cache-dir output/uniprot_cache --out-dir output/rnaseq_uniprot
 .venv/Scripts/python -m src.omics_agent --expression examples/rnaseq/expression.csv --metadata examples/rnaseq/metadata.csv --gene-sets examples/rnaseq/gene_sets.csv --evidence-provider pubmed --cache-dir output/pubmed_cache --out-dir output/rnaseq_pubmed

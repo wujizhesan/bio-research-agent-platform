@@ -96,7 +96,10 @@ def create_app(job_manager=None, plugin_manager=None, database=None):
     app.state.job_manager = jobs
     app.state.plugin_manager = plugins
     app.state.database = db
-    origins = [item.strip() for item in os.environ.get('CORS_ORIGINS', 'http://localhost:5173').split(',') if item.strip()]
+    origins = [item.strip() for item in os.environ.get(
+        'CORS_ORIGINS',
+        'http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174',
+    ).split(',') if item.strip()]
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,

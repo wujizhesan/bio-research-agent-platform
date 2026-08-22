@@ -11,7 +11,7 @@ from scipy.stats import hypergeom, ttest_ind
 PLUGIN_NAME = 'RNA-seq and omics domain'
 PLUGIN_VERSION = '0.1.0'
 PLUGIN_API_VERSION = 1
-PLUGIN_CAPABILITIES = ('omics.differential_expression', 'omics.pathway', 'omics.report')
+PLUGIN_CAPABILITIES = ('omics.end_to_end', 'omics.differential_expression', 'omics.pathway', 'omics.evidence', 'omics.report')
 
 
 
@@ -297,6 +297,22 @@ def _parameters(properties, required=()):
 
 
 TOOLS = {
+    'run_analysis': {
+        'description': 'Run an end-to-end RNA-seq research analysis with differential expression, pathway enrichment, evidence retrieval and a traceable report.',
+        'parameters': _parameters({
+            'expression_csv': {'type': 'string'},
+            'metadata_csv': {'type': 'string'},
+            'gene_sets_csv': {'type': 'string'},
+            'output_dir': {'type': 'string'},
+            'evidence_csv': {'type': 'string'},
+            'condition_a': {'type': 'string'},
+            'condition_b': {'type': 'string'},
+            'evidence_provider': {'type': 'string', 'enum': ['local', 'uniprot', 'pubmed']},
+            'evidence_cache_dir': {'type': 'string'},
+            'evidence_timeout': {'type': 'number'},
+        }, required=('expression_csv', 'metadata_csv', 'gene_sets_csv', 'output_dir')),
+        'function': run_omics_analysis,
+    },
     'run_differential_expression': {
         'description': 'Run a reproducible two-condition RNA-seq differential expression analysis.',
         'parameters': _parameters({

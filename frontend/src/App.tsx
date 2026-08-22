@@ -218,6 +218,49 @@ function App() {
     }
   }
 
+  async function submitOmicsDemo() {
+    setLoading(true)
+    setError('')
+    setEvents([])
+    try {
+      const response = await apiFetch<{ job: Job }>(apiBase, token, '/api/v1/jobs', {
+        method: 'POST',
+        headers: { 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({
+          tool: 'omics_run_analysis',
+          arguments: {
+            expression_csv: 'examples/rnaseq/expression.csv',
+            metadata_csv: 'examples/rnaseq/metadata.csv',
+            gene_sets_csv: 'examples/rnaseq/gene_sets.csv',
+            output_dir: 'output/frontend_rnaseq_demo',
+            evidence_csv: 'examples/rnaseq/evidence.csv',
+            evidence_provider: 'local',
+          },
+        }),
+      })
+      const job = response.job
+      setSelectedJob(job)
+      setJobs((current) => [job, ...current.filter((item) => item.job_id !== job.job_id)])
+      setEvents([{ at: formatTime(new Date().toISOString()), type: 'accepted', status: 'queued', detail: 'RNA-seq Agent 已进入执行队列' }])
+      await followJob(apiBase, token, job.job_id, (type, data) => {
+        if (!data.job) return
+        setSelectedJob(data.job)
+        setJobs((current) => [data.job!, ...current.filter((item) => item.job_id !== data.job!.job_id)])
+        setEvents((current) => [...current, {
+          at: formatTime(new Date().toISOString()),
+          type,
+          status: data.job!.status,
+          detail: type === 'timeout' ? 'SSE 订阅超时，任务仍可通过列表查询' : `状态更新为${statusLabels[data.job!.status] || data.job!.status}`,
+        }])
+      })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'RNA-seq Agent 执行失败')
+    } finally {
+      setLoading(false)
+      void refresh()
+    }
+  }
+
   async function cancelSelectedJob() {
     if (!selectedJob || !['queued', 'running'].includes(selectedJob.status) || selectedJob.cancel_requested) return
     setError('')
@@ -289,6 +332,8 @@ function App() {
                   <Metric label="LIVE RUNS" value={String(runningJobs).padStart(2, '0')} icon={<Radio size={14} />} />
                 </div>
               </section>
+
+              <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#28524b] bg-[#102b2a]/70 px-5 py-4"><div><div className="font-mono text-[10px] tracking-[0.16em] text-[#8fe5c1]">INTERVIEW DEMO / RNA-SEQ AGENT</div><div className="mt-1 text-sm text-[#b4cdc6]">差异表达 → 通路富集 → 基因证据 → 可追溯报告</div></div><button onClick={() => void submitOmicsDemo()} disabled={loading} className="rounded-lg bg-[#8fe5c1] px-3 py-2 text-xs font-semibold text-[#092521] transition hover:bg-[#b8f4d8] disabled:cursor-not-allowed disabled:opacity-50">运行 RNA-seq Agent</button></div>
 
               {selectedJob && ['queued', 'running'].includes(selectedJob.status) && <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#5c4930] bg-[#211d16] px-5 py-4"><div className="flex items-center gap-3"><Ban size={16} className="text-[#e6c875]" /><div><div className="text-sm font-medium text-[#f1dfaa]">任务控制</div><div className="mt-1 text-xs text-[#aa9767]">排队中的任务会立即取消，运行中的任务采用协作式取消。</div></div></div><button onClick={() => void cancelSelectedJob()} disabled={selectedJob.cancel_requested} className="rounded-lg border border-[#80643c] px-3 py-2 text-xs font-medium text-[#f1d889] transition hover:bg-[#392d1c] disabled:cursor-not-allowed disabled:opacity-50">{selectedJob.cancel_requested ? '取消请求已发送' : '取消任务'}</button></div>}
 

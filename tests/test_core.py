@@ -255,6 +255,7 @@ class CoreTests(unittest.TestCase):
         names = {spec['name'] for spec in specs}
         self.assertIn('cadd_run_screening', names)
         self.assertIn('omics_run_differential_expression', names)
+        self.assertIn('omics_run_analysis', names)
         self.assertEqual(len(names), len(specs))
         custom_tools = {'ping': {'description': 'Ping', 'parameters': {'type': 'object'}, 'function': lambda: {'status': 'ok'}}}
         self.assertIs(validate_tool_map('custom', custom_tools), custom_tools)
@@ -323,6 +324,15 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(result['report']['n_evidence_matches'], 1)
             self.assertTrue((out_dir / 'omics_manifest.json').exists())
             self.assertIn('run_differential_expression', OMICS_TOOLS)
+            agent_result = run_omics_tool('run_analysis', {
+                'expression_csv': str(expression_path),
+                'metadata_csv': str(metadata_path),
+                'gene_sets_csv': str(gene_sets_path),
+                'output_dir': str(root / 'agent_out'),
+                'evidence_csv': str(evidence_path),
+            })
+            self.assertEqual(agent_result['status'], 'completed')
+            self.assertEqual(agent_result['report']['n_evidence_matches'], 1)
             tool_result = run_omics_tool('unknown', {})
             self.assertEqual(tool_result['status'], 'error')
 
