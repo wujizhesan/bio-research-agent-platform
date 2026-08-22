@@ -45,6 +45,14 @@ curl http://127.0.0.1:8000/health
 
 Compose 会启动 FastAPI、PostgreSQL 和持久化数据卷；科学计算所需的大型受体、分子库和 Vina 可执行文件需要按项目说明另行挂载或准备。
 
+Compose 同时提供 React 研究工作台，访问 `http://127.0.0.1:5173`；本地开发前端可运行：
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
 ## 项目要解决什么
 
 虚拟筛选（Virtual Screening）的核心价值：

@@ -30,5 +30,14 @@ services:
     volumes:
       - ./output:/app/output
 
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    depends_on:
+      - api
+    ports:
+      - "${WEB_PUBLISHED_PORT:-5173}:80"
+
 volumes:
   bioagent_pgdata:

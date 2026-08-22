@@ -26,6 +26,12 @@ INTERVIEW_GUIDE.md
 
 .venv-chainlit/
 
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
 .playwright-cli/
 
 # Local collaboration and UI state
