@@ -23,7 +23,7 @@ CADD 是当前最完整的科学计算领域实现，其他领域通过同一套
 
 提交后台任务后，可通过 `GET /api/v1/jobs/{job_id}/events` 使用 SSE 订阅状态变化，服务会推送 `queued`、`running` 和终态事件；接口支持 `interval_seconds`、`timeout_seconds` 查询参数。
 
-任务执行支持两种后端：本地开发默认使用进程内线程池；Compose 默认启用 Redis 队列和独立 Worker。API 通过 `JOB_BACKEND=redis` 切换 Redis 模式，Worker 使用 `python -m src.worker` 启动，任务状态和队列可在多个 API/Worker 实例之间共享。Worker 使用 processing 列表和租约实现至少一次投递，进程崩溃后会自动回收过期任务；可通过 `JOB_LEASE_SECONDS` 调整租约时长。
+任务执行支持两种后端：本地开发默认使用进程内线程池；Compose 默认启用 Redis 队列和独立 Worker。API 通过 `JOB_BACKEND=redis` 切换 Redis 模式，Worker 使用 `python -m src.worker` 启动，任务状态和队列可在多个 API/Worker 实例之间共享。Worker 使用 processing 列表和租约实现至少一次投递，进程崩溃后会自动回收过期任务；可通过 `JOB_LEASE_SECONDS` 调整租约时长。每个任务还会缓存成功执行结果，恢复同一任务时优先复用缓存；缓存保留时间由 `JOB_RESULT_TTL_SECONDS` 控制。
 
 研究输入可以通过 `POST /api/v1/files` 以 multipart 上传。服务端按扩展名和大小校验文件，使用随机文件 ID 隔离目录并记录 SHA-256；上传响应中的 `path` 可直接作为 `research_plan` 的输入，`GET /api/v1/files/{file_id}` 用于下载。默认限制为 50 MiB，可通过 `UPLOAD_ROOT` 和 `UPLOAD_MAX_BYTES` 配置。
 

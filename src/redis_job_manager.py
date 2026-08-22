@@ -23,7 +23,7 @@ def _now():
 class RedisJobManager:
     backend = 'redis'
 
-    def __init__(self, redis_url=None, namespace=None, redis_client=None, lease_seconds=None, worker_id=None):
+    def __init__(self, redis_url=None, namespace=None, redis_client=None, lease_seconds=None, worker_id=None, result_ttl_seconds=None):
         if redis_client is None:
             try:
                 import redis
@@ -40,6 +40,11 @@ class RedisJobManager:
             self.lease_seconds = max(int(configured_lease), 1)
         except (TypeError, ValueError):
             self.lease_seconds = 300
+        configured_ttl = result_ttl_seconds or os.environ.get('JOB_RESULT_TTL_SECONDS', '86400')
+        try:
+            self.result_ttl_seconds = max(int(configured_ttl), 60)
+        except (TypeError, ValueError):
+            self.result_ttl_seconds = 86400
         self.worker_id = worker_id or f'worker-{uuid4().hex}'
         self._lock = Lock()
         self.redis.ping()
@@ -62,6 +67,9 @@ class RedisJobManager:
     def _idempotency_key(self, value):
         return f'{self.namespace}:jobs:idempotency:{value}'
 
+    def _execution_result_key(self, value):
+        return f'{self.namespace}:jobs:execution:{value}'
+
     @staticmethod
     def _public_record(record):
         output = dict(record)
@@ -71,6 +79,7 @@ class RedisJobManager:
         output.pop('idempotency_key', None)
         output.pop('_worker_id', None)
         output.pop('_lease_until', None)
+        output.pop('_execution_key', None)
         if '_attempts' in record:
             output['attempts'] = record['_attempts']
         if record.get('_cancel_requested'):
@@ -112,6 +121,7 @@ class RedisJobManager:
             '_arguments': dict(arguments),
             '_cancel_requested': False,
             '_created_score': time(),
+            '_execution_key': uuid4().hex,
         }
         if retry_of:
             record['retry_of'] = retry_of
@@ -211,6 +221,51 @@ class RedisJobManager:
     def _ack(self, job_id):
         self.redis.lrem(self._processing_key, 0, str(job_id))
 
+    def _load_execution_result(self, execution_key):
+        payload = self.redis.get(self._execution_result_key(execution_key))
+        if not payload:
+            return None
+        if isinstance(payload, bytes):
+            payload = payload.decode('utf-8')
+        return json.loads(payload)
+
+    def _store_execution_result(self, execution_key, result):
+        payload = json.dumps({'result': result}, ensure_ascii=False, default=str)
+        key = self._execution_result_key(execution_key)
+        try:
+            stored = self.redis.set(key, payload, ex=self.result_ttl_seconds, nx=True)
+        except TypeError:
+            stored = self.redis.set(key, payload)
+        if stored is False or stored is None:
+            cached = self._load_execution_result(execution_key)
+            return cached['result'] if cached else result
+        return result
+
+    def _finish(self, job_id, result, failed=False):
+        update = {
+            'status': 'failed' if failed else 'completed',
+            'finished_at': _now(),
+            'result': result,
+        }
+        if failed:
+            update['error'] = result.get('error', 'tool returned an error')
+        current = self._load(str(job_id))
+        if current is None:
+            return None
+        if (
+            current.get('status') == 'running'
+            and current.get('_worker_id') not in (None, self.worker_id)
+            and self._lease_active(current)
+        ):
+            return self._public_record(current)
+        if current.get('_cancel_requested'):
+            update = {'status': 'cancelled', 'finished_at': _now(), 'error': 'job cancelled by user'}
+        current.update(update)
+        current.pop('_worker_id', None)
+        current.pop('_lease_until', None)
+        self._save(current)
+        return self._public_record(current)
+
     def recover_stale_jobs(self):
         processing_ids = self.redis.lrange(self._processing_key, 0, -1)
         recovered = []
@@ -259,33 +314,17 @@ class RedisJobManager:
             self._save(record)
             return self.get(job_id)
         self._claim(record)
+        cached = self._load_execution_result(record['_execution_key'])
+        if cached is not None:
+            return self._finish(job_id, cached['result'])
         try:
             result = run_tool(record['tool'], record.get('_arguments', {}))
             failed = isinstance(result, dict) and result.get('status') == 'error'
-            update = {
-                'status': 'failed' if failed else 'completed',
-                'finished_at': _now(),
-                'result': result,
-            }
-            if failed:
-                update['error'] = result.get('error', 'tool returned an error')
+            if not failed:
+                result = self._store_execution_result(record['_execution_key'], result)
         except Exception as exc:
-            update = {'status': 'failed', 'finished_at': _now(), 'error': str(exc)}
-        current = self._load(str(job_id))
-        if current is not None:
-            if (
-                current.get('status') == 'running'
-                and current.get('_worker_id') not in (None, self.worker_id)
-                and self._lease_active(current)
-            ):
-                return self._public_record(current)
-            if current.get('_cancel_requested'):
-                update = {'status': 'cancelled', 'finished_at': _now(), 'error': 'job cancelled by user'}
-            current.update(update)
-            current.pop('_worker_id', None)
-            current.pop('_lease_until', None)
-            self._save(current)
-        return self.get(job_id)
+            return self._finish(job_id, {'status': 'error', 'error': str(exc)}, failed=True)
+        return self._finish(job_id, result, failed=failed)
 
     def run_forever(self, poll_timeout=5):
         self.recover_stale_jobs()

@@ -2,6 +2,7 @@ from collections import defaultdict
 import json
 from time import time
 import unittest
+from unittest.mock import patch
 
 from src.redis_job_manager import RedisJobManager
 
@@ -15,7 +16,9 @@ class InMemoryRedis:
     def ping(self):
         return True
 
-    def set(self, key, value):
+    def set(self, key, value, **options):
+        if options.get('nx') and key in self.values:
+            return None
         self.values[key] = value
         return True
 
@@ -110,6 +113,26 @@ class RedisJobManagerTests(unittest.TestCase):
             completed = manager.run_job(submitted['job_id'])
             self.assertEqual(completed['status'], 'completed')
             self.assertEqual(completed['attempts'], 1)
+        finally:
+            manager.shutdown()
+
+    def test_recovered_job_reuses_successful_execution_result(self):
+        redis = InMemoryRedis()
+        manager = RedisJobManager(redis_client=redis, namespace='test', worker_id='first-worker')
+        try:
+            submitted = manager.submit('research_catalog', {})
+            first = manager.run_job(submitted['job_id'])
+            record = manager._load(submitted['job_id'])
+            record.update({'status': 'queued', 'finished_at': None})
+            manager._save(record)
+
+            with patch('src.redis_job_manager.run_tool') as run_tool:
+                recovered = manager.run_job(submitted['job_id'])
+
+            self.assertEqual(recovered['status'], 'completed')
+            self.assertEqual(recovered['result'], first['result'])
+            run_tool.assert_not_called()
+            self.assertTrue(redis.get(f"test:jobs:execution:{record['_execution_key']}"))
         finally:
             manager.shutdown()
 
