@@ -13,7 +13,7 @@ CI：GitHub Actions 会运行 Python 3.11/3.12 测试、Alembic 迁移、领域/
 - **Sequence**：通过 mRNA-Forge 插件进行 mRNA 优化、评分和翻译验证
 - **Literature**：本地证据、UniProt、PubMed、NCBI Gene 和 KEGG 适配
 - **Knowledge**：本地 Markdown、文本和 HTML 科研资料索引与检索
-- **Research**：根据任务选择领域并执行可追踪的跨领域工作流
+- **Research**：根据任务选择领域、推断证据源并执行可追踪的跨领域工作流
 
 CADD 是当前最完整的科学计算领域实现，其他领域通过同一套插件和工作流接口扩展。
 
@@ -135,6 +135,9 @@ python -m venv .venv
 
 # End-to-end RNA-seq research Agent workflow
 .venv/Scripts/python -m src.workflow_runner --workflow examples/workflows/rnaseq_research_agent.yaml --out output/rnaseq_research_agent/workflow_manifest.json
+
+# Inspect an automatically planned multi-domain workflow
+.venv/Scripts/python -c "from src.research_agent import research_plan; import json; print(json.dumps(research_plan('分析 RNA-seq 并使用 KEGG 解释通路和设计 mRNA', inputs={'expression_csv': 'examples/rnaseq/expression.csv', 'metadata_csv': 'examples/rnaseq/metadata.csv', 'gene_sets_csv': 'examples/rnaseq/gene_sets.csv', 'protein': 'MKT', 'output_dir': 'output/auto_research'}), ensure_ascii=False, indent=2))"
 
 # Use live UniProt, PubMed, NCBI Gene or KEGG evidence with a local response cache
 .venv/Scripts/python -m src.omics_agent --expression examples/rnaseq/expression.csv --metadata examples/rnaseq/metadata.csv --gene-sets examples/rnaseq/gene_sets.csv --evidence-provider uniprot --cache-dir output/uniprot_cache --out-dir output/rnaseq_uniprot

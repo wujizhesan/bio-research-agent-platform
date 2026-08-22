@@ -18,6 +18,57 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertIn('omics_run_differential_expression', result['capabilities'])
         self.assertIn('sequence_pipeline', result['capabilities'])
         self.assertFalse(result['policy']['llm_may_invent_measurements'])
+        self.assertFalse(result['execution']['ready'])
+        self.assertIn('expression_csv', result['execution']['missing_inputs'])
+
+    def test_research_planner_builds_kegg_rnaseq_sequence_workflow(self):
+        inputs = {
+            'expression_csv': 'examples/rnaseq/expression.csv',
+            'metadata_csv': 'examples/rnaseq/metadata.csv',
+            'gene_sets_csv': 'examples/rnaseq/gene_sets.csv',
+            'protein': 'MKT',
+            'output_dir': 'output/test_auto_research',
+        }
+        result = run_tool('research_plan', {
+            'task': '分析 RNA-seq 差异表达，使用 KEGG 解释通路并设计 mRNA',
+            'inputs': inputs,
+        })
+        self.assertEqual(result['status'], 'planned')
+        self.assertEqual(result['evidence_provider'], 'kegg')
+        self.assertTrue(result['execution']['ready'])
+        workflow = result['execution']['workflow']
+        self.assertEqual(workflow['steps'][0]['tool'], 'omics_run_analysis')
+        self.assertEqual(workflow['steps'][0]['args']['evidence_provider'], 'kegg')
+        self.assertIn('sequence_pipeline', [step['tool'] for step in workflow['steps']])
+        self.assertEqual(result['execution']['selected_tools'], [
+            'omics_run_analysis', 'sequence_pipeline', 'sequence_report'
+        ])
+
+        built = run_tool('research_build_workflow', {
+            'task': '分析 RNA-seq 差异表达，使用 KEGG 解释通路并设计 mRNA',
+            'inputs': inputs,
+        })
+        self.assertTrue(built['ready'])
+        dry_run = run_tool('research_execute', {
+            'workflow': built['workflow'],
+            'domains': built['selected_domains'],
+            'dry_run': True,
+            'output_path': 'output/test_auto_research_manifest.json',
+        })
+        self.assertEqual(dry_run['status'], 'planned')
+        self.assertEqual(dry_run['manifest']['completed_steps'], 3)
+
+    def test_research_planner_requires_local_evidence_file(self):
+        result = run_tool('research_build_workflow', {
+            'task': '查询本地基因证据',
+            'domains': ['literature'],
+            'inputs': {
+                'gene_ids': ['GeneA'],
+                'evidence_provider': 'local',
+            },
+        })
+        self.assertFalse(result['ready'])
+        self.assertIn('evidence_csv', result['missing_inputs'])
 
     def test_bgi_preset_is_discoverable_and_dry_runnable(self):
         presets = run_tool('research_presets', {})

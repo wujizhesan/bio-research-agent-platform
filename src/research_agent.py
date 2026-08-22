@@ -46,14 +46,22 @@ _DOMAIN_KEYWORDS = {
         'nucleotide', 'translation',
     ),
     'literature': (
-        'literature', 'pubmed', 'uniprot', 'paper', 'evidence',
-        'citation', '文献', '数据库',
+        'literature', 'pubmed', 'uniprot', 'ncbi', 'kegg', 'paper',
+        'evidence', 'citation', 'database', '文献', '数据库',
     ),
     'knowledge': (
         'rag', 'knowledge', 'retrieval', 'full text', '全文',
         'document', '知识库',
     ),
 }
+
+
+_EVIDENCE_PROVIDER_KEYWORDS = (
+    ('kegg', ('kegg', 'pathway database', '通路数据库')),
+    ('ncbi_gene', ('ncbi', 'gene annotation', '基因注释')),
+    ('pubmed', ('pubmed', 'literature', 'paper', 'citation', '文献', '论文')),
+    ('uniprot', ('uniprot', 'protein annotation', '蛋白注释')),
+)
 
 
 RESEARCH_PRESETS = {
@@ -125,6 +133,176 @@ def _required_inputs(domains):
     return required
 
 
+def _select_evidence_provider(task, inputs=None):
+    inputs = inputs or {}
+    explicit = inputs.get('evidence_provider')
+    providers = {'local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg'}
+    if explicit:
+        if explicit not in providers:
+            raise ValueError(f'unknown evidence provider: {explicit}')
+        return explicit
+    text = task.lower()
+    for provider, keywords in _EVIDENCE_PROVIDER_KEYWORDS:
+        if any(keyword.lower() in text for keyword in keywords):
+            return provider
+    return 'local'
+
+
+def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto'):
+    inputs = dict(inputs or {})
+    output_dir = str(inputs.get('output_dir') or output_dir)
+    evidence_provider = _select_evidence_provider(task, inputs)
+    steps = []
+    missing = []
+    rationale = []
+    omics_ready = False
+
+    if 'omics' in domains:
+        omics_required = ('expression_csv', 'metadata_csv', 'gene_sets_csv')
+        missing.extend(key for key in omics_required if not inputs.get(key))
+        if not any(key in missing for key in omics_required):
+            args = {key: str(inputs[key]) for key in omics_required}
+            args['output_dir'] = output_dir
+            args['evidence_provider'] = evidence_provider
+            for key in ('evidence_csv', 'condition_a', 'condition_b', 'evidence_timeout'):
+                if inputs.get(key) is not None:
+                    args[key] = inputs[key]
+            if inputs.get('evidence_cache_dir'):
+                args['evidence_cache_dir'] = str(inputs['evidence_cache_dir'])
+            elif evidence_provider != 'local':
+                args['evidence_cache_dir'] = str(Path(output_dir) / 'evidence_cache')
+            steps.append({
+                'id': 'omics_analysis',
+                'tool': 'omics_run_analysis',
+                'args': args,
+            })
+            omics_ready = True
+            rationale.append(f'omics analysis uses {evidence_provider} evidence')
+
+    direct_literature = bool(inputs.get('gene_ids'))
+    reuse_omics_evidence = omics_ready and evidence_provider != 'local' and not direct_literature
+    if direct_literature and evidence_provider == 'local' and not inputs.get('evidence_csv'):
+        missing.append('evidence_csv')
+    if 'literature' in domains and not reuse_omics_evidence:
+        if not direct_literature:
+            missing.append('gene_ids')
+        else:
+            search_args = {
+                'gene_ids': [str(gene_id) for gene_id in inputs['gene_ids']],
+                'provider': evidence_provider,
+            }
+            if inputs.get('evidence_csv'):
+                search_args['evidence_csv'] = str(inputs['evidence_csv'])
+            if inputs.get('evidence_cache_dir'):
+                search_args['cache_dir'] = str(inputs['evidence_cache_dir'])
+            steps.extend([
+                {
+                    'id': 'literature_search',
+                    'tool': 'literature_search',
+                    'args': search_args,
+                },
+                {
+                    'id': 'literature_summary',
+                    'tool': 'literature_summarize',
+                    'depends_on': ['literature_search'],
+                    'args': {'evidence': '${literature_search.result}'},
+                },
+            ])
+            rationale.append(f'literature search uses {evidence_provider} evidence')
+    elif reuse_omics_evidence:
+        rationale.append('significant genes from omics analysis are forwarded to the selected evidence provider')
+
+    if 'knowledge' in domains:
+        index_path = inputs.get('knowledge_index_path')
+        if not index_path and inputs.get('documents_dir'):
+            index_path = str(Path(output_dir) / 'knowledge_index.json')
+            steps.append({
+                'id': 'knowledge_ingest',
+                'tool': 'knowledge_ingest_directory',
+                'args': {
+                    'input_dir': str(inputs['documents_dir']),
+                    'output_path': index_path,
+                },
+            })
+        if index_path:
+            search_step = {
+                'id': 'knowledge_search',
+                'tool': 'knowledge_search',
+                'args': {
+                    'query': task.strip(),
+                    'index_path': index_path,
+                    'top_k': int(inputs.get('top_k', 5)),
+                },
+            }
+            if any(step['id'] == 'knowledge_ingest' for step in steps):
+                search_step['depends_on'] = ['knowledge_ingest']
+                search_step['args']['index_path'] = '${knowledge_ingest.result.output_path}'
+            steps.append(search_step)
+            rationale.append('knowledge retrieval grounds the research context')
+        else:
+            missing.append('documents_dir')
+
+    if 'sequence' in domains:
+        if not inputs.get('protein'):
+            missing.append('protein')
+        else:
+            steps.extend([
+                {
+                    'id': 'sequence_design',
+                    'tool': 'sequence_pipeline',
+                    'args': {
+                        'protein': str(inputs['protein']),
+                        'molecule': inputs.get('molecule', 'linear'),
+                        'method': inputs.get('method', 'greedy'),
+                    },
+                },
+                {
+                    'id': 'sequence_report',
+                    'tool': 'sequence_report',
+                    'depends_on': ['sequence_design'],
+                    'args': {
+                        'result': '${sequence_design.result}',
+                        'output_path': str(inputs.get(
+                            'sequence_report_path',
+                            Path(output_dir) / 'sequence_report.html',
+                        )),
+                    },
+                },
+            ])
+            rationale.append('sequence pipeline includes optimization, scoring and translation verification')
+
+    if 'cadd' in domains:
+        ligand_library = inputs.get('ligand_library') or inputs.get('external_dataset')
+        if not inputs.get('receptor'):
+            missing.append('receptor')
+        if not ligand_library:
+            missing.append('ligand_library')
+        if inputs.get('receptor') and ligand_library:
+            steps.append({
+                'id': 'cadd_screening',
+                'tool': 'cadd_run_screening',
+                'args': {
+                    'receptor': str(inputs['receptor']),
+                    'out': str(Path(output_dir) / 'cadd'),
+                    'external_dataset': str(ligand_library),
+                },
+            })
+            rationale.append('CADD screening is isolated as a reproducible execution step')
+
+    missing = sorted(set(missing))
+    workflow = {'name': 'auto-research-workflow', 'steps': steps} if steps else None
+    ready = bool(workflow and not missing)
+    return {
+        'ready': ready,
+        'missing_inputs': missing,
+        'evidence_provider': evidence_provider,
+        'selected_tools': [step['tool'] for step in steps],
+        'rationale': rationale,
+        'workflow': workflow if ready else None,
+        'workflow_preview': workflow,
+    }
+
+
 def research_catalog():
     domain_catalog = _domain_registry_module().active_domain_catalog
     return {
@@ -165,9 +343,11 @@ def research_run_preset(preset, output_path='output/research_manifest.json',
     )
 
 
-def research_plan(task, domains=None):
+def research_plan(task, domains=None, inputs=None, output_dir='output/research_auto'):
     if not isinstance(task, str) or not task.strip():
         raise ValueError('task must be a non-empty string')
+    if inputs is not None and not isinstance(inputs, dict):
+        raise ValueError('inputs must be an object')
     selected = _select_domains(task, domains)
     tool_specs = _domain_registry_module().active_tool_specs
     capabilities = [
@@ -202,6 +382,7 @@ def research_plan(task, domains=None):
             'description': 'Persist step results, provenance and quality checks.',
         },
     ]
+    execution = _build_workflow(task, selected, inputs, output_dir)
     return {
         'status': 'planned',
         'application': 'bioinformatics-research-agent',
@@ -209,11 +390,33 @@ def research_plan(task, domains=None):
         'selected_domains': selected,
         'capabilities': capabilities,
         'required_inputs': _required_inputs(selected),
+        'execution': execution,
+        'evidence_provider': execution['evidence_provider'],
         'steps': steps,
         'policy': {
             'llm_may_select_tools': True,
             'llm_may_invent_measurements': False,
             'execution_requires_validated_workflow': True,
+        },
+    }
+
+
+def research_build_workflow(task, inputs, domains=None, output_dir='output/research_auto'):
+    if not isinstance(task, str) or not task.strip():
+        raise ValueError('task must be a non-empty string')
+    if not isinstance(inputs, dict):
+        raise ValueError('inputs must be an object')
+    selected = _select_domains(task, domains)
+    execution = _build_workflow(task, selected, inputs, output_dir)
+    return {
+        'status': 'planned',
+        'application': 'bioinformatics-research-agent',
+        'task': task.strip(),
+        'selected_domains': selected,
+        **execution,
+        'provenance': {
+            'planner': 'deterministic-intent-router',
+            'workflow_validation': 'delegated to research_execute',
         },
     }
 
@@ -352,12 +555,24 @@ TOOLS = {
         'function': research_run_preset,
     },
     'plan': {
-        'description': 'Build a traceable research plan from a scientific task without inventing measurements.',
+        'description': 'Build a traceable research plan and infer evidence sources without inventing measurements.',
         'parameters': _parameters({
             'task': {'type': 'string'},
             'domains': {'type': 'array', 'items': {'type': 'string'}},
+            'inputs': {'type': 'object'},
+            'output_dir': {'type': 'string'},
         }, ('task',)),
         'function': research_plan,
+    },
+    'build_workflow': {
+        'description': 'Build an executable cross-domain workflow from a research task and validated inputs.',
+        'parameters': _parameters({
+            'task': {'type': 'string'},
+            'domains': {'type': 'array', 'items': {'type': 'string'}},
+            'inputs': {'type': 'object'},
+            'output_dir': {'type': 'string'},
+        }, ('task', 'inputs')),
+        'function': research_build_workflow,
     },
     'execute': {
         'description': 'Execute or dry-run a validated cross-domain research workflow with an audit manifest.',
