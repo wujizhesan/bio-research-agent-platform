@@ -22,6 +22,7 @@ import {
   ShieldCheck,
   Sparkles,
   Terminal,
+  Upload,
   Workflow,
   XCircle,
 } from 'lucide-react'
@@ -72,6 +73,18 @@ type ResearchPlan = {
   required_inputs: Array<{ name: string; description: string }>
   evidence_provider: string
   execution: ResearchPlanExecution
+}
+
+type ResearchFileSlot = 'expression' | 'metadata' | 'gene_sets'
+
+type UploadedFile = {
+  file_id: string
+  filename: string
+  content_type: string
+  size_bytes: number
+  sha256: string
+  path: string
+  download_url: string
 }
 
 type View = 'workspace' | 'domains'
@@ -132,6 +145,21 @@ async function apiFetch<T>(base: string, token: string, path: string, init: Requ
   return payload as T
 }
 
+async function uploadFile(base: string, token: string, file: File): Promise<UploadedFile> {
+  const body = new FormData()
+  body.append('upload', file)
+  const response = await fetch(`${base}/api/v1/files`, {
+    method: 'POST',
+    body,
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  })
+  const payload = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    throw new Error(payload.detail || payload.error || `文件上传失败: ${response.status}`)
+  }
+  return payload.file as UploadedFile
+}
+
 async function followJob(
   base: string,
   token: string,
@@ -183,6 +211,8 @@ function App() {
   const [task, setTask] = useState('分析 RNA-seq 差异表达并设计 mRNA 序列')
   const [protein, setProtein] = useState('MKT')
   const [evidenceProvider, setEvidenceProvider] = useState('local')
+  const [uploadedFiles, setUploadedFiles] = useState<Record<ResearchFileSlot, UploadedFile | null>>({ expression: null, metadata: null, gene_sets: null })
+  const [uploadingFile, setUploadingFile] = useState<ResearchFileSlot | ''>('')
   const [researchPlan, setResearchPlan] = useState<ResearchPlan | null>(null)
   const [loading, setLoading] = useState(false)
   const [connected, setConnected] = useState(false)
@@ -219,13 +249,28 @@ function App() {
 
   function buildResearchInputs() {
     return {
-      expression_csv: 'examples/rnaseq/expression.csv',
-      metadata_csv: 'examples/rnaseq/metadata.csv',
-      gene_sets_csv: 'examples/rnaseq/gene_sets.csv',
+      expression_csv: uploadedFiles.expression?.path || 'examples/rnaseq/expression.csv',
+      metadata_csv: uploadedFiles.metadata?.path || 'examples/rnaseq/metadata.csv',
+      gene_sets_csv: uploadedFiles.gene_sets?.path || 'examples/rnaseq/gene_sets.csv',
       evidence_csv: evidenceProvider === 'local' ? 'examples/rnaseq/evidence.csv' : undefined,
       evidence_provider: evidenceProvider,
       protein,
       output_dir: 'output/frontend_auto_research',
+    }
+  }
+
+  async function handleResearchFileUpload(slot: ResearchFileSlot, file?: File) {
+    if (!file) return
+    setUploadingFile(slot)
+    setError('')
+    try {
+      const uploaded = await uploadFile(apiBase, token, file)
+      setUploadedFiles((current) => ({ ...current, [slot]: uploaded }))
+      setResearchPlan(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '文件上传失败')
+    } finally {
+      setUploadingFile('')
     }
   }
 
@@ -444,7 +489,12 @@ function App() {
                       <div><label className="field-label" htmlFor="protein-context">蛋白输入上下文</label><input id="protein-context" value={protein} onChange={(event) => { setProtein(event.target.value.toUpperCase()); setResearchPlan(null) }} className="input-control font-mono tracking-[0.18em]" placeholder="例如 MKT" /></div>
                       <div><label className="field-label" htmlFor="evidence-provider">证据源</label><select id="evidence-provider" value={evidenceProvider} onChange={(event) => { setEvidenceProvider(event.target.value); setResearchPlan(null) }} className="input-control"><option value="local">本地证据</option><option value="kegg">KEGG</option><option value="ncbi_gene">NCBI Gene</option><option value="pubmed">PubMed</option><option value="uniprot">UniProt</option></select></div>
                     </div>
-                    <p className="mt-3 text-xs leading-5 text-[#688983]">Planner 使用仓库内示例数据生成预览；执行前仍会显示工具链和缺失输入。</p>
+                    <div className="mt-5 grid gap-3 sm:grid-cols-3">
+                      <ResearchFileField id="expression-file" label="表达矩阵 CSV" file={uploadedFiles.expression} uploading={uploadingFile === 'expression'} onChange={(file) => void handleResearchFileUpload('expression', file)} />
+                      <ResearchFileField id="metadata-file" label="样本元数据 CSV" file={uploadedFiles.metadata} uploading={uploadingFile === 'metadata'} onChange={(file) => void handleResearchFileUpload('metadata', file)} />
+                      <ResearchFileField id="gene-sets-file" label="基因集 CSV" file={uploadedFiles.gene_sets} uploading={uploadingFile === 'gene_sets'} onChange={(file) => void handleResearchFileUpload('gene_sets', file)} />
+                    </div>
+                    <p className="mt-3 text-xs leading-5 text-[#688983]">上传文件会在服务端校验、计算 SHA-256 并保存到本次研究输入目录；未上传的字段使用仓库示例数据。</p>
                   </> : <label className="mt-6 block"><span className="field-label">Protein sequence</span><input value={protein} onChange={(event) => setProtein(event.target.value.toUpperCase())} className="input-control font-mono tracking-[0.18em]" placeholder="例如 MKT" /><span className="mt-2 block text-xs text-[#688983]">内置确定性后端将执行 optimize → score → verify。</span></label>}
                   <div className="mt-6 flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2 font-mono text-[10px] text-[#66847e]"><CircleDot size={13} className="text-[#70e3ad]" />ASYNC / TRACEABLE / REPLAYABLE</div><button onClick={submitRun} disabled={loading || (mode === 'research' ? !task.trim() : !protein.trim())} className="group inline-flex items-center gap-2 rounded-xl bg-[#a8f0d2] px-4 py-2.5 text-sm font-semibold text-[#092521] transition hover:bg-[#c6f8e1] disabled:cursor-not-allowed disabled:opacity-50">{loading ? <RefreshCw size={15} className="animate-spin" /> : <Play size={15} />}{loading ? '执行中…' : '开始运行'}<ArrowUpRight size={14} className="transition group-hover:translate-x-0.5 group-hover:-translate-y-0.5" /></button></div>
                 </div>
@@ -470,6 +520,17 @@ function Metric({ label, value, icon }: { label: string; value: string; icon: Re
 function StatusBadge({ status }: { status: string }) {
   const style = status === 'completed' ? 'status-ok' : status === 'failed' || status === 'cancelled' ? 'status-failed' : status === 'running' ? 'status-running' : 'status-queued'
   return <span className={`status-badge ${style}`}><span className="size-1.5 rounded-full bg-current" />{status === 'cancelled' ? '已取消' : statusLabels[status] || status}</span>
+}
+
+function ResearchFileField({ id, label, file, uploading, onChange }: { id: string; label: string; file: UploadedFile | null; uploading: boolean; onChange: (file?: File) => void }) {
+  return <div>
+    <div className="field-label">{label}</div>
+    <label htmlFor={id} className="flex min-h-[76px] cursor-pointer items-center justify-between gap-3 rounded-xl border border-dashed border-[#315d55] bg-[#071719]/70 px-3 py-3 transition hover:border-[#71cba7] hover:bg-[#102b2a]">
+      <input id={id} type="file" accept=".csv,.tsv,text/csv,text/tab-separated-values" className="sr-only" onChange={(event) => { onChange(event.target.files?.[0]); event.currentTarget.value = '' }} />
+      <div className="min-w-0"><div className="truncate text-xs font-medium text-[#b8d8ce]">{uploading ? '上传中…' : file?.filename || '选择 CSV / TSV'}</div><div className="mt-1 truncate font-mono text-[9px] text-[#668983]">{file ? `${file.size_bytes} bytes · ${file.sha256.slice(0, 12)}` : '服务端安全存储'}</div></div>
+      {uploading ? <RefreshCw size={15} className="shrink-0 animate-spin text-[#8fe5c1]" /> : <Upload size={15} className="shrink-0 text-[#78cdaa]" />}
+    </label>
+  </div>
 }
 
 function ResearchPlanCard({ plan, loading, onExecute }: { plan: ResearchPlan | null; loading: boolean; onExecute: () => void }) {

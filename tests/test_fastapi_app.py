@@ -9,17 +9,19 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from src.database import Database
+from src.file_storage import LocalFileStorage
 from src.fastapi_app import create_app
 from src.job_manager import JobManager
 from src.plugin_manager import PluginManager
 
 
 class FastApiAppTests(unittest.TestCase):
-    def _app(self, root):
+    def _app(self, root, file_storage=None):
         app = create_app(
             job_manager=JobManager(max_workers=1, store_path=Path(root) / 'jobs.sqlite3'),
             plugin_manager=PluginManager(state_path=Path(root) / 'plugins.json'),
             database=Database(f"sqlite+aiosqlite:///{(Path(root) / 'api.sqlite3').as_posix()}"),
+            file_storage=file_storage,
         )
         return app
 
@@ -134,6 +136,48 @@ class FastApiAppTests(unittest.TestCase):
                 with TestClient(app) as client:
                     response = client.get('/api/v1/jobs/missing/events')
                     self.assertEqual(response.status_code, 404)
+            finally:
+                self._close_app(app)
+
+    def test_file_upload_is_safely_stored_and_downloadable(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_files_') as raw:
+            storage = LocalFileStorage(Path(raw) / 'uploads')
+            app = self._app(raw, storage)
+            try:
+                with TestClient(app) as client:
+                    content = b'gene_id,sample_a\nTP53,12\n'
+                    response = client.post(
+                        '/api/v1/files',
+                        files={'upload': ('../../expression.csv', content, 'text/csv')},
+                    )
+                    self.assertEqual(response.status_code, 201)
+                    uploaded = response.json()['file']
+                    self.assertEqual(uploaded['filename'], 'expression.csv')
+                    self.assertEqual(uploaded['size_bytes'], len(content))
+                    self.assertEqual(Path(uploaded['path']).resolve(), Path(raw).resolve() / 'uploads' / uploaded['file_id'] / 'expression.csv')
+                    self.assertRegex(uploaded['file_id'], r'^[a-f0-9]{32}$')
+                    self.assertEqual(len(uploaded['sha256']), 64)
+                    self.assertTrue((Path(raw) / 'uploads' / uploaded['file_id'] / 'expression.csv').is_file())
+
+                    downloaded = client.get(uploaded['download_url'])
+                    self.assertEqual(downloaded.status_code, 200)
+                    self.assertEqual(downloaded.content, content)
+                    self.assertEqual(downloaded.headers['x-file-sha256'], uploaded['sha256'])
+                    self.assertIn('expression.csv', downloaded.headers['content-disposition'])
+            finally:
+                self._close_app(app)
+
+    def test_file_upload_rejects_unsupported_and_oversized_files(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_file_validation_') as raw:
+            storage = LocalFileStorage(Path(raw) / 'uploads', max_bytes=4)
+            app = self._app(raw, storage)
+            try:
+                with TestClient(app) as client:
+                    unsupported = client.post('/api/v1/files', files={'upload': ('payload.exe', b'ab', 'application/octet-stream')})
+                    self.assertEqual(unsupported.status_code, 400)
+                    oversized = client.post('/api/v1/files', files={'upload': ('payload.csv', b'12345', 'text/csv')})
+                    self.assertEqual(oversized.status_code, 400)
+                    self.assertEqual(list((Path(raw) / 'uploads').iterdir()), [])
             finally:
                 self._close_app(app)
 

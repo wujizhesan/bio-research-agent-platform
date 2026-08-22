@@ -9,9 +9,9 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.responses import Response
@@ -20,6 +20,7 @@ try:
     from .api_server import list_run_manifests
     from .database import Database
     from .domain_registry import active_tool_specs
+    from .file_storage import LocalFileStorage
     from .job_manager import JobManager
     from .plugin_manager import PluginManager
     from .observability import HTTP_LATENCY, HTTP_REQUESTS, JOB_STATUS, JOB_SUBMISSIONS
@@ -27,6 +28,7 @@ except ImportError:
     from api_server import list_run_manifests
     from database import Database
     from domain_registry import active_tool_specs
+    from file_storage import LocalFileStorage
     from job_manager import JobManager
     from plugin_manager import PluginManager
     from observability import HTTP_LATENCY, HTTP_REQUESTS, JOB_STATUS, JOB_SUBMISSIONS
@@ -70,13 +72,21 @@ def _public_specs(domain=None):
     ]
 
 
-def create_app(job_manager=None, plugin_manager=None, database=None):
+def create_app(job_manager=None, plugin_manager=None, database=None, file_storage=None):
     owned_job_manager = job_manager is None
     owned_plugin_manager = plugin_manager is None
     owned_database = database is None
     jobs = job_manager or JobManager(store_path=OUTPUT_ROOT / 'jobs.sqlite3')
     plugins = plugin_manager or PluginManager(state_path=OUTPUT_ROOT / 'plugin_state.json')
     db = database or Database()
+    configured_upload_root = os.environ.get('UPLOAD_ROOT')
+    upload_root = Path(configured_upload_root) if configured_upload_root else OUTPUT_ROOT / 'uploads'
+    if not upload_root.is_absolute():
+        upload_root = PROJECT_ROOT / upload_root
+    storage = file_storage or LocalFileStorage(
+        upload_root,
+        max_bytes=int(os.environ.get('UPLOAD_MAX_BYTES', str(50 * 1024 * 1024))),
+    )
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -96,6 +106,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None):
     app.state.job_manager = jobs
     app.state.plugin_manager = plugins
     app.state.database = db
+    app.state.file_storage = storage
     origins = [item.strip() for item in os.environ.get(
         'CORS_ORIGINS',
         'http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174',
@@ -150,6 +161,32 @@ def create_app(job_manager=None, plugin_manager=None, database=None):
     @app.get('/api/v1/runs', dependencies=[Depends(require_auth)], tags=['runs'])
     async def runs(limit: int = Query(default=20, ge=1, le=100)):
         return {'status': 'ok', 'runs': list_run_manifests(OUTPUT_ROOT, limit)}
+
+    @app.post('/api/v1/files', status_code=201, dependencies=[Depends(require_auth)], tags=['files'])
+    async def upload_file(upload: UploadFile = File(...)):
+        try:
+            stored = await storage.save(upload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            await upload.close()
+        return {
+            'status': 'uploaded',
+            'file': storage.payload(stored, PROJECT_ROOT, f'/api/v1/files/{stored.file_id}'),
+        }
+
+    @app.get('/api/v1/files/{file_id}', dependencies=[Depends(require_auth)], tags=['files'])
+    async def download_file(file_id: str):
+        try:
+            stored = storage.get(file_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f'file not found: {file_id}') from exc
+        return FileResponse(
+            stored.path,
+            media_type=stored.content_type,
+            filename=stored.filename,
+            headers={'X-File-SHA256': stored.sha256},
+        )
 
     async def read_job(job_id):
         record = jobs.get(job_id)
