@@ -14,6 +14,7 @@ mcp>=1.28
 jsonschema>=4.20
 fastapi>=0.115
 PyJWT>=2.8
+redis>=5.0
 python-multipart>=0.0.9
 uvicorn[standard]>=0.30
 sqlalchemy[asyncio]>=2.0

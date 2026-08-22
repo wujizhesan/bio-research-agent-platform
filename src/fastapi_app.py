@@ -26,6 +26,7 @@ try:
     from .job_manager import JobManager
     from .plugin_manager import PluginManager
     from .observability import HTTP_LATENCY, HTTP_REQUESTS, JOB_STATUS, JOB_SUBMISSIONS
+    from .redis_job_manager import RedisJobManager
 except ImportError:
     from api_server import list_run_manifests
     from audit_log import AuditLogger
@@ -36,6 +37,7 @@ except ImportError:
     from job_manager import JobManager
     from plugin_manager import PluginManager
     from observability import HTTP_LATENCY, HTTP_REQUESTS, JOB_STATUS, JOB_SUBMISSIONS
+    from redis_job_manager import RedisJobManager
 
 
 API_NAME = 'bio-research-agent-api'
@@ -87,7 +89,15 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
     owned_job_manager = job_manager is None
     owned_plugin_manager = plugin_manager is None
     owned_database = database is None
-    jobs = job_manager or JobManager(store_path=OUTPUT_ROOT / 'jobs.sqlite3')
+    if job_manager is not None:
+        jobs = job_manager
+    elif os.environ.get('JOB_BACKEND', 'local').lower() == 'redis':
+        jobs = RedisJobManager(
+            redis_url=os.environ.get('REDIS_URL', 'redis://127.0.0.1:6379/0'),
+            namespace=os.environ.get('REDIS_NAMESPACE', 'bioagent'),
+        )
+    else:
+        jobs = JobManager(store_path=OUTPUT_ROOT / 'jobs.sqlite3')
     plugins = plugin_manager or PluginManager(state_path=OUTPUT_ROOT / 'plugin_state.json')
     db = database or Database()
     auth = AuthService.from_env()
@@ -117,6 +127,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         lifespan=lifespan,
     )
     app.state.job_manager = jobs
+    app.state.job_backend = getattr(jobs, 'backend', 'local')
     app.state.plugin_manager = plugins
     app.state.database = db
     app.state.file_storage = storage
@@ -174,7 +185,13 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
             await db.ping()
         except Exception as exc:
             return JSONResponse(status_code=503, content={'status': 'degraded', 'database': 'unavailable', 'error': str(exc)})
-        return {'status': 'ok', 'service': API_NAME, 'version': API_VERSION, 'database': 'ok'}
+        return {
+            'status': 'ok',
+            'service': API_NAME,
+            'version': API_VERSION,
+            'database': 'ok',
+            'job_backend': app.state.job_backend,
+        }
 
     @app.post('/api/v1/auth/token', tags=['auth'])
     async def issue_token(form_data: OAuth2PasswordRequestForm = Depends()):

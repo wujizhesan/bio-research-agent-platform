@@ -1,4 +1,12 @@
 services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   db:
     image: postgres:16-alpine
     environment:
@@ -20,6 +28,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}
       CADD_API_TOKEN: ${CADD_API_TOKEN:-change-me-in-development}
@@ -30,10 +40,34 @@ services:
       UPLOAD_ROOT: ${UPLOAD_ROOT:-/app/output/uploads}
       UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-52428800}
       AUTO_CREATE_SCHEMA: "false"
+      JOB_BACKEND: ${JOB_BACKEND:-redis}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_NAMESPACE: ${REDIS_NAMESPACE:-bioagent}
     ports:
       - "${API_PUBLISHED_PORT:-8000}:8000"
     volumes:
       - ./output:/app/output
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}
+      CADD_API_TOKEN: ${CADD_API_TOKEN:-change-me-in-development}
+      CADD_JWT_SECRET: ${CADD_JWT_SECRET:-}
+      CADD_AUTH_USERS_JSON: ${CADD_AUTH_USERS_JSON:-}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_NAMESPACE: ${REDIS_NAMESPACE:-bioagent}
+      MRNA_FORGE_ROOT: ${MRNA_FORGE_ROOT:-}
+    volumes:
+      - ./output:/app/output
+    command: ["python", "-m", "src.worker"]
 
   web:
     build:
