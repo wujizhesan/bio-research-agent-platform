@@ -15,6 +15,24 @@
 
 CADD 是当前最完整的科学计算领域实现，其他领域通过同一套插件和工作流接口扩展。
 
+## 服务层与本地部署
+
+平台同时提供 FastAPI 异步服务层，使用统一插件目录提交后台任务，并通过 OpenAPI 自动生成 `/docs`。本地直接运行时默认使用 SQLite 保存服务层任务读模型；Docker Compose 使用 PostgreSQL。
+
+```bash
+python -m pip install -e .
+bio-agent-api --port 8000
+```
+
+服务启动后访问 `http://127.0.0.1:8000/docs`。配置 `CADD_API_TOKEN` 后，除 `/health` 外的 API 请求使用 `Authorization: Bearer <token>`。
+
+```bash
+docker compose up --build
+curl http://127.0.0.1:8000/health
+```
+
+Compose 会启动 FastAPI、PostgreSQL 和持久化数据卷；科学计算所需的大型受体、分子库和 Vina 可执行文件需要按项目说明另行挂载或准备。
+
 ## 项目要解决什么
 
 虚拟筛选（Virtual Screening）的核心价值：
