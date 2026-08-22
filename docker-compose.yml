@@ -43,12 +43,19 @@ services:
       JOB_BACKEND: ${JOB_BACKEND:-redis}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       REDIS_NAMESPACE: ${REDIS_NAMESPACE:-bioagent}
+      REDIS_SOCKET_TIMEOUT: ${REDIS_SOCKET_TIMEOUT:-15}
       JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-300}
       JOB_RESULT_TTL_SECONDS: ${JOB_RESULT_TTL_SECONDS:-86400}
+      RUN_MIGRATIONS: "true"
     ports:
       - "${API_PUBLISHED_PORT:-8000}:8000"
     volumes:
       - ./output:/app/output
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   worker:
     build:
@@ -59,6 +66,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      api:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}
       CADD_API_TOKEN: ${CADD_API_TOKEN:-change-me-in-development}
@@ -66,8 +75,11 @@ services:
       CADD_AUTH_USERS_JSON: ${CADD_AUTH_USERS_JSON:-}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       REDIS_NAMESPACE: ${REDIS_NAMESPACE:-bioagent}
+      REDIS_SOCKET_TIMEOUT: ${REDIS_SOCKET_TIMEOUT:-15}
       JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-300}
       JOB_RESULT_TTL_SECONDS: ${JOB_RESULT_TTL_SECONDS:-86400}
+      RUN_MIGRATIONS: "false"
+      AUTO_CREATE_SCHEMA: "false"
       WORKER_METRICS_HOST: ${WORKER_METRICS_HOST:-0.0.0.0}
       WORKER_METRICS_PORT: ${WORKER_METRICS_PORT:-9000}
       MRNA_FORGE_ROOT: ${MRNA_FORGE_ROOT:-}

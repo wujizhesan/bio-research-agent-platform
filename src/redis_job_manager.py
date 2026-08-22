@@ -41,15 +41,21 @@ def _now():
 class RedisJobManager:
     backend = 'redis'
 
-    def __init__(self, redis_url=None, namespace=None, redis_client=None, lease_seconds=None, worker_id=None, result_ttl_seconds=None, state_store=None):
+    def __init__(self, redis_url=None, namespace=None, redis_client=None, lease_seconds=None, worker_id=None, result_ttl_seconds=None, state_store=None, redis_socket_timeout=None):
         if redis_client is None:
             try:
                 import redis
             except ImportError as exc:
                 raise RuntimeError('Redis backend requires the redis package') from exc
+            configured_socket_timeout = redis_socket_timeout or os.environ.get('REDIS_SOCKET_TIMEOUT', '15')
+            try:
+                socket_timeout = max(float(configured_socket_timeout), 6.0)
+            except (TypeError, ValueError):
+                socket_timeout = 15.0
             redis_client = redis.Redis.from_url(
                 redis_url or os.environ.get('REDIS_URL', 'redis://127.0.0.1:6379/0'),
                 decode_responses=True,
+                socket_timeout=socket_timeout,
             )
         self.redis = redis_client
         self.namespace = namespace or os.environ.get('REDIS_NAMESPACE', 'bioagent')

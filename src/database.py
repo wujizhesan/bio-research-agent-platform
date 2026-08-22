@@ -2,12 +2,15 @@
 from pathlib import Path
 import os
 
-from sqlalchemy import Boolean, Float, Integer, JSON, String, Text, inspect, select, text
+from sqlalchemy import Boolean, Float, Integer, JSON, String, Text, inspect, or_, select, text
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+TERMINAL_STATUSES = {'completed', 'failed', 'cancelled'}
 
 
 def normalize_database_url(value=None):
@@ -116,12 +119,39 @@ class Database:
     async def upsert_job(self, record):
         values = _row_values(record)
         async with self.sessions() as session:
+            if self.url.startswith('postgresql'):
+                statement = postgres_insert(JobRow).values(**values)
+                updates = {
+                    key: getattr(statement.excluded, key)
+                    for key in values
+                    if key != 'job_id'
+                }
+                statement = statement.on_conflict_do_update(
+                    index_elements=[JobRow.job_id],
+                    set_=updates,
+                    where=or_(
+                        ~JobRow.status.in_(TERMINAL_STATUSES),
+                        statement.excluded.status.in_(TERMINAL_STATUSES),
+                    ),
+                )
+                await session.execute(statement)
+                await session.commit()
+                return
             row = await session.get(JobRow, values['job_id'])
             if row is None:
-                session.add(JobRow(**values))
-            else:
-                for key, value in values.items():
-                    setattr(row, key, value)
+                try:
+                    session.add(JobRow(**values))
+                    await session.commit()
+                    return
+                except IntegrityError:
+                    await session.rollback()
+                    row = await session.get(JobRow, values['job_id'])
+                    if row is None:
+                        raise
+            if row.status in TERMINAL_STATUSES and values['status'] not in TERMINAL_STATUSES:
+                return
+            for key, value in values.items():
+                setattr(row, key, value)
             await session.commit()
 
     async def get_job(self, job_id):
