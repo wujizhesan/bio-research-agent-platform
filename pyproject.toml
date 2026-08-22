@@ -88,6 +88,7 @@ py-modules = [
   "streamlit_chat",
   "visualize",
   "redis_job_manager",
+  "job_state_store",
   "worker",
   "workflow_runner",
 ]

@@ -2,7 +2,7 @@
 from pathlib import Path
 import os
 
-from sqlalchemy import JSON, String, Text, select, text
+from sqlalchemy import Boolean, Float, Integer, JSON, String, Text, inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -38,6 +38,10 @@ class JobRow(Base):
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_of: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_until: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 def _row_values(record):
@@ -52,6 +56,10 @@ def _row_values(record):
         'result': record.get('result'),
         'error': record.get('error'),
         'retry_of': record.get('retry_of'),
+        'attempts': int(record.get('_attempts', 0)),
+        'cancel_requested': bool(record.get('_cancel_requested')),
+        'worker_id': record.get('_worker_id'),
+        'lease_until': record.get('_lease_until'),
     }
 
 
@@ -66,6 +74,9 @@ def _public_row(row):
         value = getattr(row, field)
         if value is not None:
             output[field] = value
+    output['attempts'] = row.attempts
+    if row.cancel_requested:
+        output['cancel_requested'] = True
     return output
 
 
@@ -81,7 +92,22 @@ class Database:
         auto_create = os.environ.get('AUTO_CREATE_SCHEMA', 'true').lower() in {'1', 'true', 'yes'}
         if auto_create:
             async with self.engine.begin() as connection:
-                await connection.run_sync(Base.metadata.create_all)
+                await connection.run_sync(self._create_and_upgrade_schema)
+
+    @staticmethod
+    def _create_and_upgrade_schema(connection):
+        Base.metadata.create_all(connection)
+        columns = {item['name'] for item in inspect(connection).get_columns('job_records')}
+        missing = {
+            'attempts': 'INTEGER NOT NULL DEFAULT 0',
+            'worker_id': 'VARCHAR(128)',
+            'lease_until': 'FLOAT',
+        }
+        boolean_default = 'FALSE' if connection.dialect.name == 'postgresql' else '0'
+        missing['cancel_requested'] = f'BOOLEAN NOT NULL DEFAULT {boolean_default}'
+        for name, definition in missing.items():
+            if name not in columns:
+                connection.execute(text(f'ALTER TABLE job_records ADD COLUMN {name} {definition}'))
 
     async def ping(self):
         async with self.engine.connect() as connection:

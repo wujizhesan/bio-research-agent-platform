@@ -41,7 +41,7 @@ def _now():
 class RedisJobManager:
     backend = 'redis'
 
-    def __init__(self, redis_url=None, namespace=None, redis_client=None, lease_seconds=None, worker_id=None, result_ttl_seconds=None):
+    def __init__(self, redis_url=None, namespace=None, redis_client=None, lease_seconds=None, worker_id=None, result_ttl_seconds=None, state_store=None):
         if redis_client is None:
             try:
                 import redis
@@ -64,6 +64,7 @@ class RedisJobManager:
         except (TypeError, ValueError):
             self.result_ttl_seconds = 86400
         self.worker_id = worker_id or f'worker-{uuid4().hex}'
+        self.state_store = state_store
         self._lock = Lock()
         self.redis.ping()
 
@@ -113,6 +114,8 @@ class RedisJobManager:
             record['_created_score'] = score
             self.redis.set(self._key(record['job_id']), json.dumps(record, ensure_ascii=False, default=str))
         self.redis.zadd(self._index_key, {record['job_id']: score})
+        if self.state_store is not None:
+            self.state_store.save(record)
 
     def _load(self, job_id):
         payload = self.redis.get(self._key(job_id))

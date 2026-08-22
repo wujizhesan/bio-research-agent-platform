@@ -269,6 +269,17 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         )
 
     async def read_job(job_id):
+        if app.state.job_backend == 'redis':
+            record = await db.get_job(job_id)
+            if record is not None:
+                JOB_STATUS.labels(record['tool'], record['status']).set(1)
+                return record
+            record = jobs.get(job_id)
+            if record is not None:
+                await db.upsert_job(record)
+                JOB_STATUS.labels(record['tool'], record['status']).set(1)
+                return await db.get_job(job_id) or record
+            return None
         record = jobs.get(job_id)
         if record is not None:
             await db.upsert_job(record)
@@ -301,6 +312,12 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
 
     @app.get('/api/v1/jobs', dependencies=[Depends(require_permission('jobs:read'))], tags=['jobs'])
     async def list_jobs(limit: int = Query(default=20, ge=1, le=100)):
+        if app.state.job_backend == 'redis':
+            records = await db.list_jobs(limit)
+            if records:
+                for record in records:
+                    JOB_STATUS.labels(record['tool'], record['status']).set(1)
+                return {'status': 'ok', 'jobs': records}
         records = jobs.list(limit)
         for record in records:
             await db.upsert_job(record)

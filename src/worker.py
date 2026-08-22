@@ -4,8 +4,10 @@ import argparse
 import os
 
 try:
+    from .job_state_store import DatabaseStateWriter
     from .redis_job_manager import RedisJobManager
 except ImportError:
+    from job_state_store import DatabaseStateWriter
     from redis_job_manager import RedisJobManager
 
 
@@ -19,13 +21,17 @@ def main(argv=None):
     if args.metrics_port > 0:
         from prometheus_client import start_http_server
         start_http_server(args.metrics_port, addr=args.metrics_host)
-    manager = RedisJobManager(redis_url=args.redis_url, namespace=args.namespace)
+    state_writer = DatabaseStateWriter()
+    manager = None
     try:
+        manager = RedisJobManager(redis_url=args.redis_url, namespace=args.namespace, state_store=state_writer)
         manager.run_forever()
     except KeyboardInterrupt:
         return 0
     finally:
-        manager.shutdown()
+        if manager is not None:
+            manager.shutdown()
+        state_writer.close()
     return 0
 
 
