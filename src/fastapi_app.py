@@ -102,7 +102,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None):
         allow_origins=origins,
         allow_credentials=False,
         allow_methods=['GET', 'POST'],
-        allow_headers=['Authorization', 'Content-Type'],
+        allow_headers=['Authorization', 'Content-Type', 'Idempotency-Key'],
     )
 
     @app.middleware('http')
@@ -157,15 +157,19 @@ def create_app(job_manager=None, plugin_manager=None, database=None):
         return await db.get_job(job_id)
 
     @app.post('/api/v1/jobs', status_code=202, dependencies=[Depends(require_auth)], tags=['jobs'])
-    async def submit_job(payload: JobCreate):
+    async def submit_job(
+        payload: JobCreate,
+        idempotency_key: str | None = Header(default=None, alias='Idempotency-Key'),
+    ):
         try:
-            record = jobs.submit(payload.tool, payload.arguments)
+            record = jobs.submit(payload.tool, payload.arguments, idempotency_key=idempotency_key)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         await db.upsert_job(record)
-        JOB_SUBMISSIONS.labels(payload.tool).inc()
+        if not record.get('deduplicated'):
+            JOB_SUBMISSIONS.labels(payload.tool).inc()
         JOB_STATUS.labels(payload.tool, record['status']).set(1)
-        return {'status': 'accepted', 'job': record}
+        return {'status': 'deduplicated' if record.get('deduplicated') else 'accepted', 'job': record}
 
     @app.get('/api/v1/jobs', dependencies=[Depends(require_auth)], tags=['jobs'])
     async def list_jobs(limit: int = Query(default=20, ge=1, le=100)):
@@ -205,7 +209,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None):
                     payload = {'status': 'ok', 'job': record}
                     yield f'event: job\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n'
                     last_signature = signature
-                if record.get('status') in {'completed', 'failed'}:
+                if record.get('status') in {'completed', 'failed', 'cancelled'}:
                     return
                 if monotonic() >= deadline:
                     payload = {'status': 'timeout', 'job': record}
@@ -218,6 +222,18 @@ def create_app(job_manager=None, plugin_manager=None, database=None):
             media_type='text/event-stream',
             headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
         )
+
+    @app.post('/api/v1/jobs/{job_id}/cancel', status_code=202, dependencies=[Depends(require_auth)], tags=['jobs'])
+    async def cancel_job(job_id: str):
+        try:
+            record = jobs.cancel(job_id)
+        except ValueError as exc:
+            status_code = 404 if str(exc).startswith('job not found:') else 400
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        await db.upsert_job(record)
+        JOB_STATUS.labels(record['tool'], record['status']).set(1)
+        response_status = 'already_terminal' if record['status'] in {'completed', 'failed', 'cancelled'} else 'cancelled' if record['status'] == 'cancelled' else 'cancellation_requested'
+        return {'status': response_status, 'job': record}
 
     @app.post('/api/v1/jobs/{job_id}/retry', status_code=202, dependencies=[Depends(require_auth)], tags=['jobs'])
     async def retry_job(job_id: str):

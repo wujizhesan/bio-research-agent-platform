@@ -153,6 +153,15 @@ def route_request(method, target, payload=None, output_root=None, job_manager=No
         except ValueError as exc:
             return 400, {'status': 'error', 'error': str(exc)}
         return 202, {'status': 'accepted', 'job': record}
+    if method == 'POST' and path.startswith('/jobs/') and path.endswith('/cancel'):
+        job_id = unquote(path[len('/jobs/'): -len('/cancel')].rstrip('/'))
+        try:
+            record = jobs.cancel(job_id)
+        except ValueError as exc:
+            status_code = 404 if str(exc).startswith('job not found:') else 400
+            return status_code, {'status': 'error', 'error': str(exc)}
+        response_status = 'already_terminal' if record['status'] in {'completed', 'failed', 'cancelled'} else 'cancelled' if record['status'] == 'cancelled' else 'cancellation_requested'
+        return 202, {'status': response_status, 'job': record}
     if method == 'GET' and path == '/jobs':
         limit = parse_qs(parsed.query).get('limit', ['20'])[0]
         return 200, {'status': 'ok', 'jobs': jobs.list(limit)}
@@ -167,10 +176,10 @@ def route_request(method, target, payload=None, output_root=None, job_manager=No
         try:
             name = body.get('tool')
             arguments = body.get('arguments', body.get('args', {}))
-            record = jobs.submit(name, arguments)
+            record = jobs.submit(name, arguments, idempotency_key=body.get('idempotency_key'))
         except (TypeError, ValueError) as exc:
             return 400, {'status': 'error', 'error': str(exc)}
-        return 202, {'status': 'accepted', 'job': record}
+        return 202, {'status': 'deduplicated' if record.get('deduplicated') else 'accepted', 'job': record}
     if method == 'POST' and (path == '/run' or path.startswith('/run/')):
         body = payload if isinstance(payload, dict) else {}
         name = body.get('tool')

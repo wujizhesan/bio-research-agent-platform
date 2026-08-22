@@ -53,6 +53,8 @@ npm install
 npm run dev
 ```
 
+任务提交支持 `Idempotency-Key` 请求头，重复提交同一工具与参数会复用原任务；参数不一致会返回 `400`。任务可通过 `POST /api/v1/jobs/{job_id}/cancel` 取消，排队任务立即取消，运行中任务在执行线程结束后标记为 `cancelled`。
+
 ## 项目要解决什么
 
 虚拟筛选（Virtual Screening）的核心价值：

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Activity,
   ArrowUpRight,
+  Ban,
   Beaker,
   Boxes,
   Check,
@@ -37,12 +38,13 @@ type Plugin = {
 type Job = {
   job_id: string
   tool: string
-  status: 'queued' | 'running' | 'completed' | 'failed'
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
   created_at: string
   started_at?: string
   finished_at?: string
   result?: Record<string, unknown>
   error?: string
+  cancel_requested?: boolean
 }
 
 type EventItem = {
@@ -187,6 +189,7 @@ function App() {
         : { tool: 'sequence_pipeline', arguments: { protein, molecule: 'linear', method: 'greedy' } }
       const response = await apiFetch<{ job: Job }>(apiBase, token, '/api/v1/jobs', {
         method: 'POST',
+        headers: { 'Idempotency-Key': crypto.randomUUID() },
         body: JSON.stringify(payload),
       })
       const job = response.job
@@ -212,6 +215,24 @@ function App() {
     } finally {
       setLoading(false)
       void refresh()
+    }
+  }
+
+  async function cancelSelectedJob() {
+    if (!selectedJob || !['queued', 'running'].includes(selectedJob.status) || selectedJob.cancel_requested) return
+    setError('')
+    try {
+      const response = await apiFetch<{ job: Job }>(apiBase, token, `/api/v1/jobs/${selectedJob.job_id}/cancel`, { method: 'POST' })
+      setSelectedJob(response.job)
+      setJobs((current) => [response.job, ...current.filter((item) => item.job_id !== response.job.job_id)])
+      setEvents((current) => [...current, {
+        at: formatTime(new Date().toISOString()),
+        type: 'cancel',
+        status: response.job.status,
+        detail: response.job.status === 'cancelled' ? '任务已取消' : '已发送取消请求，等待执行线程退出',
+      }])
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '取消任务失败')
     }
   }
 
@@ -269,6 +290,8 @@ function App() {
                 </div>
               </section>
 
+              {selectedJob && ['queued', 'running'].includes(selectedJob.status) && <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#5c4930] bg-[#211d16] px-5 py-4"><div className="flex items-center gap-3"><Ban size={16} className="text-[#e6c875]" /><div><div className="text-sm font-medium text-[#f1dfaa]">任务控制</div><div className="mt-1 text-xs text-[#aa9767]">排队中的任务会立即取消，运行中的任务采用协作式取消。</div></div></div><button onClick={() => void cancelSelectedJob()} disabled={selectedJob.cancel_requested} className="rounded-lg border border-[#80643c] px-3 py-2 text-xs font-medium text-[#f1d889] transition hover:bg-[#392d1c] disabled:cursor-not-allowed disabled:opacity-50">{selectedJob.cancel_requested ? '取消请求已发送' : '取消任务'}</button></div>}
+
               <section className="grid gap-5 xl:grid-cols-[1.08fr_0.92fr]">
                 <div className="panel p-5 sm:p-6">
                   <div className="flex items-start justify-between gap-4"><div><div className="eyebrow">01 / START A RUN</div><h2 className="mt-2 text-xl font-semibold">启动一条研究路径</h2></div><div className="rounded-xl border border-[#21443f] bg-[#102b2a] p-2.5 text-[#8fe5c1]"><Play size={17} /></div></div>
@@ -294,8 +317,8 @@ function Metric({ label, value, icon }: { label: string; value: string; icon: Re
 }
 
 function StatusBadge({ status }: { status: string }) {
-  const style = status === 'completed' ? 'status-ok' : status === 'failed' ? 'status-failed' : status === 'running' ? 'status-running' : 'status-queued'
-  return <span className={`status-badge ${style}`}><span className="size-1.5 rounded-full bg-current" />{statusLabels[status] || status}</span>
+  const style = status === 'completed' ? 'status-ok' : status === 'failed' || status === 'cancelled' ? 'status-failed' : status === 'running' ? 'status-running' : 'status-queued'
+  return <span className={`status-badge ${style}`}><span className="size-1.5 rounded-full bg-current" />{status === 'cancelled' ? '已取消' : statusLabels[status] || status}</span>
 }
 
 function EmptyStream() {

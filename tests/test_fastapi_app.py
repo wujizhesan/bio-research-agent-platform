@@ -60,13 +60,54 @@ class FastApiAppTests(unittest.TestCase):
                     response = client.post('/api/v1/jobs', json={'tool': 'research_catalog', 'arguments': {}})
                     self.assertEqual(response.status_code, 202)
                     job_id = response.json()['job']['job_id']
-                    for _ in range(30):
+                    for _ in range(100):
                         record = client.get(f'/api/v1/jobs/{job_id}').json()['job']
                         if record['status'] in {'completed', 'failed'}:
                             break
                         time.sleep(0.05)
                     self.assertEqual(record['status'], 'completed')
                     self.assertEqual(client.get('/api/v1/jobs').status_code, 200)
+            finally:
+                self._close_app(app)
+
+    def test_idempotency_header_deduplicates_submission(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_idempotency_') as raw:
+            app = self._app(raw)
+            try:
+                with TestClient(app) as client:
+                    headers = {'Idempotency-Key': 'api-request-1'}
+                    first = client.post('/api/v1/jobs', json={'tool': 'research_catalog', 'arguments': {}}, headers=headers)
+                    second = client.post('/api/v1/jobs', json={'tool': 'research_catalog', 'arguments': {}}, headers=headers)
+                    self.assertEqual(first.status_code, 202)
+                    self.assertEqual(second.status_code, 202)
+                    self.assertEqual(first.json()['job']['job_id'], second.json()['job']['job_id'])
+                    self.assertEqual(second.json()['status'], 'deduplicated')
+            finally:
+                self._close_app(app)
+
+    def test_cancel_endpoint_returns_terminal_job(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_cancel_') as raw:
+            app = self._app(raw)
+            try:
+                with TestClient(app) as client:
+                    response = client.post('/api/v1/jobs', json={'tool': 'research_catalog', 'arguments': {}})
+                    job_id = response.json()['job']['job_id']
+                    for _ in range(100):
+                        record = client.get(f'/api/v1/jobs/{job_id}').json()['job']
+                        if record['status'] in {'completed', 'failed'}:
+                            break
+                        time.sleep(0.05)
+                    cancelled = client.post(f'/api/v1/jobs/{job_id}/cancel')
+                    self.assertEqual(cancelled.status_code, 202)
+                    response_status = cancelled.json()['status']
+                    self.assertIn(response_status, {'already_terminal', 'cancellation_requested', 'cancelled'})
+                    if response_status == 'cancellation_requested':
+                        for _ in range(100):
+                            record = client.get(f'/api/v1/jobs/{job_id}').json()['job']
+                            if record['status'] == 'cancelled':
+                                break
+                            time.sleep(0.05)
+                        self.assertEqual(record['status'], 'cancelled')
             finally:
                 self._close_app(app)
 

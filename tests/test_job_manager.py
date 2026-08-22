@@ -4,11 +4,67 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from threading import Event
+from unittest.mock import patch
 
 from src.job_manager import JobManager
 
 
 class JobManagerPersistenceTests(unittest.TestCase):
+    def test_idempotency_key_reuses_matching_job(self):
+        manager = JobManager(max_workers=1)
+        try:
+            first = manager.submit('research_catalog', {}, idempotency_key='request-1')
+            second = manager.submit('research_catalog', {}, idempotency_key='request-1')
+            self.assertEqual(second['job_id'], first['job_id'])
+            self.assertTrue(second['deduplicated'])
+            with self.assertRaisesRegex(ValueError, 'different job payload'):
+                manager.submit('research_catalog', {'query': 'other'}, idempotency_key='request-1')
+        finally:
+            manager.shutdown()
+
+    def test_idempotency_key_survives_manager_restart(self):
+        with tempfile.TemporaryDirectory(prefix='bio_job_idempotency_') as raw:
+            store = Path(raw) / 'jobs.sqlite3'
+            manager = JobManager(max_workers=1, store_path=store)
+            first = manager.submit('research_catalog', {}, idempotency_key='restart-request')
+            manager.shutdown()
+            restored = JobManager(max_workers=1, store_path=store)
+            try:
+                second = restored.submit('research_catalog', {}, idempotency_key='restart-request')
+                self.assertEqual(second['job_id'], first['job_id'])
+                self.assertTrue(second['deduplicated'])
+            finally:
+                restored.shutdown()
+
+    def test_queued_job_can_be_cancelled(self):
+        started = Event()
+        release = Event()
+
+        def blocking_tool(_tool, _arguments):
+            started.set()
+            release.wait(2)
+            return {'status': 'ok'}
+
+        manager = JobManager(max_workers=1)
+        try:
+            with patch('src.job_manager.run_tool', blocking_tool):
+                first = manager.submit('research_catalog', {})
+                self.assertTrue(started.wait(1))
+                queued = manager.submit('research_catalog', {})
+                cancelled = manager.cancel(queued['job_id'])
+                self.assertEqual(cancelled['status'], 'cancelled')
+                release.set()
+                for _ in range(100):
+                    current = manager.get(first['job_id'])
+                    if current['status'] == 'completed':
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(current['status'], 'completed')
+        finally:
+            release.set()
+            manager.shutdown()
+
     def test_completed_job_survives_manager_restart(self):
         with tempfile.TemporaryDirectory(prefix='bio_job_store_') as raw:
             store = Path(raw) / 'jobs.sqlite3'
