@@ -4,10 +4,28 @@ import json
 from typing import Any
 
 try:
-    from mcp.server.mcpserver import MCPServer
     from mcp.types import CallToolResult, TextContent, Tool
+    try:
+        from mcp.server.mcpserver import MCPServer
+        _MCP_API = 'legacy'
+    except ImportError:
+        from mcp.server.fastmcp import FastMCP
+        MCPServer = FastMCP
+        _MCP_API = 'fastmcp'
 except ImportError as exc:
-    raise SystemExit('MCP server requires the optional dependency: pip install "mcp>=2.0"') from exc
+    raise SystemExit('MCP server requires the optional dependency: pip install "mcp>=1.28"') from exc
+
+if _MCP_API == 'fastmcp':
+    class _CompatCallToolResult(CallToolResult):
+        @property
+        def is_error(self):
+            return self.isError
+
+        @property
+        def structured_content(self):
+            return self.structuredContent
+else:
+    _CompatCallToolResult = CallToolResult
 
 try:
     from .domain_registry import run_tool, active_tool_specs
@@ -17,11 +35,17 @@ except ImportError:
 
 class BioMCPServer(MCPServer):
     def __init__(self):
-        super().__init__(
-            name='cadd-bio-agent',
-            version='0.1.0',
-            description='Cross-domain CADD and RNA-seq bioinformatics tools',
-        )
+        if _MCP_API == 'legacy':
+            super().__init__(
+                name='cadd-bio-agent',
+                version='0.1.0',
+                description='Cross-domain CADD and RNA-seq bioinformatics tools',
+            )
+        else:
+            super().__init__(
+                name='cadd-bio-agent',
+                instructions='Cross-domain CADD and RNA-seq bioinformatics tools',
+            )
         self._specs = {spec['name']: spec for spec in active_tool_specs()}
 
     async def list_tools(self):
@@ -40,8 +64,8 @@ class BioMCPServer(MCPServer):
         else:
             result = run_tool(name, arguments)
         is_error = isinstance(result, dict) and result.get('status') == 'error'
-        return CallToolResult(
-            content=[TextContent(text=json.dumps(result, ensure_ascii=False, default=str))],
+        return _CompatCallToolResult(
+            content=[TextContent(type='text', text=json.dumps(result, ensure_ascii=False, default=str))],
             structuredContent=result,
             isError=is_error,
         )

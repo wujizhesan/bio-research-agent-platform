@@ -14,6 +14,8 @@ jobs:
   test:
     name: Test Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    env:
+      CADD_SKIP_ASSETS: '1'
     strategy:
       fail-fast: false
       matrix:

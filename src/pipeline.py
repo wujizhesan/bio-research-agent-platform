@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import platform
 import sys
@@ -191,9 +192,10 @@ def check_environment(config_path=None):
         receptor_path = resolve_path(receptor_cfg.get('pdb_path', 'data/4hjo.pdb'))
         vina_path = resolve_path(vina_cfg.get('exe', 'tools/vina_1.2.7_win.exe'))
         library_path = resolve_path(cfg.get('library', {}).get('data_module', 'src/library_data.py'))
+        skip_assets = os.environ.get('CADD_SKIP_ASSETS') == '1'
         checks = [
-            ('receptor_file', receptor_path.exists(), receptor_path),
-            ('vina_executable', vina_path.exists(), vina_path),
+            ('receptor_file', skip_assets or receptor_path.exists(), receptor_path),
+            ('vina_executable', skip_assets or vina_path.exists(), vina_path),
             ('library_module', library_path.exists(), library_path),
         ]
         center = receptor_cfg.get('box_center')
@@ -247,6 +249,8 @@ def check_environment(config_path=None):
         'box_size',
         'external_dataset',
     }
+    if os.environ.get('CADD_SKIP_ASSETS') == '1':
+        required_checks -= {'receptor_file', 'vina_executable'}
     failed = []
     for label, module in required_modules + optional_modules:
         checks.append((f'dependency:{label}', importlib.util.find_spec(module) is not None, module))

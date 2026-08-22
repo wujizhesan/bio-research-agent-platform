@@ -235,7 +235,7 @@ bio-agent-mcp --list
 
 ## mRNA 插件
 
-Sequence 领域默认作为可选外部插件发现。若本机没有 mRNA-Forge，平台仍可启动，但该领域状态会标记为 `unavailable`。安装或准备 mRNA-Forge 后，通过环境变量指定路径：
+Sequence 领域默认使用内置确定性后端，保证公开仓库可以直接运行优化、评分、验证、比较、基准和报告工具。若配置了 mRNA-Forge，平台会优先使用外部后端；通过环境变量指定路径：
 
 ```bash
 set MRNA_FORGE_ROOT=D:\EnornaAgent

@@ -1,4 +1,4 @@
-"""Adapter for the external mRNA-Forge sequence domain."""
+"""Adapter for the optional mRNA-Forge sequence domain."""
 import importlib
 import os
 import re
@@ -8,8 +8,10 @@ from pathlib import Path
 
 try:
     from .config_loader import PROJECT_ROOT, load_config
+    from . import sequence_builtin
 except ImportError:
     from config_loader import PROJECT_ROOT, load_config
+    import sequence_builtin
 
 
 PLUGIN_NAME = 'mRNA-Forge sequence domain'
@@ -58,13 +60,23 @@ def _configured_root():
 
 def plugin_status():
     root = _configured_root()
+    try:
+        config = load_config()
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        config = {}
+    if (config.get('sequence', {}) or {}).get('enabled') is False:
+        return {'available': False, 'reason': 'sequence plugin disabled'}
     if root is None:
-        return {'available': False, 'reason': 'sequence plugin disabled or root not found'}
+        return {
+            'available': True,
+            'backend': 'builtin',
+            'reason': 'external mRNA-Forge root not configured; using built-in deterministic backend',
+        }
     required = (root / 'core' / 'rules.py', root / 'tools' / 'tools.py')
     missing = [str(path) for path in required if not path.exists()]
     if missing:
         return {'available': False, 'root': str(root), 'missing': missing}
-    return {'available': True, 'root': str(root)}
+    return {'available': True, 'backend': 'external', 'root': str(root)}
 
 
 @lru_cache(maxsize=4)
@@ -90,6 +102,8 @@ def _get_backend():
     status = plugin_status()
     if not status.get('available'):
         raise RuntimeError(status.get('reason') or f"sequence plugin unavailable: {status}")
+    if status.get('backend') == 'builtin':
+        return sequence_builtin, None
     return _backend(status['root'])
 
 
@@ -221,23 +235,26 @@ def sequence_pipeline(protein, molecule='linear', method='greedy'):
 
 
 def sequence_report(result, output_path='output/sequence_report.html'):
-    _get_backend()
-    root = Path(plugin_status()['root'])
+    backend, _ = _get_backend()
     if not isinstance(result, dict):
         raise ValueError('result must be an object')
     payload = result.get('result', result)
     report_path = Path(output_path)
     if not report_path.is_absolute():
         report_path = PROJECT_ROOT / report_path
-    sys.path.insert(0, str(root))
-    try:
-        report_builder = importlib.import_module('report.report_builder')
-        built = report_builder.build_report(payload, str(report_path))
-    finally:
+    if plugin_status().get('backend') == 'builtin':
+        built = backend.build_report(payload, str(report_path))
+    else:
+        root = Path(plugin_status()['root'])
+        sys.path.insert(0, str(root))
         try:
-            sys.path.remove(str(root))
-        except ValueError:
-            pass
+            report_builder = importlib.import_module('report.report_builder')
+            built = report_builder.build_report(payload, str(report_path))
+        finally:
+            try:
+                sys.path.remove(str(root))
+            except ValueError:
+                pass
     return _envelope('report', {
         'status': 'ok',
         'output_html': str(built or report_path),

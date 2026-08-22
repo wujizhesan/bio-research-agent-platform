@@ -30,7 +30,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ui = ["streamlit>=1.40", "mcp>=2.0"]
+ui = ["streamlit>=1.40", "mcp>=1.28"]
 chainlit = ["chainlit==2.11.1"]
 dev = ["pytest>=8.0"]
 
@@ -78,6 +78,7 @@ py-modules = [
   "resplit_external",
   "run_benchmark_replicates",
   "sequence_plugin",
+  "sequence_builtin",
   "streamlit_chat",
   "visualize",
   "workflow_runner",

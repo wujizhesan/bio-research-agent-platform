@@ -1,9 +1,20 @@
 import unittest
+from unittest.mock import patch
 
 from src.domain_registry import available_domains, domain_catalog, run_tool, tool_specs
+from src import sequence_plugin
 
 
 class SequencePluginTests(unittest.TestCase):
+    def test_builtin_backend_is_available_without_external_root(self):
+        with patch.object(sequence_plugin, '_configured_root', return_value=None):
+            status = sequence_plugin.plugin_status()
+            result = sequence_plugin.sequence_pipeline('MKT')
+        self.assertTrue(status['available'])
+        self.assertEqual(status['backend'], 'builtin')
+        self.assertEqual(result['result']['mrna'], 'ATGAAGACC')
+        self.assertTrue(result['result']['verify'])
+
     def test_sequence_domain_is_discovered_when_backend_is_available(self):
         if 'sequence' not in available_domains():
             self.skipTest('mRNA-Forge backend is not installed')
