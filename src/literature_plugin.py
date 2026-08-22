@@ -107,10 +107,10 @@ def literature_summarize(evidence):
 
 TOOLS = {
     'search': {
-        'description': 'Search local evidence, UniProt or PubMed through the shared evidence provider layer.',
+        'description': 'Search local evidence, UniProt, PubMed, NCBI Gene or KEGG through the shared evidence provider layer.',
         'parameters': _parameters({
             'gene_ids': {'type': 'array', 'items': {'type': 'string'}},
-            'provider': {'type': 'string', 'enum': ['local', 'uniprot', 'pubmed']},
+            'provider': {'type': 'string', 'enum': ['local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg']},
             'evidence_csv': {'type': 'string'},
             'cache_dir': {'type': 'string'},
             'timeout': {'type': 'number'},

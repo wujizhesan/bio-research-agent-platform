@@ -250,6 +250,59 @@ class CoreTests(unittest.TestCase):
             cached = search_gene_evidence(['TP53'], provider='pubmed', cache_dir=raw, timeout=3)
             self.assertEqual(cached['n_matches'], 1)
             mocked_get.assert_not_called()
+
+    @patch('src.evidence_providers.requests.get')
+    def test_ncbi_gene_evidence_provider_normalizes_results(self, mocked_get):
+        search_response = Mock()
+        search_response.json.return_value = {
+            'esearchresult': {'idlist': ['7157']}
+        }
+        summary_response = Mock()
+        summary_response.json.return_value = {
+            'result': {
+                'uids': ['7157'],
+                '7157': {
+                    'uid': '7157',
+                    'name': 'TP53',
+                    'description': 'tumor protein p53',
+                    'organism': {'scientificname': 'Homo sapiens'},
+                    'chromosome': '17',
+                    'maplocation': '17p13.1',
+                },
+            }
+        }
+        mocked_get.side_effect = [search_response, summary_response]
+        with tempfile.TemporaryDirectory(prefix='cadd_ncbi_gene_cache_') as raw:
+            result = search_gene_evidence(['TP53'], provider='ncbi_gene', cache_dir=raw, timeout=3)
+            self.assertEqual(result['provider'], 'ncbi_gene')
+            self.assertEqual(result['n_matches'], 1)
+            self.assertEqual(result['matches'][0]['ncbi_gene_id'], '7157')
+            self.assertEqual(result['matches'][0]['organism'], 'Homo sapiens')
+            self.assertIn('/gene/7157', result['matches'][0]['url'])
+            mocked_get.reset_mock()
+            cached = search_gene_evidence(['TP53'], provider='ncbi_gene', cache_dir=raw, timeout=3)
+            self.assertEqual(cached['n_matches'], 1)
+            mocked_get.assert_not_called()
+
+    @patch('src.evidence_providers.requests.get')
+    def test_kegg_evidence_provider_normalizes_results(self, mocked_get):
+        find_response = Mock()
+        find_response.text = 'hsa:7157\tTP53; tumor protein p53\n'
+        pathway_response = Mock()
+        pathway_response.text = 'hsa:7157\tpath:hsa04115\n'
+        mocked_get.side_effect = [find_response, pathway_response]
+        with tempfile.TemporaryDirectory(prefix='cadd_kegg_cache_') as raw:
+            result = search_gene_evidence(['TP53'], provider='kegg', cache_dir=raw, timeout=3)
+            self.assertEqual(result['provider'], 'kegg')
+            self.assertEqual(result['n_matches'], 1)
+            self.assertEqual(result['matches'][0]['kegg_id'], 'hsa:7157')
+            self.assertEqual(result['matches'][0]['pathways'], ['path:hsa04115'])
+            self.assertIn('/entry/hsa:7157', result['matches'][0]['url'])
+            mocked_get.reset_mock()
+            cached = search_gene_evidence(['TP53'], provider='kegg', cache_dir=raw, timeout=3)
+            self.assertEqual(cached['n_matches'], 1)
+            mocked_get.assert_not_called()
+
     def test_domain_registry_exposes_cadd_and_omics_tools(self):
         specs = tool_specs()
         names = {spec['name'] for spec in specs}

@@ -11,7 +11,7 @@ CI：GitHub Actions 会运行 Python 3.11/3.12 测试、Alembic 迁移、领域/
 - **CADD**：RDKit、AutoDock Vina、虚拟筛选和活性预测
 - **Omics**：RNA-seq 差异表达、通路富集、证据检索和报告生成
 - **Sequence**：通过 mRNA-Forge 插件进行 mRNA 优化、评分和翻译验证
-- **Literature**：本地证据、UniProt 和 PubMed 适配
+- **Literature**：本地证据、UniProt、PubMed、NCBI Gene 和 KEGG 适配
 - **Knowledge**：本地 Markdown、文本和 HTML 科研资料索引与检索
 - **Research**：根据任务选择领域并执行可追踪的跨领域工作流
 
@@ -136,9 +136,11 @@ python -m venv .venv
 # End-to-end RNA-seq research Agent workflow
 .venv/Scripts/python -m src.workflow_runner --workflow examples/workflows/rnaseq_research_agent.yaml --out output/rnaseq_research_agent/workflow_manifest.json
 
-# Use live UniProt or PubMed evidence with a local response cache
+# Use live UniProt, PubMed, NCBI Gene or KEGG evidence with a local response cache
 .venv/Scripts/python -m src.omics_agent --expression examples/rnaseq/expression.csv --metadata examples/rnaseq/metadata.csv --gene-sets examples/rnaseq/gene_sets.csv --evidence-provider uniprot --cache-dir output/uniprot_cache --out-dir output/rnaseq_uniprot
 .venv/Scripts/python -m src.omics_agent --expression examples/rnaseq/expression.csv --metadata examples/rnaseq/metadata.csv --gene-sets examples/rnaseq/gene_sets.csv --evidence-provider pubmed --cache-dir output/pubmed_cache --out-dir output/rnaseq_pubmed
+.venv/Scripts/python -m src.omics_agent --expression examples/rnaseq/expression.csv --metadata examples/rnaseq/metadata.csv --gene-sets examples/rnaseq/gene_sets.csv --evidence-provider ncbi_gene --cache-dir output/ncbi_gene_cache --out-dir output/rnaseq_ncbi_gene
+.venv/Scripts/python -m src.omics_agent --expression examples/rnaseq/expression.csv --metadata examples/rnaseq/metadata.csv --gene-sets examples/rnaseq/gene_sets.csv --evidence-provider kegg --cache-dir output/kegg_cache --out-dir output/rnaseq_kegg
 
 # MVP uses a replaceable SciPy statistics backend; production RNA-seq can swap in DESeq2 or edgeR without changing the Agent tool contract.
 # 验收(自检 5 项断言)

@@ -252,7 +252,7 @@ def run_omics_analysis(expression_csv, metadata_csv, gene_sets_csv, output_dir,
     )
     pathway_meta = run_pathway_enrichment(de_csv, gene_sets_csv, pathway_csv)
     evidence = None
-    if evidence_csv or evidence_provider in {'uniprot', 'pubmed'}:
+    if evidence_csv or evidence_provider in {'uniprot', 'pubmed', 'ncbi_gene', 'kegg'}:
         significant_genes = pd.read_csv(de_csv)
         significant_genes = significant_genes.loc[
             significant_genes['significant'], 'gene_id'
@@ -307,7 +307,7 @@ TOOLS = {
             'evidence_csv': {'type': 'string'},
             'condition_a': {'type': 'string'},
             'condition_b': {'type': 'string'},
-            'evidence_provider': {'type': 'string', 'enum': ['local', 'uniprot', 'pubmed']},
+            'evidence_provider': {'type': 'string', 'enum': ['local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg']},
             'evidence_cache_dir': {'type': 'string'},
             'evidence_timeout': {'type': 'number'},
         }, required=('expression_csv', 'metadata_csv', 'gene_sets_csv', 'output_dir')),
@@ -340,7 +340,7 @@ TOOLS = {
         'parameters': _parameters({
             'gene_ids': {'type': 'array', 'items': {'type': 'string'}},
             'evidence_csv': {'type': 'string'},
-            'provider': {'type': 'string', 'enum': ['local', 'uniprot', 'pubmed']},
+            'provider': {'type': 'string', 'enum': ['local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg']},
             'cache_dir': {'type': 'string'},
             'timeout': {'type': 'number'},
         }, required=('gene_ids',)),
@@ -375,7 +375,7 @@ def main(argv=None):
     parser.add_argument('--gene-sets', required=True)
     parser.add_argument('--out-dir', required=True)
     parser.add_argument('--evidence')
-    parser.add_argument('--evidence-provider', choices=('local', 'uniprot', 'pubmed'), default='local')
+    parser.add_argument('--evidence-provider', choices=('local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg'), default='local')
     parser.add_argument('--cache-dir')
     parser.add_argument('--condition-a')
     parser.add_argument('--condition-b')
