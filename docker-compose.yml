@@ -43,6 +43,7 @@ services:
       JOB_BACKEND: ${JOB_BACKEND:-redis}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       REDIS_NAMESPACE: ${REDIS_NAMESPACE:-bioagent}
+      JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-300}
     ports:
       - "${API_PUBLISHED_PORT:-8000}:8000"
     volumes:
@@ -64,6 +65,7 @@ services:
       CADD_AUTH_USERS_JSON: ${CADD_AUTH_USERS_JSON:-}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       REDIS_NAMESPACE: ${REDIS_NAMESPACE:-bioagent}
+      JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-300}
       MRNA_FORGE_ROOT: ${MRNA_FORGE_ROOT:-}
     volumes:
       - ./output:/app/output
