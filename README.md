@@ -1,7 +1,19 @@
-# EGFR 虚拟筛选流水线 + LLM Agent
+# Bio Research Agent Platform
 
-一个在 Windows 上真实跑通的 **CADD（计算机辅助药物设计）虚拟筛选项目**：
-用 AutoDock Vina + RDKit 对 EGFR 靶点做分子对接筛选，外加一层 Agent 编排。
+一个面向生物科研场景的可插拔 Agent 平台。平台通过统一的插件契约、领域注册表和工作流运行器，把 CADD、RNA-seq/Omics、mRNA 序列设计、文献证据和本地知识检索接入同一套 Agent 工具协议。
+
+许可证：MIT，见 [LICENSE](LICENSE)。
+
+## 平台领域
+
+- **CADD**：RDKit、AutoDock Vina、虚拟筛选和活性预测
+- **Omics**：RNA-seq 差异表达、通路富集、证据检索和报告生成
+- **Sequence**：通过 mRNA-Forge 插件进行 mRNA 优化、评分和翻译验证
+- **Literature**：本地证据、UniProt 和 PubMed 适配
+- **Knowledge**：本地 Markdown、文本和 HTML 科研资料索引与检索
+- **Research**：根据任务选择领域并执行可追踪的跨领域工作流
+
+CADD 是当前最完整的科学计算领域实现，其他领域通过同一套插件和工作流接口扩展。
 
 ## 项目要解决什么
 
@@ -40,6 +52,10 @@ src/pipeline.py ── 一条命令串起 ──► src/report.py (离线 markdo
   └─ src/library_data.py       分子库(活性正对照 + 非活性负对照)
 ```
 
+## 可插拔扩展
+
+CADD backend 通过统一 PluginContract 校验 API version 和 capability，配置支持内置模块、module:attribute、mapping target，以及 Python entry point：cadd_agent.plugins。domain_registry 还支持通过 cadd_agent.domains 安装外部领域工具集。每次运行的 run_manifest.json 会记录插件名称、版本、API 版本和能力。
+
 ## 快速运行（一条命令）
 
 ```bash
@@ -50,9 +66,38 @@ python -m venv .venv
 # 跑完整虚拟筛选 → 出 top_hits.csv + report.md
 .venv/Scripts/python src/pipeline.py --exhaustiveness 6
 
+# Results are isolated under output/runs/<run_id>; use an explicit id when comparing experiments
+.venv/Scripts/python src/pipeline.py --exhaustiveness 6 --run-id egfr-baseline
+
 # 离线查看报告(不依赖 LLM key)
 .venv/Scripts/python src/agent.py --report
+.venv/Scripts/python src/agent.py --chat --domain all
 
+# Build a property-matched hard-decoy benchmark from a strict external holdout
+.venv/Scripts/python -m src.build_hard_decoy_benchmark --input output/bindingdb_egfr_10000_strict_holdout.csv --out output/bindingdb_egfr_hard_decoy.csv --provenance output/bindingdb_egfr_hard_decoy.provenance.json
+.venv/Scripts/python -m src.build_hard_decoy_benchmark --input output/bindingdb_egfr_10000_strict_holdout.csv --out output/bindingdb_egfr_hard_decoy.csv --provenance output/bindingdb_egfr_hard_decoy.provenance.json --control-out output/bindingdb_egfr_random_control.csv --control-provenance output/bindingdb_egfr_random_control.provenance.json --max-pairs 50
+.venv/Scripts/python -m src.compare_benchmarks --hard output/bindingdb_egfr_hard_decoy.csv --control output/bindingdb_egfr_random_control.csv --out output/bindingdb_egfr_benchmark_comparison.json
+
+# Generate repeated random controls and bootstrap summaries
+.venv/Scripts/python -m src.run_benchmark_replicates --input output/bindingdb_egfr_10000_strict_holdout.csv --hard output/bindingdb_egfr_hard_decoy.csv --hard-provenance output/bindingdb_egfr_hard_decoy.provenance.json --control-dir output/random_controls --seeds 11 22 33 44 55 66 77 88 --out output/bindingdb_egfr_benchmark_replicates.json
+
+# RNA-seq domain adapter
+.venv/Scripts/python -m src.omics_agent --expression examples/rnaseq/expression.csv --metadata examples/rnaseq/metadata.csv --gene-sets examples/rnaseq/gene_sets.csv --evidence examples/rnaseq/evidence.csv --out-dir output/rnaseq_demo
+.venv/Scripts/python -m src.domain_registry --domain all
+
+# MCP server
+.venv/Scripts/python -m src.mcp_server --list
+.venv/Scripts/python -m src.mcp_server
+
+# Traceable cross-domain workflow
+.venv/Scripts/python -m src.workflow_runner --workflow examples/workflows/rnaseq.yaml --dry-run --out output/workflow_demo_dry/workflow_manifest.json
+.venv/Scripts/python -m src.workflow_runner --workflow examples/workflows/rnaseq.yaml --out output/workflow_demo/workflow_manifest.json
+
+# Use live UniProt or PubMed evidence with a local response cache
+.venv/Scripts/python -m src.omics_agent --expression examples/rnaseq/expression.csv --metadata examples/rnaseq/metadata.csv --gene-sets examples/rnaseq/gene_sets.csv --evidence-provider uniprot --cache-dir output/uniprot_cache --out-dir output/rnaseq_uniprot
+.venv/Scripts/python -m src.omics_agent --expression examples/rnaseq/expression.csv --metadata examples/rnaseq/metadata.csv --gene-sets examples/rnaseq/gene_sets.csv --evidence-provider pubmed --cache-dir output/pubmed_cache --out-dir output/rnaseq_pubmed
+
+# MVP uses a replaceable SciPy statistics backend; production RNA-seq can swap in DESeq2 or edgeR without changing the Agent tool contract.
 # 验收(自检 5 项断言)
 .venv/Scripts/python src/qa_verify.py
 ```
@@ -129,3 +174,51 @@ data/         PDB 结构 + 分子库(不入 git)
 output/       运行产物(top_hits.csv / report.md)
 requirements.txt / README.md / config.yaml
 ```
+
+## 对话式 UI（可选）
+
+项目现在提供两个互补界面：`app.py` 是 Streamlit 结果仪表盘，`src/chainlit_app.py` 是 Chainlit 对话入口。Chainlit 只负责交互层，工具注册、插件和 workflow 仍由现有后端负责。
+
+```bash
+.venv/Scripts/python -m streamlit run app.py
+
+```
+
+打开后可使用 `/help`、`/domain cadd|omics|all`、`/tools`、`/run <工具名> <JSON>` 和 `/workflow <路径>`。未配置 LLM Key 时，工具和工作流仍可直接运行；配置 `CADD_API_KEY` 或 `OPENAI_API_KEY` 后启用自然语言 Agent。
+
+Chainlit 当前依赖 MCP 1.x，而项目 MCP 服务使用 MCP 2.x，因此 Chainlit UI 使用独立的 .venv-chainlit；两套环境共享同一份源码和工具契约。
+
+
+Streamlit Agent chat is integrated in app.py and runs in the core .venv. Chainlit remains an optional adapter in the separate .venv-chainlit environment because its MCP dependency version differs from the project MCP server.
+
+## 安装为 Python 项目
+
+```bash
+python -m pip install -e .
+```
+
+安装后可以使用：
+
+```bash
+bio-agent-domains --domain all
+bio-agent-workflow --workflow examples/workflows/bgi_research_demo.yaml --dry-run
+bio-agent-mcp --list
+```
+
+## mRNA 插件
+
+Sequence 领域默认作为可选外部插件发现。若本机没有 mRNA-Forge，平台仍可启动，但该领域状态会标记为 `unavailable`。安装或准备 mRNA-Forge 后，通过环境变量指定路径：
+
+```bash
+set MRNA_FORGE_ROOT=D:\EnornaAgent
+```
+
+Linux/macOS 使用：
+
+```bash
+export MRNA_FORGE_ROOT=/path/to/EnornaAgent
+```
+
+## 科学边界
+
+RNA-seq 当前使用可替换的 SciPy 统计后端，适合作为可复现演示和平台契约验证；生产分析可以替换为 DESeq2 或 edgeR。mRNA 的 CAI、GC、GC3、UpA、UpU 和表达评分来自确定性规则或可选后端，不应被表述为经过大规模实验数据训练的预测模型。CADD 和序列结果都需要结合实验或领域专业判断验证。

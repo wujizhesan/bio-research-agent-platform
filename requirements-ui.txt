@@ -1,3 +1,4 @@
+chainlit==2.11.1
 rdkit>=2024.3.5
 meeko>=0.7.1
 scikit-learn>=1.4
@@ -9,6 +10,4 @@ biopython>=1.82
 gemmi>=0.7
 matplotlib>=3.8
 PyYAML>=6.0
-streamlit>=1.40
-mcp>=2.0
 jsonschema>=4.20

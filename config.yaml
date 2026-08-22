@@ -7,16 +7,35 @@ receptor:
 
 vina:
   exe: tools/vina_1.2.7_win.exe
-  exhaustiveness: 6     # 搜索充分度,越大越准越慢(正式可调 8-16)
+  exhaustiveness: 6
+  seed: 42
 
 library:
   data_module: src/library_data.py   # 分子库定义(正/负对照)
 
+ml:
+  test_fraction: 0.25
+  external_dataset: null
+
+plugins:
+  # null 使用内置实现；也支持 module:attribute 或 mapping target/entrypoint
+
+  receptor_backend: null
+  library_backend: null
+  docking_backend: null
+  ml_backend: null
+  report_backend: null
+
 output:
   dir: output
+  runs_dir: runs
+  isolate_runs: true
   csv: top_hits.csv
   report: report.md
 
 llm:                    # 可选的 LLM Agent 层(需可用 API key)
   base_url: https://opencode.ai/zen/go
   model: deepseek-v4-flash
+
+runtime:
+  resume: true

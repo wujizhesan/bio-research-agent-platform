@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.pyc
+*.egg-info/
 .venv/
 
 # 运行产物
@@ -21,3 +22,17 @@ config.local.yaml
 
 # 面试准备材料(仅本地学习,不公开)
 INTERVIEW_GUIDE.md
+*.log.txt
+
+.venv-chainlit/
+
+.playwright-cli/
+
+# Local collaboration and UI state
+.chainlit/
+.files/
+AGENTS.md
+SESSION_LOG.md
+SESSION_LOG.md.lock
+.session_summary.json
+streamlit_app.log

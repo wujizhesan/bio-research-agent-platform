@@ -1,0 +1,24 @@
+name: rnaseq-evidence-workflow
+steps:
+  - id: differential_expression
+    tool: omics_run_differential_expression
+    args:
+      expression_csv: examples/rnaseq/expression.csv
+      metadata_csv: examples/rnaseq/metadata.csv
+      output_csv: output/workflow_demo/differential_expression.csv
+  - id: pathway_enrichment
+    tool: omics_run_pathway_enrichment
+    depends_on:
+      - differential_expression
+    args:
+      de_csv: ${differential_expression.output_csv}
+      gene_sets_csv: examples/rnaseq/gene_sets.csv
+      output_csv: output/workflow_demo/pathway_enrichment.csv
+  - id: report
+    tool: omics_generate_omics_report
+    depends_on:
+      - pathway_enrichment
+    args:
+      de_csv: ${differential_expression.output_csv}
+      pathway_csv: ${pathway_enrichment.output_csv}
+      output_md: output/workflow_demo/omics_report.md

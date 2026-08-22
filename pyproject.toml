@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bio-research-agent-platform"
+version = "0.1.0"
+description = "Pluggable research Agent platform for CADD, RNA-seq, mRNA design, literature and knowledge workflows"
+requires-python = ">=3.11"
+dependencies = [
+  "rdkit>=2024.3.5",
+  "meeko>=0.7.1",
+  "scikit-learn>=1.4",
+  "pandas>=2.0",
+  "numpy>=1.26",
+  "scipy>=1.11",
+  "requests>=2.31",
+  "biopython>=1.82",
+  "gemmi>=0.7",
+  "matplotlib>=3.8",
+  "PyYAML>=6.0",
+  "jsonschema>=4.20",
+]
+
+[project.optional-dependencies]
+ui = ["streamlit>=1.40", "mcp>=2.0"]
+chainlit = ["chainlit==2.11.1"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+bio-agent-domains = "domain_registry:main"
+bio-agent-workflow = "workflow_runner:main"
+bio-agent-mcp = "mcp_server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = [
+  "agent",
+  "api_server",
+  "audit_external_overlap",
+  "build_hard_decoy_benchmark",
+  "build_library",
+  "chainlit_app",
+  "compare_benchmarks",
+  "config_loader",
+  "domain_registry",
+  "dock_vina",
+  "evidence_providers",
+  "fetch_bindingdb_egfr",
+  "fetch_chembl_egfr",
+  "import_bindingdb",
+  "job_manager",
+  "knowledge_plugin",
+  "literature_plugin",
+  "library_data",
+  "mcp_server",
+  "ml_predictor",
+  "omics_agent",
+  "pipeline",
+  "plugin_loader",
+  "plugin_manager",
+  "plugin_manifest",
+  "prepare_receptor",
+  "qa_verify",
+  "report",
+  "research_agent",
+  "resplit_external",
+  "run_benchmark_replicates",
+  "sequence_plugin",
+  "streamlit_chat",
+  "visualize",
+  "workflow_runner",
+]

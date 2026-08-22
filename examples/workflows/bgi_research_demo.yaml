@@ -1,0 +1,69 @@
+name: bgi-research-demo
+steps:
+  - id: differential_expression
+    tool: omics_run_differential_expression
+    args:
+      expression_csv: examples/rnaseq/expression.csv
+      metadata_csv: examples/rnaseq/metadata.csv
+      output_csv: output/bgi_research_demo/differential_expression.csv
+
+  - id: literature_search
+    tool: literature_search
+    depends_on:
+      - differential_expression
+    args:
+      gene_ids:
+        - GeneA
+      provider: local
+      evidence_csv: examples/rnaseq/evidence.csv
+
+  - id: literature_summary
+    tool: literature_summarize
+    depends_on:
+      - literature_search
+    args:
+      evidence: ${literature_search.result}
+
+  - id: knowledge_ingest
+    tool: knowledge_ingest_directory
+    depends_on:
+      - literature_summary
+    args:
+      input_dir: examples/knowledge
+      output_path: output/bgi_research_demo/knowledge_index.json
+
+  - id: knowledge_search
+    tool: knowledge_search
+    depends_on:
+      - knowledge_ingest
+    args:
+      query: RNA-seq differential expression mRNA sequence design
+      index_path: ${knowledge_ingest.result.output_path}
+      top_k: 2
+
+  - id: pathway_enrichment
+    tool: omics_run_pathway_enrichment
+    depends_on:
+      - differential_expression
+    args:
+      de_csv: ${differential_expression.output_csv}
+      gene_sets_csv: examples/rnaseq/gene_sets.csv
+      output_csv: output/bgi_research_demo/pathway_enrichment.csv
+
+  - id: omics_report
+    tool: omics_generate_omics_report
+    depends_on:
+      - pathway_enrichment
+      - literature_summary
+      - knowledge_search
+    args:
+      de_csv: ${differential_expression.output_csv}
+      pathway_csv: ${pathway_enrichment.output_csv}
+      output_md: output/bgi_research_demo/omics_report.md
+
+  - id: sequence_design
+    tool: sequence_pipeline
+    args:
+      protein: MKT
+      molecule: linear
+      method: greedy

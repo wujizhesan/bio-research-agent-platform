@@ -1,0 +1,4 @@
+pathway_id,pathway_name,gene_id
+P1,Example pathway,GeneA
+P1,Example pathway,GeneB
+P2,Background pathway,GeneC

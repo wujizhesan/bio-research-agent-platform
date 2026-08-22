@@ -16,6 +16,15 @@ VINA_EXE = Path(__file__).resolve().parent.parent / 'tools' / 'vina_1.2.7_win.ex
 BOX_SIZE = (18.0, 18.0, 18.0)
 
 
+def parse_affinity(text):
+    affinities = []
+    for line in text.splitlines():
+        match = re.match(r'\s*\d+\s+(-?\d+\.\d+)', line)
+        if match:
+            affinities.append(float(match.group(1)))
+    return min(affinities) if affinities else None
+
+
 def receptor_center_from_ligand(pdb_with_ligand, ligand_resname='AQ4'):
     """从含共晶配体的原始 PDB 提取指定配体(如 AQ4)的坐标,计算结合口袋中心(质心)。
     这是"真算出来的"盒子中心: 用已知结合 EGFR 的共晶配体定结合口袋。
@@ -40,7 +49,7 @@ def receptor_center_from_ligand(pdb_with_ligand, ligand_resname='AQ4'):
 
 
 def dock_one(ligand_pdbqt, receptor_pdb, out_prefix, exhaustiveness=8,
-             center=None, size=None, source_pdb=None):
+             center=None, size=None, source_pdb=None, vina_exe=None, resume=False, seed=None):
     """单个配体对接,返回 {'name','affinity'} 或 None(失败)。
     受体用 Vina 可直接接受的干净 PDB。
     source_pdb 传"含共晶配体的原始 PDB"(如 data/4hjo.pdb),用于从 AQ4 算盒子中心。"""
@@ -56,28 +65,33 @@ def dock_one(ligand_pdbqt, receptor_pdb, out_prefix, exhaustiveness=8,
     out_pdbqt = out_prefix.with_suffix('.out.pdbqt')
     log_txt = out_prefix.with_suffix('.log.txt')
 
+    if resume and out_pdbqt.exists() and log_txt.exists():
+        affinity = parse_affinity(log_txt.read_text(encoding='utf-8', errors='replace'))
+        if affinity is not None:
+            print(f'  [dock] {ligand_pdbqt.name} 使用已有结果 {affinity:.2f}')
+            return {'name': ligand_pdbqt.stem, 'affinity': affinity, 'resumed': True}
+
+    exe = Path(vina_exe) if vina_exe else VINA_EXE
     cmd = [
-        str(VINA_EXE), '--receptor', str(receptor_pdb),
+        str(exe), '--receptor', str(receptor_pdb),
         '--ligand', str(ligand_pdbqt),
         '--center_x', str(center[0]), '--center_y', str(center[1]), '--center_z', str(center[2]),
         '--size_x', str(size[0]), '--size_y', str(size[1]), '--size_z', str(size[2]),
         '--exhaustiveness', str(exhaustiveness),
         '--out', str(out_pdbqt),
     ]
+    if seed is not None:
+        cmd.extend(['--seed', str(seed)])
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        # Vina 会输出多个构象(mode),打分格式 "   <mode>   <affinity>   ..."
-        # 取所有构象中最低(kcal/mol 最负)的打分 = 该配体的最佳结合模式
-        affinities = []
-        for line in r.stdout.splitlines():
-            m = re.match(r'\s*\d+\s+(-\d+\.\d+)', line)
-            if m:
-                affinities.append(float(m.group(1)))
-        if not affinities:
+        log_txt.write_text(r.stdout + '\n[stderr]\n' + r.stderr, encoding='utf-8')
+        if r.returncode != 0:
+            print(f'  [dock] {ligand_pdbqt.name} 失败(returncode={r.returncode}): {r.stderr[-300:]}')
+            return None
+        affinity = parse_affinity(r.stdout)
+        if affinity is None:
             print(f'  [dock] {ligand_pdbqt.name} 未找到打分, stderr: {r.stderr[-300:]}')
             return None
-        # 最佳结合 = 最负的亲和力(注意:Vina mode1 不一定是最低分,须遍历取 min)
-        affinity = min(affinities)
         return {'name': ligand_pdbqt.stem, 'affinity': affinity}
     except subprocess.TimeoutExpired:
         print(f'  [dock] {ligand_pdbqt.name} 超时')
@@ -87,13 +101,15 @@ def dock_one(ligand_pdbqt, receptor_pdb, out_prefix, exhaustiveness=8,
         return None
 
 
-def dock_batch(ligand_pdbqts, receptor_pdb, out_dir, exhaustiveness=8, source_pdb=None):
+def dock_batch(ligand_pdbqts, receptor_pdb, out_dir, exhaustiveness=8, source_pdb=None,
+              center=None, size=None, vina_exe=None, resume=False, seed=None):
     """批量对接,返回 DataFrame(按 affinity 升序)。
     source_pdb: 含共晶配体的原始 PDB,用于从 AQ4 算盒子中心。"""
     results = []
     for i, lig in enumerate(ligand_pdbqts):
         prefix = Path(out_dir) / f'dock_{i}'
-        res = dock_one(lig, receptor_pdb, prefix, exhaustiveness, source_pdb=source_pdb)
+        res = dock_one(lig, receptor_pdb, prefix, exhaustiveness, center=center, size=size,
+                       source_pdb=source_pdb, vina_exe=vina_exe, resume=resume, seed=seed)
         if res:
             results.append(res)
     return pd.DataFrame(results).sort_values('affinity') if results else pd.DataFrame()
