@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 from src.domain_registry import available_domains, domain_catalog, run_tool, tool_specs
@@ -34,6 +36,18 @@ class SequencePluginTests(unittest.TestCase):
         self.assertEqual(result['plugin'], 'sequence')
         self.assertTrue(result['result']['verify'])
         self.assertEqual(result['result']['mrna_len'], 9)
+
+    def test_sequence_report_loads_external_builder_without_module_collision(self):
+        if sequence_plugin.plugin_status().get('backend') != 'external':
+            self.skipTest('external mRNA-Forge backend is not installed')
+        pipeline = sequence_plugin.sequence_pipeline('MKT')
+        with tempfile.TemporaryDirectory(prefix='sequence_report_') as raw:
+            result = sequence_plugin.sequence_report(
+                pipeline,
+                output_path=Path(raw) / 'report.html',
+            )
+            self.assertEqual(result['status'], 'ok')
+            self.assertTrue(Path(result['result']['output_html']).exists())
 
     def test_platform_domain_catalog_reports_plugin_health(self):
         catalog = {item['domain']: item for item in domain_catalog()}

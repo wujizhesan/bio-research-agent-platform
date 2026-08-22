@@ -1,5 +1,6 @@
 """Adapter for the optional mRNA-Forge sequence domain."""
 import importlib
+from importlib import util as importlib_util
 import os
 import re
 import sys
@@ -246,15 +247,15 @@ def sequence_report(result, output_path='output/sequence_report.html'):
         built = backend.build_report(payload, str(report_path))
     else:
         root = Path(plugin_status()['root'])
-        sys.path.insert(0, str(root))
-        try:
-            report_builder = importlib.import_module('report.report_builder')
-            built = report_builder.build_report(payload, str(report_path))
-        finally:
-            try:
-                sys.path.remove(str(root))
-            except ValueError:
-                pass
+        builder_path = root / 'report' / 'report_builder.py'
+        if not builder_path.exists():
+            raise ImportError(f'external report builder not found: {builder_path}')
+        spec = importlib_util.spec_from_file_location('bio_agent_external_report_builder', builder_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f'cannot load external report builder: {builder_path}')
+        report_builder = importlib_util.module_from_spec(spec)
+        spec.loader.exec_module(report_builder)
+        built = report_builder.build_report(payload, str(report_path))
     return _envelope('report', {
         'status': 'ok',
         'output_html': str(built or report_path),

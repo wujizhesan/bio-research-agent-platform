@@ -54,6 +54,26 @@ type EventItem = {
   detail: string
 }
 
+type ResearchPlanExecution = {
+  ready: boolean
+  missing_inputs: string[]
+  evidence_provider: string
+  selected_tools: string[]
+  rationale: string[]
+  workflow?: Record<string, unknown> | null
+  workflow_preview?: Record<string, unknown> | null
+}
+
+type ResearchPlan = {
+  status: string
+  task: string
+  selected_domains: string[]
+  capabilities: string[]
+  required_inputs: Array<{ name: string; description: string }>
+  evidence_provider: string
+  execution: ResearchPlanExecution
+}
+
 type View = 'workspace' | 'domains'
 type RunMode = 'research' | 'sequence'
 
@@ -69,6 +89,22 @@ const statusLabels: Record<string, string> = {
   running: '执行中',
   completed: '已完成',
   failed: '失败',
+}
+
+const providerLabels: Record<string, string> = {
+  local: '本地证据',
+  kegg: 'KEGG',
+  ncbi_gene: 'NCBI Gene',
+  pubmed: 'PubMed',
+  uniprot: 'UniProt',
+}
+
+const domainLabels: Record<string, string> = {
+  cadd: 'CADD',
+  omics: 'Omics',
+  sequence: 'mRNA / Sequence',
+  literature: 'Literature',
+  knowledge: 'Knowledge',
 }
 
 const domainIcons: Record<string, typeof Beaker> = {
@@ -146,6 +182,8 @@ function App() {
   const [events, setEvents] = useState<EventItem[]>([])
   const [task, setTask] = useState('分析 RNA-seq 差异表达并设计 mRNA 序列')
   const [protein, setProtein] = useState('MKT')
+  const [evidenceProvider, setEvidenceProvider] = useState('local')
+  const [researchPlan, setResearchPlan] = useState<ResearchPlan | null>(null)
   const [loading, setLoading] = useState(false)
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState('')
@@ -179,34 +217,58 @@ function App() {
     void refresh()
   }
 
-  async function submitRun() {
+  function buildResearchInputs() {
+    return {
+      expression_csv: 'examples/rnaseq/expression.csv',
+      metadata_csv: 'examples/rnaseq/metadata.csv',
+      gene_sets_csv: 'examples/rnaseq/gene_sets.csv',
+      evidence_csv: evidenceProvider === 'local' ? 'examples/rnaseq/evidence.csv' : undefined,
+      evidence_provider: evidenceProvider,
+      protein,
+      output_dir: 'output/frontend_auto_research',
+    }
+  }
+
+  function extractResearchPlan(job: Job) {
+    const payload = job.result
+    if (!payload || typeof payload !== 'object') return null
+    const candidate = payload as Record<string, unknown>
+    if (candidate.status !== 'planned' || !candidate.execution || typeof candidate.execution !== 'object') return null
+    return candidate as unknown as ResearchPlan
+  }
+
+  async function submitToolJob(
+    tool: string,
+    arguments_: Record<string, unknown>,
+    acceptedDetail: string,
+    onCompleted?: (job: Job) => void,
+  ) {
     setLoading(true)
     setError('')
     setEvents([])
     try {
-      const payload = mode === 'research'
-        ? { tool: 'research_plan', arguments: { task } }
-        : { tool: 'sequence_pipeline', arguments: { protein, molecule: 'linear', method: 'greedy' } }
       const response = await apiFetch<{ job: Job }>(apiBase, token, '/api/v1/jobs', {
         method: 'POST',
         headers: { 'Idempotency-Key': crypto.randomUUID() },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ tool, arguments: arguments_ }),
       })
       const job = response.job
       setSelectedJob(job)
       setJobs((current) => [job, ...current.filter((item) => item.job_id !== job.job_id)])
-      setEvents([{ at: formatTime(new Date().toISOString()), type: 'accepted', status: 'queued', detail: '任务已进入执行队列' }])
+      setEvents([{ at: formatTime(new Date().toISOString()), type: 'accepted', status: 'queued', detail: acceptedDetail }])
       await followJob(apiBase, token, job.job_id, (type, data) => {
         if (!data.job) return
-        setSelectedJob(data.job)
-        setJobs((current) => [data.job!, ...current.filter((item) => item.job_id !== data.job!.job_id)])
+        const currentJob = data.job
+        setSelectedJob(currentJob)
+        setJobs((current) => [currentJob, ...current.filter((item) => item.job_id !== currentJob.job_id)])
+        if (currentJob.status === 'completed') onCompleted?.(currentJob)
         setEvents((current) => [
           ...current,
           {
             at: formatTime(new Date().toISOString()),
             type,
-            status: data.job!.status,
-            detail: type === 'timeout' ? 'SSE 订阅超时，任务仍可通过列表查询' : `状态更新为${statusLabels[data.job!.status]}`,
+            status: currentJob.status,
+            detail: type === 'timeout' ? 'SSE 订阅超时，任务仍可通过列表查询' : `状态更新为${statusLabels[currentJob.status] || currentJob.status}`,
           },
         ])
       })
@@ -216,6 +278,41 @@ function App() {
       setLoading(false)
       void refresh()
     }
+  }
+
+  async function submitRun() {
+    if (mode === 'research') {
+      setResearchPlan(null)
+      await submitToolJob(
+        'research_plan',
+        { task, inputs: buildResearchInputs() },
+        '研究计划已进入执行队列',
+        (job) => setResearchPlan(extractResearchPlan(job)),
+      )
+      return
+    }
+    await submitToolJob(
+      'sequence_pipeline',
+      { protein, molecule: 'linear', method: 'greedy' },
+      'mRNA 设计任务已进入执行队列',
+    )
+  }
+
+  async function executeResearchPlan() {
+    const execution = researchPlan?.execution
+    if (!researchPlan || !execution?.ready || !execution.workflow) return
+    await submitToolJob(
+      'research_execute',
+      {
+        workflow: execution.workflow,
+        domains: researchPlan.selected_domains,
+        output_path: 'output/frontend_auto_research_manifest.json',
+        report_path: 'output/frontend_auto_research_report.md',
+        dry_run: false,
+        continue_on_error: false,
+      },
+      '已确认计划，研究工作流进入执行队列',
+    )
   }
 
   async function submitOmicsDemo() {
@@ -341,12 +438,21 @@ function App() {
                 <div className="panel p-5 sm:p-6">
                   <div className="flex items-start justify-between gap-4"><div><div className="eyebrow">01 / START A RUN</div><h2 className="mt-2 text-xl font-semibold">启动一条研究路径</h2></div><div className="rounded-xl border border-[#21443f] bg-[#102b2a] p-2.5 text-[#8fe5c1]"><Play size={17} /></div></div>
                   <div className="mt-7 grid grid-cols-2 gap-1 rounded-xl bg-[#071719] p-1"><button onClick={() => setMode('research')} className={`mode-tab ${mode === 'research' ? 'mode-tab-active' : ''}`}><Workflow size={14} />研究规划</button><button onClick={() => setMode('sequence')} className={`mode-tab ${mode === 'sequence' ? 'mode-tab-active' : ''}`}><Dna size={14} />mRNA 设计</button></div>
-                  {mode === 'research' ? <label className="mt-6 block"><span className="field-label">科学问题</span><textarea value={task} onChange={(event) => setTask(event.target.value)} rows={4} className="input-area" placeholder="描述你希望 Agent 协助完成的研究任务" /></label> : <label className="mt-6 block"><span className="field-label">Protein sequence</span><input value={protein} onChange={(event) => setProtein(event.target.value.toUpperCase())} className="input-control font-mono tracking-[0.18em]" placeholder="例如 MKT" /><span className="mt-2 block text-xs text-[#688983]">内置确定性后端将执行 optimize → score → verify。</span></label>}
+                  {mode === 'research' ? <>
+                    <label className="mt-6 block"><span className="field-label">科学问题</span><textarea value={task} onChange={(event) => { setTask(event.target.value); setResearchPlan(null) }} rows={4} className="input-area" placeholder="描述你希望 Agent 协助完成的研究任务" /></label>
+                    <div className="mt-5 grid gap-4 sm:grid-cols-[1fr_0.8fr]">
+                      <div><label className="field-label" htmlFor="protein-context">蛋白输入上下文</label><input id="protein-context" value={protein} onChange={(event) => { setProtein(event.target.value.toUpperCase()); setResearchPlan(null) }} className="input-control font-mono tracking-[0.18em]" placeholder="例如 MKT" /></div>
+                      <div><label className="field-label" htmlFor="evidence-provider">证据源</label><select id="evidence-provider" value={evidenceProvider} onChange={(event) => { setEvidenceProvider(event.target.value); setResearchPlan(null) }} className="input-control"><option value="local">本地证据</option><option value="kegg">KEGG</option><option value="ncbi_gene">NCBI Gene</option><option value="pubmed">PubMed</option><option value="uniprot">UniProt</option></select></div>
+                    </div>
+                    <p className="mt-3 text-xs leading-5 text-[#688983]">Planner 使用仓库内示例数据生成预览；执行前仍会显示工具链和缺失输入。</p>
+                  </> : <label className="mt-6 block"><span className="field-label">Protein sequence</span><input value={protein} onChange={(event) => setProtein(event.target.value.toUpperCase())} className="input-control font-mono tracking-[0.18em]" placeholder="例如 MKT" /><span className="mt-2 block text-xs text-[#688983]">内置确定性后端将执行 optimize → score → verify。</span></label>}
                   <div className="mt-6 flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2 font-mono text-[10px] text-[#66847e]"><CircleDot size={13} className="text-[#70e3ad]" />ASYNC / TRACEABLE / REPLAYABLE</div><button onClick={submitRun} disabled={loading || (mode === 'research' ? !task.trim() : !protein.trim())} className="group inline-flex items-center gap-2 rounded-xl bg-[#a8f0d2] px-4 py-2.5 text-sm font-semibold text-[#092521] transition hover:bg-[#c6f8e1] disabled:cursor-not-allowed disabled:opacity-50">{loading ? <RefreshCw size={15} className="animate-spin" /> : <Play size={15} />}{loading ? '执行中…' : '开始运行'}<ArrowUpRight size={14} className="transition group-hover:translate-x-0.5 group-hover:-translate-y-0.5" /></button></div>
                 </div>
 
                 <div className="panel flex min-h-[326px] flex-col p-5 sm:p-6"><div className="flex items-start justify-between"><div><div className="eyebrow">02 / EXECUTION STREAM</div><h2 className="mt-2 text-xl font-semibold">实时执行轨迹</h2></div><div className="flex items-center gap-1.5 rounded-full border border-[#28524b] bg-[#102b2a] px-2.5 py-1 font-mono text-[10px] text-[#8fe5c1]"><span className="size-1.5 animate-pulse rounded-full bg-[#70e3ad]" />SSE</div></div>{selectedJob ? <div className="mt-7 flex flex-1 flex-col"><div className="flex items-center justify-between border-b border-white/10 pb-4"><div><div className="font-mono text-[11px] text-[#6f9189]">{formatJobId(selectedJob.job_id)}</div><div className="mt-1 text-sm font-medium">{selectedJob.tool}</div></div><StatusBadge status={selectedJob.status} /></div><div className="mt-5 space-y-3">{events.slice(-4).map((event, index) => <div key={`${event.at}-${index}`} className="flex items-start gap-3 text-xs"><div className="mt-1.5 size-1.5 rounded-full bg-[#83e3bc] shadow-[0_0_12px_#83e3bc]" /><div className="min-w-0 flex-1"><div className="text-[#b2cbc4]">{event.detail}</div><div className="mt-1 font-mono text-[10px] text-[#5f7c76]">{event.at} · {event.status}</div></div></div>)}</div><div className="mt-auto flex items-center gap-2 pt-5 font-mono text-[10px] text-[#64827b]"><Clock3 size={13} />{selectedJob.status === 'completed' ? `完成于 ${formatTime(selectedJob.finished_at)}` : '等待状态更新…'}</div></div> : <EmptyStream />}</div>
               </section>
+
+              {mode === 'research' && <ResearchPlanCard plan={researchPlan} loading={loading && selectedJob?.tool === 'research_plan'} onExecute={() => void executeResearchPlan()} />}
 
               <section className="panel mt-5 overflow-hidden"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-5 py-5 sm:px-6"><div><div className="eyebrow">03 / RECENT RUNS</div><h2 className="mt-2 text-xl font-semibold">最近任务</h2></div><button onClick={() => void refresh()} className="inline-flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-xs text-[#9bb7b0] transition hover:border-[#4f8c7d] hover:text-[#d6eee7]"><RefreshCw size={13} />刷新</button></div>{jobs.length ? <div className="overflow-x-auto"><table className="w-full min-w-[680px] text-left text-sm"><thead className="bg-white/[0.025] font-mono text-[10px] tracking-[0.12em] text-[#63817b]"><tr><th className="px-5 py-3 font-normal sm:px-6">TASK ID</th><th className="px-5 py-3 font-normal">TOOL</th><th className="px-5 py-3 font-normal">STATUS</th><th className="px-5 py-3 font-normal">CREATED</th><th className="px-5 py-3 font-normal" /></tr></thead><tbody>{jobs.map((job) => <tr key={job.job_id} onClick={() => { setSelectedJob(job); setEvents([]) }} className="cursor-pointer border-t border-white/[0.06] transition hover:bg-white/[0.035]"><td className="px-5 py-4 font-mono text-xs text-[#81aaa1] sm:px-6">{formatJobId(job.job_id)}</td><td className="px-5 py-4 font-medium text-[#c7ddd7]">{job.tool}</td><td className="px-5 py-4"><StatusBadge status={job.status} /></td><td className="px-5 py-4 font-mono text-xs text-[#66837d]">{formatTime(job.created_at)}</td><td className="px-5 py-4 text-right text-[#6b8f87]"><ChevronRight size={15} /></td></tr>)}</tbody></table></div> : <div className="px-6 py-12 text-center text-sm text-[#66837d]">还没有运行记录，先启动一条研究路径。</div>}</section>
             </>
@@ -364,6 +470,35 @@ function Metric({ label, value, icon }: { label: string; value: string; icon: Re
 function StatusBadge({ status }: { status: string }) {
   const style = status === 'completed' ? 'status-ok' : status === 'failed' || status === 'cancelled' ? 'status-failed' : status === 'running' ? 'status-running' : 'status-queued'
   return <span className={`status-badge ${style}`}><span className="size-1.5 rounded-full bg-current" />{status === 'cancelled' ? '已取消' : statusLabels[status] || status}</span>
+}
+
+function ResearchPlanCard({ plan, loading, onExecute }: { plan: ResearchPlan | null; loading: boolean; onExecute: () => void }) {
+  const execution = plan?.execution
+  return <section className="panel mt-5 overflow-hidden" aria-live="polite">
+    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-5 py-5 sm:px-6">
+      <div><div className="eyebrow">02B / PLAN REVIEW</div><h2 className="mt-2 text-xl font-semibold">执行前计划检查</h2></div>
+      <div className="flex items-center gap-2 rounded-full border border-[#28524b] bg-[#102b2a] px-2.5 py-1 font-mono text-[10px] text-[#8fe5c1]"><Workflow size={12} />HUMAN CONFIRMATION</div>
+    </div>
+    {!plan ? <div className="flex items-center gap-4 px-5 py-8 text-sm text-[#789791] sm:px-6"><div className="grid size-10 place-items-center rounded-xl border border-[#21443f] bg-[#102b2a] text-[#78cdaa]">{loading ? <RefreshCw size={17} className="animate-spin" /> : <Sparkles size={17} />}</div><div><div className="font-medium text-[#b7d3ca]">{loading ? 'Planner 正在检查任务…' : '提交科研问题后，这里会出现执行计划。'}</div><div className="mt-1 text-xs text-[#66857e]">计划会先展示领域、证据源、工具链和输入门槛。</div></div></div> : <div className="space-y-5 px-5 py-5 sm:px-6">
+      <div className="flex flex-wrap items-center gap-2">
+        {plan.selected_domains.map((domain) => <span key={domain} className="status-badge status-ok"><span className="size-1.5 rounded-full bg-current" />{domainLabels[domain] || domain}</span>)}
+        <span className="status-badge status-running">证据：{providerLabels[execution?.evidence_provider || plan.evidence_provider] || execution?.evidence_provider}</span>
+      </div>
+      <div className="grid gap-4 lg:grid-cols-[0.7fr_1.3fr]">
+        <div className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-4">
+          <div className="field-label">INPUT GATE</div>
+          {execution?.ready ? <div className="flex items-center gap-2 text-sm text-[#9be6c5]"><Check size={15} />输入已满足，可执行</div> : <div className="text-sm text-[#efb19f]">缺少必要输入</div>}
+          {!execution?.ready && <div className="mt-3 flex flex-wrap gap-1.5">{(execution?.missing_inputs || []).map((item) => <span key={item} className="rounded-md border border-[#70483f] bg-[#2b1b1b] px-2 py-1 font-mono text-[10px] text-[#e9a694]">{item}</span>)}</div>}
+          {execution?.rationale?.length ? <div className="mt-4 space-y-2 text-xs leading-5 text-[#789791]">{execution.rationale.map((item) => <div key={item} className="flex gap-2"><span className="mt-2 size-1 rounded-full bg-[#78cdaa]" />{item}</div>)}</div> : null}
+        </div>
+        <div className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-4">
+          <div className="field-label">SELECTED TOOLCHAIN</div>
+          <div className="flex flex-wrap gap-2">{(execution?.selected_tools || []).map((tool, index) => <div key={`${tool}-${index}`} className="inline-flex items-center gap-2 rounded-lg border border-[#28524b] bg-[#102b2a] px-2.5 py-2 font-mono text-[10px] text-[#b9e6d5]"><span className="grid size-4 place-items-center rounded-full bg-[#8fe5c1] text-[9px] font-bold text-[#092521]">{index + 1}</span>{tool}</div>)}</div>
+        </div>
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/[0.08] pt-4"><div className="text-xs text-[#66857e]">规划任务：<span className="text-[#aac8bf]">{plan.task}</span></div><button onClick={onExecute} disabled={loading || !execution?.ready} className="inline-flex items-center gap-2 rounded-xl bg-[#a8f0d2] px-4 py-2.5 text-sm font-semibold text-[#092521] transition hover:bg-[#c6f8e1] disabled:cursor-not-allowed disabled:opacity-40"><Check size={15} />确认并执行</button></div>
+    </div>}
+  </section>
 }
 
 function EmptyStream() {

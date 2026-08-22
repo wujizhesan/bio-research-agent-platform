@@ -23,6 +23,8 @@ CADD 是当前最完整的科学计算领域实现，其他领域通过同一套
 
 提交后台任务后，可通过 `GET /api/v1/jobs/{job_id}/events` 使用 SSE 订阅状态变化，服务会推送 `queued`、`running` 和终态事件；接口支持 `interval_seconds`、`timeout_seconds` 查询参数。
 
+React 工作台的研究模式采用两阶段交互：先提交 `research_plan` 展示领域、证据源、输入门槛和实际工具链，再由用户确认后提交 `research_execute`；mRNA 模式仍可直接运行 `sequence_pipeline`。两阶段任务都通过同一套 Job/SSE 生命周期展示。
+
 ```bash
 python -m pip install -e .
 bio-agent-api --port 8000
