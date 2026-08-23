@@ -89,6 +89,10 @@ _GENOMICS_QC_KEYWORDS = (
     'sequencing qc', '测序质控', '质量控制',
 )
 
+_SINGLE_CELL_KEYWORDS = (
+    'single-cell', 'single cell', 'scrna', '10x', '单细胞',
+)
+
 
 RESEARCH_PRESETS = {
     'bgi_research_demo': {
@@ -172,10 +176,20 @@ def _is_genomics_qc_task(task, inputs=None):
     return any(keyword in text for keyword in _GENOMICS_QC_KEYWORDS)
 
 
+def _is_single_cell_task(task, inputs=None):
+    inputs = inputs or {}
+    if any(key in inputs for key in ('matrix_csv', 'single_cell_matrix')):
+        return True
+    text = str(task or '').lower()
+    return any(keyword in text for keyword in _SINGLE_CELL_KEYWORDS)
+
+
 def _required_inputs(domains, task=None, inputs=None):
     required = []
     if 'omics' in domains:
-        if _is_genomics_qc_task(task, inputs):
+        if _is_single_cell_task(task, inputs):
+            required.append({'name': 'matrix_csv', 'description': 'cell-by-gene count matrix CSV'})
+        elif _is_genomics_qc_task(task, inputs):
             required.append({'name': 'input_path', 'description': 'FASTQ, BAM/CRAM or VCF/BCF input file'})
         elif _is_variant_task(task, inputs):
             required.append({'name': 'vcf_path', 'description': 'VCF variant file'})
@@ -231,8 +245,30 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
         missing.append('gencode_gtf')
 
     variant_task = _is_variant_task(task, inputs)
+    single_cell_task = _is_single_cell_task(task, inputs)
     qc_task = _is_genomics_qc_task(task, inputs)
-    if 'omics' in domains and qc_task:
+    if 'omics' in domains and single_cell_task:
+        matrix_csv = inputs.get('matrix_csv') or inputs.get('single_cell_matrix')
+        if not matrix_csv:
+            missing.append('matrix_csv')
+        else:
+            single_cell_args = {
+                'matrix_csv': str(matrix_csv),
+                'output_dir': output_dir,
+            }
+            for key in (
+                'cell_id_column', 'min_genes', 'max_genes', 'min_counts',
+                'max_mito_percent', 'mitochondrial_prefix',
+            ):
+                if inputs.get(key) is not None:
+                    single_cell_args[key] = inputs[key]
+            steps.append({
+                'id': 'single_cell_qc',
+                'tool': 'omics_run_single_cell_qc',
+                'args': single_cell_args,
+            })
+            rationale.append('single-cell QC calculates genes-per-cell, total counts and mitochondrial fraction')
+    elif 'omics' in domains and qc_task:
         qc_input = (
             inputs.get('input_path')
             or inputs.get('fastq_path')

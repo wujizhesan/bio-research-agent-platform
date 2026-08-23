@@ -25,6 +25,7 @@ PLUGIN_CAPABILITIES = (
     'omics.variant_annotation',
     'omics.toolchain',
     'omics.genomics_qc',
+    'omics.single_cell_qc',
 )
 STATISTICS_BACKENDS = ('auto', 'scipy', 'deseq2')
 VARIANT_ANNOTATION_BACKENDS = ('auto', 'local', 'vcf_ann')
@@ -543,6 +544,97 @@ def _parse_flagstat_total(text):
     return int(match.group(1)) + int(match.group(2))
 
 
+def run_single_cell_qc(matrix_csv, output_dir, cell_id_column='cell_id',
+                       min_genes=0, max_genes=None, min_counts=0,
+                       max_mito_percent=100, mitochondrial_prefix='MT-'):
+    matrix_csv = Path(matrix_csv)
+    if not matrix_csv.is_file():
+        raise ValueError(f'single-cell matrix does not exist: {matrix_csv}')
+    frame = pd.read_csv(matrix_csv)
+    if frame.empty:
+        raise ValueError('single-cell expression matrix is empty')
+    if cell_id_column not in frame.columns:
+        raise ValueError(f'single-cell matrix requires column: {cell_id_column}')
+    gene_columns = [column for column in frame.columns if column != cell_id_column]
+    if not gene_columns:
+        raise ValueError('single-cell matrix has no gene columns')
+    raw_cell_ids = frame[cell_id_column]
+    if raw_cell_ids.isna().any():
+        raise ValueError('cell identifiers must be non-empty and unique')
+    cell_ids = raw_cell_ids.astype(str).str.strip()
+    if cell_ids.eq('').any() or cell_ids.duplicated().any():
+        raise ValueError('cell identifiers must be non-empty and unique')
+    counts = frame[gene_columns].apply(pd.to_numeric, errors='raise')
+    if counts.isna().any().any() or (counts < 0).any().any():
+        raise ValueError('single-cell counts must be non-negative numbers')
+    min_genes = max(0, int(min_genes))
+    min_counts = max(0, float(min_counts))
+    max_mito_percent = float(max_mito_percent)
+    if max_genes is not None:
+        max_genes = max(0, int(max_genes))
+    if max_mito_percent < 0 or max_mito_percent > 100:
+        raise ValueError('max_mito_percent must be between 0 and 100')
+    prefix = str(mitochondrial_prefix or 'MT-').upper()
+    mito_columns = [
+        column for column in gene_columns
+        if str(column).upper().startswith(prefix)
+    ]
+    total_counts = counts.sum(axis=1)
+    n_genes = (counts > 0).sum(axis=1)
+    mito_counts = counts[mito_columns].sum(axis=1) if mito_columns else pd.Series(0.0, index=counts.index)
+    mito_percent = (mito_counts / total_counts.replace(0, np.nan) * 100).fillna(0.0)
+    metrics = pd.DataFrame({
+        cell_id_column: cell_ids,
+        'n_genes_by_counts': n_genes.astype(int),
+        'total_counts': total_counts,
+        'total_counts_mito': mito_counts,
+        'pct_counts_mito': mito_percent,
+    })
+    keep = metrics['n_genes_by_counts'] >= min_genes
+    keep &= metrics['total_counts'] >= min_counts
+    keep &= metrics['pct_counts_mito'] <= max_mito_percent
+    if max_genes is not None:
+        keep &= metrics['n_genes_by_counts'] <= max_genes
+    metrics['pass_qc'] = keep.astype(bool)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = output_dir / 'single_cell_cell_metrics.csv'
+    filtered_path = output_dir / 'single_cell_filtered_matrix.csv'
+    manifest_path = output_dir / 'single_cell_qc.json'
+    metrics.to_csv(metrics_path, index=False)
+    filtered = frame.loc[keep].copy()
+    filtered.to_csv(filtered_path, index=False)
+    payload = {
+        'status': 'completed',
+        'input': str(matrix_csv),
+        'output_dir': str(output_dir),
+        'outputs': {
+            'cell_metrics': str(metrics_path),
+            'filtered_matrix': str(filtered_path),
+        },
+        'metrics': {
+            'n_cells_input': int(len(frame)),
+            'n_cells_passed': int(keep.sum()),
+            'n_cells_filtered': int((~keep).sum()),
+            'n_genes': len(gene_columns),
+            'mitochondrial_genes': mito_columns,
+        },
+        'thresholds': {
+            'min_genes': min_genes,
+            'max_genes': max_genes,
+            'min_counts': min_counts,
+            'max_mito_percent': max_mito_percent,
+            'mitochondrial_prefix': mitochondrial_prefix,
+        },
+        'manifest_path': str(manifest_path),
+    }
+    manifest_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
+        encoding='utf-8',
+    )
+    return payload
+
+
 def _open_vcf(path):
     path = Path(path)
     if path.suffix.lower() == '.gz':
@@ -969,6 +1061,20 @@ TOOLS = {
             'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 3600},
         }, required=('input_path', 'output_dir')),
         'function': run_genomics_qc,
+    },
+    'run_single_cell_qc': {
+        'description': 'Calculate single-cell expression QC metrics and write a filtered cell matrix without requiring Scanpy.',
+        'parameters': _parameters({
+            'matrix_csv': {'type': 'string'},
+            'output_dir': {'type': 'string'},
+            'cell_id_column': {'type': 'string'},
+            'min_genes': {'type': 'integer', 'minimum': 0},
+            'max_genes': {'type': 'integer', 'minimum': 0},
+            'min_counts': {'type': 'number', 'minimum': 0},
+            'max_mito_percent': {'type': 'number', 'minimum': 0, 'maximum': 100},
+            'mitochondrial_prefix': {'type': 'string'},
+        }, required=('matrix_csv', 'output_dir')),
+        'function': run_single_cell_qc,
     },
     'search_gene_evidence': {
         'description': 'Retrieve cited gene evidence from a structured evidence index.',

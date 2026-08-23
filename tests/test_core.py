@@ -19,7 +19,7 @@ from src.audit_external_overlap import audit_overlap, remove_structure_overlap
 from src.build_hard_decoy_benchmark import build_hard_decoy_benchmark, build_random_control_benchmark
 from src.compare_benchmarks import compare_benchmarks, compare_benchmark_replicates
 from src.run_benchmark_replicates import _normalize_id, _validate_control, _validate_hard_benchmark
-from src.omics_agent import TOOLS as OMICS_TOOLS, _resolve_statistics_backend, annotate_variants, run_genomics_qc, run_omics_analysis, run_tool as run_omics_tool, search_gene_evidence, statistics_backend_status, toolchain_status
+from src.omics_agent import TOOLS as OMICS_TOOLS, _resolve_statistics_backend, annotate_variants, run_genomics_qc, run_omics_analysis, run_single_cell_qc, run_tool as run_omics_tool, search_gene_evidence, statistics_backend_status, toolchain_status
 from src.domain_registry import run_tool as run_domain_tool, tool_specs, validate_tool_map
 from src.workflow_runner import run_workflow
 from src.resplit_external import joint_split_indices
@@ -534,6 +534,25 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result['tool'], 'bcftools')
         self.assertEqual(result['number_of_records'], '4')
         self.assertEqual(mocked_run.call_args.args[0][1], 'stats')
+
+    def test_single_cell_qc_calculates_metrics_and_filters_cells(self):
+        with tempfile.TemporaryDirectory(prefix='cadd_single_cell_qc_') as raw:
+            root = Path(raw)
+            result = run_single_cell_qc(
+                'examples/omics/single_cell_counts.csv',
+                root / 'qc',
+                min_genes=2,
+                max_mito_percent=20,
+            )
+            metrics = pd.read_csv(root / 'qc' / 'single_cell_cell_metrics.csv')
+            filtered = pd.read_csv(root / 'qc' / 'single_cell_filtered_matrix.csv')
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['metrics']['n_cells_input'], 3)
+        self.assertEqual(result['metrics']['n_cells_passed'], 1)
+        self.assertEqual(result['metrics']['mitochondrial_genes'], ['MT-CO1'])
+        self.assertEqual(filtered['cell_id'].tolist(), ['cell-1'])
+        self.assertAlmostEqual(float(metrics.loc[0, 'pct_counts_mito']), 11.111, places=3)
+        self.assertIn('run_single_cell_qc', OMICS_TOOLS)
 
     def test_agent_uses_project_llm_config(self):
         base_url, model, _ = load_llm_config()
