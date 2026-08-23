@@ -845,6 +845,10 @@ function JobResultSummary({ job, onDownload }: { job: Job; onDownload: (path: st
   const knowledgeSearchStep = steps.find((step) => step.tool === 'knowledge_search')
   const knowledgeSearchEnvelope = knowledgeSearchStep?.result && typeof knowledgeSearchStep.result === 'object' && !Array.isArray(knowledgeSearchStep.result) ? knowledgeSearchStep.result as Record<string, unknown> : {}
   const knowledgeSearchResult = knowledgeSearchEnvelope.result && typeof knowledgeSearchEnvelope.result === 'object' && !Array.isArray(knowledgeSearchEnvelope.result) ? knowledgeSearchEnvelope.result as Record<string, unknown> : {}
+  const graphStep = steps.find((step) => step.tool === 'knowledge_build_graph')
+  const graphEnvelope = graphStep?.result && typeof graphStep.result === 'object' && !Array.isArray(graphStep.result) ? graphStep.result as Record<string, unknown> : {}
+  const graphResult = graphEnvelope.result && typeof graphEnvelope.result === 'object' && !Array.isArray(graphEnvelope.result) ? graphEnvelope.result as Record<string, unknown> : {}
+  const graphMetrics = graphResult.metrics && typeof graphResult.metrics === 'object' && !Array.isArray(graphResult.metrics) ? graphResult.metrics as Record<string, unknown> : {}
   const sequenceStep = steps.find((step) => step.tool === 'sequence_pipeline')
   const sequenceEnvelope = sequenceStep?.result && typeof sequenceStep.result === 'object' && !Array.isArray(sequenceStep.result) ? sequenceStep.result as Record<string, unknown> : payload
   const sequenceResult = sequenceEnvelope.result && typeof sequenceEnvelope.result === 'object' && !Array.isArray(sequenceEnvelope.result) ? sequenceEnvelope.result as Record<string, unknown> : sequenceEnvelope
@@ -878,6 +882,9 @@ function JobResultSummary({ job, onDownload }: { job: Job; onDownload: (path: st
     evidence_matches: evidenceResult.n_matches,
     knowledge_matches: knowledgeSearchResult.n_matches,
     knowledge_index: knowledgeIngestResult.output_path,
+    knowledge_graph_nodes: graphMetrics.n_nodes,
+    knowledge_graph_edges: graphMetrics.n_edges,
+    knowledge_graph: graphResult.output_path,
     pipeline: payload.pipeline ?? sequenceResult.pipeline,
     mrna_len: payload.mrna_len ?? sequenceResult.mrna_len,
     verdict: payload.verdict ?? sequenceResult.verdict,
@@ -891,7 +898,7 @@ function JobResultSummary({ job, onDownload }: { job: Job; onDownload: (path: st
     cadd_report: caddResult.report,
   }
   const visible = Object.entries(summary).filter(([, value]) => value !== undefined && value !== null)
-  const artifactKeys = new Set(['output_csv', 'cadd_result_csv', 'manifest_path', 'report_path', 'cadd_report', 'fastq_manifest', 'single_cell_metrics', 'metagenomics_relative_abundance', 'metagenomics_sample_metrics', 'knowledge_index'])
+  const artifactKeys = new Set(['output_csv', 'cadd_result_csv', 'manifest_path', 'report_path', 'cadd_report', 'fastq_manifest', 'single_cell_metrics', 'metagenomics_relative_abundance', 'metagenomics_sample_metrics', 'knowledge_index', 'knowledge_graph'])
   const traceSteps = steps.map((step, index) => ({
     index: index + 1,
     id: typeof step.id === 'string' ? step.id : `step-${index + 1}`,

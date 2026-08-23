@@ -10,6 +10,7 @@ PLUGIN_API_VERSION = 1
 PLUGIN_CAPABILITIES = (
     'knowledge.ingest',
     'knowledge.search',
+    'knowledge.graph',
 )
 
 
@@ -140,6 +141,70 @@ def knowledge_search(query, index_path, top_k=5):
     })
 
 
+def knowledge_build_graph(evidence, output_path='output/knowledge/evidence_graph.json'):
+    if not isinstance(evidence, dict):
+        raise ValueError('evidence must be an object')
+    payload = evidence.get('result', evidence)
+    if not isinstance(payload, dict):
+        raise ValueError('evidence result must be an object')
+    matches = payload.get('matches', [])
+    if not isinstance(matches, list):
+        raise ValueError('evidence.matches must be an array')
+    nodes = {}
+    edges = []
+
+    def add_node(node_id, node_type, label):
+        nodes.setdefault(node_id, {'id': node_id, 'type': node_type, 'label': label})
+
+    for index, match in enumerate(matches):
+        if not isinstance(match, dict):
+            continue
+        evidence_id = f'evidence:{index + 1}'
+        source = str(match.get('source') or 'unknown')
+        source_id = f'source:{source}'
+        gene_id = match.get('gene_id')
+        add_node(evidence_id, 'evidence', str(match.get('title') or evidence_id))
+        add_node(source_id, 'source', source)
+        edges.append({
+            'source': evidence_id,
+            'target': source_id,
+            'relation': 'from_source',
+        })
+        if gene_id:
+            gene = str(gene_id)
+            gene_node_id = f'gene:{gene}'
+            add_node(gene_node_id, 'gene', gene)
+            edges.append({
+                'source': gene_node_id,
+                'target': evidence_id,
+                'relation': 'supported_by',
+            })
+
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    graph = {
+        'version': 1,
+        'graph': {
+            'nodes': list(nodes.values()),
+            'edges': edges,
+        },
+        'metrics': {
+            'n_nodes': len(nodes),
+            'n_edges': len(edges),
+            'n_evidence': len({node['id'] for node in nodes.values() if node['type'] == 'evidence'}),
+            'n_genes': len({node['id'] for node in nodes.values() if node['type'] == 'gene'}),
+            'n_sources': len({node['id'] for node in nodes.values() if node['type'] == 'source'}),
+        },
+        'provenance': {
+            'input_operation': payload.get('status', 'unknown'),
+            'relation_policy': 'gene-supported_by-evidence-from_source',
+        },
+        'output_path': str(target),
+    }
+    target.write_text(json.dumps(graph, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    return _envelope('build_graph', graph)
+
+
 TOOLS = {
     'ingest_directory': {
         'description': 'Build a local JSON knowledge index from Markdown, text or HTML documents.',
@@ -158,5 +223,13 @@ TOOLS = {
             'top_k': {'type': 'integer', 'minimum': 1, 'maximum': 20},
         }, ('query', 'index_path')),
         'function': knowledge_search,
+    },
+    'build_graph': {
+        'description': 'Build a traceable evidence knowledge graph with gene, evidence and source nodes.',
+        'parameters': _parameters({
+            'evidence': {'type': 'object'},
+            'output_path': {'type': 'string'},
+        }, ('evidence',)),
+        'function': knowledge_build_graph,
     },
 }

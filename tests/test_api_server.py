@@ -41,6 +41,7 @@ class ApiServerTests(unittest.TestCase):
         self.assertEqual({item['name'] for item in payload['tools']}, {
             'knowledge_ingest_directory',
             'knowledge_search',
+            'knowledge_build_graph',
         })
 
     def test_run_supports_registry_tools(self):

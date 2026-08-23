@@ -37,6 +37,27 @@ class KnowledgePluginTests(unittest.TestCase):
             self.assertEqual(result['result']['matches'][0]['document_id'], 'rna.md')
             self.assertGreater(result['result']['matches'][0]['score'], 0)
 
+    def test_build_graph_preserves_gene_evidence_source_trace(self):
+        with tempfile.TemporaryDirectory(prefix='knowledge_graph_test_') as raw:
+            output_path = Path(raw) / 'evidence_graph.json'
+            result = run_tool('knowledge_build_graph', {
+                'evidence': {
+                    'result': {
+                        'matches': [
+                            {'gene_id': 'GeneA', 'source': 'local_fixture', 'title': 'Example evidence'},
+                            {'gene_id': 'GeneB', 'source': 'pubmed', 'title': 'Published evidence'},
+                        ],
+                    },
+                },
+                'output_path': str(output_path),
+            })
+            self.assertEqual(result['status'], 'ok')
+            self.assertEqual(result['result']['metrics']['n_genes'], 2)
+            self.assertEqual(result['result']['metrics']['n_evidence'], 2)
+            self.assertEqual(result['result']['metrics']['n_sources'], 2)
+            self.assertEqual(result['result']['metrics']['n_edges'], 4)
+            self.assertTrue(output_path.is_file())
+
 
 if __name__ == '__main__':
     unittest.main()

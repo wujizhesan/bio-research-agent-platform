@@ -41,10 +41,18 @@ steps:
     args:
       evidence: ${evidence_search.result}
 
+  - id: evidence_graph
+    tool: knowledge_build_graph
+    depends_on:
+      - evidence_search
+    args:
+      evidence: ${evidence_search.result}
+      output_path: output/bgi_multiomics_demo/evidence_graph.json
+
   - id: knowledge_ingest
     tool: knowledge_ingest_directory
     depends_on:
-      - evidence_summary
+      - evidence_graph
     args:
       input_dir: examples/knowledge
       output_path: output/bgi_multiomics_demo/knowledge_index.json

@@ -224,8 +224,11 @@ class ResearchAgentTests(unittest.TestCase):
         })
         self.assertEqual(result['status'], 'planned')
         self.assertEqual(result['selected_domains'], ['omics', 'literature', 'knowledge', 'sequence'])
-        self.assertEqual(result['manifest']['completed_steps'], 9)
+        self.assertEqual(result['manifest']['completed_steps'], 10)
         self.assertEqual(result['manifest']['failed_steps'], 0)
+        self.assertIn('knowledge_build_graph', {
+            step['tool'] for step in result['manifest']['steps']
+        })
 
     def test_research_execute_dry_run_is_domain_scoped(self):
         workflow = {
