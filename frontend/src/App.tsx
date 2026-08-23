@@ -398,8 +398,8 @@ function App() {
       vcf_path: uploadedFiles.vcf?.path || 'examples/variants/variants.vcf',
       annotation_csv: uploadedFiles.annotation?.path || 'examples/variants/gene_annotations.csv',
       annotation_backend: variantBackend,
-      evidence_csv: 'examples/rnaseq/evidence.csv',
-      evidence_provider: 'local',
+      evidence_csv: evidenceProvider === 'local' ? 'examples/rnaseq/evidence.csv' : undefined,
+      evidence_provider: evidenceProvider,
       output_dir: 'output/frontend_variant_research',
     }
   }
@@ -888,7 +888,7 @@ function App() {
                       <ResearchFileField id="vcf-file" label="VCF / VCF.GZ input" accept=".vcf,.gz,text/plain" file={uploadedFiles.vcf} uploading={uploadingFile === 'vcf'} onChange={(file) => void handleResearchFileUpload('vcf', file)} />
                       <ResearchFileField id="annotation-file" label="Gene interval CSV" accept=".csv,.tsv,text/csv,text/tab-separated-values" file={uploadedFiles.annotation} uploading={uploadingFile === 'annotation'} onChange={(file) => void handleResearchFileUpload('annotation', file)} />
                     </div>
-                    <div className="mt-5"><label className="field-label" htmlFor="variant-backend">Annotation backend</label><select id="variant-backend" value={variantBackend} onChange={(event) => { setVariantBackend(event.target.value); setResearchPlan(null) }} className="input-control"><option value="auto">Auto: VCF ANN → local interval</option><option value="vcf_ann">VCF ANN only</option><option value="local">Local interval table</option></select></div>
+                    <div className="mt-5 grid gap-4 sm:grid-cols-2"><div><label className="field-label" htmlFor="variant-backend">Annotation backend</label><select id="variant-backend" value={variantBackend} onChange={(event) => { setVariantBackend(event.target.value); setResearchPlan(null) }} className="input-control"><option value="auto">Auto: VCF ANN → local interval</option><option value="vcf_ann">VCF ANN only</option><option value="local">Local interval table</option></select></div><div><label className="field-label" htmlFor="variant-evidence-provider">Evidence provider</label><select id="variant-evidence-provider" value={evidenceProvider} onChange={(event) => { setEvidenceProvider(event.target.value); setResearchPlan(null) }} className="input-control"><option value="local">Local fixture</option><option value="ncbi_gene">NCBI Gene</option><option value="uniprot">UniProt</option><option value="pubmed">PubMed</option><option value="kegg">KEGG</option></select></div></div>
                     <p className="mt-3 text-xs leading-5 text-[#688983]">The demo uses reproducible fixtures when no files are uploaded. Results retain annotation source and external tool availability.</p>
                   </> : mode === 'sequence' ? <label className="mt-6 block"><span className="field-label">Protein sequence</span><input value={protein} onChange={(event) => { setProtein(event.target.value.toUpperCase()); setResearchPlan(null) }} className="input-control tracking-[0.18em] font-mono" placeholder="例如 MKT" /><span className="mt-2 block text-xs text-[#688983]">内置确定性后端将执行 optimize → score → verify。</span></label> : <>
                     <label className="mt-6 block"><span className="field-label">CADD screening task</span><textarea value="Run a reproducible CADD virtual screening workflow and prioritize docking hits" readOnly rows={3} className="input-area" /></label>
