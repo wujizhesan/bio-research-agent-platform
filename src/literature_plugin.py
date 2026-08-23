@@ -20,7 +20,8 @@ def _parameters(properties, required=()):
     }
 
 
-def _provider_factory(provider, evidence_csv=None, cache_dir=None, timeout=15):
+def _provider_factory(provider, evidence_csv=None, cache_dir=None, timeout=15,
+                      genome='hg38', gencode_gtf=None):
     try:
         from .evidence_providers import get_evidence_provider
     except ImportError:
@@ -30,6 +31,8 @@ def _provider_factory(provider, evidence_csv=None, cache_dir=None, timeout=15):
         evidence_csv=evidence_csv,
         cache_dir=cache_dir,
         timeout=timeout,
+        genome=genome,
+        gencode_gtf=gencode_gtf,
     )
 
 
@@ -65,13 +68,16 @@ def _envelope(operation, payload):
 
 
 def literature_search(gene_ids, provider='local', evidence_csv=None,
-                      cache_dir=None, timeout=15):
+                      cache_dir=None, timeout=15, genome='hg38',
+                      gencode_gtf=None):
     values = _normalize_gene_ids(gene_ids)
     result = _provider_factory(
         provider,
         evidence_csv=evidence_csv,
         cache_dir=cache_dir,
         timeout=timeout,
+        genome=genome,
+        gencode_gtf=gencode_gtf,
     ).search(values)
     return _envelope('search', result)
 
@@ -107,13 +113,15 @@ def literature_summarize(evidence):
 
 TOOLS = {
     'search': {
-        'description': 'Search local evidence, UniProt, PubMed, NCBI Gene or KEGG through the shared evidence provider layer.',
+        'description': 'Search local evidence, UniProt, PubMed, NCBI Gene, KEGG, UCSC or GENCODE through the shared evidence provider layer.',
         'parameters': _parameters({
             'gene_ids': {'type': 'array', 'items': {'type': 'string'}},
-            'provider': {'type': 'string', 'enum': ['local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg']},
+            'provider': {'type': 'string', 'enum': ['local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg', 'ucsc', 'gencode']},
             'evidence_csv': {'type': 'string'},
             'cache_dir': {'type': 'string'},
             'timeout': {'type': 'number'},
+            'genome': {'type': 'string'},
+            'gencode_gtf': {'type': 'string'},
         }, ('gene_ids',)),
         'function': literature_search,
     },

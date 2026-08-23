@@ -527,7 +527,8 @@ def annotate_variants(vcf_path, output_csv, annotation_csv=None,
 
 
 def search_gene_evidence(gene_ids, evidence_csv=None, provider='local',
-                         cache_dir=None, timeout=15):
+                         cache_dir=None, timeout=15, genome='hg38',
+                         gencode_gtf=None):
     try:
         from .evidence_providers import get_evidence_provider
     except ImportError:
@@ -537,6 +538,8 @@ def search_gene_evidence(gene_ids, evidence_csv=None, provider='local',
         evidence_csv=evidence_csv,
         cache_dir=cache_dir,
         timeout=timeout,
+        genome=genome,
+        gencode_gtf=gencode_gtf,
     ).search(gene_ids)
 
 def generate_omics_report(de_csv, pathway_csv, output_md, evidence=None):
@@ -597,7 +600,8 @@ def generate_omics_report(de_csv, pathway_csv, output_md, evidence=None):
 def run_omics_analysis(expression_csv, metadata_csv, gene_sets_csv, output_dir,
                        evidence_csv=None, condition_a=None, condition_b=None,
                        evidence_provider='local', evidence_cache_dir=None,
-                       evidence_timeout=15, statistics_backend='auto'):
+                       evidence_timeout=15, statistics_backend='auto',
+                       genome='hg38', gencode_gtf=None):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     de_csv = output_dir / 'differential_expression.csv'
@@ -609,7 +613,9 @@ def run_omics_analysis(expression_csv, metadata_csv, gene_sets_csv, output_dir,
     )
     pathway_meta = run_pathway_enrichment(de_csv, gene_sets_csv, pathway_csv)
     evidence = None
-    if evidence_csv or evidence_provider in {'uniprot', 'pubmed', 'ncbi_gene', 'kegg'}:
+    if evidence_csv or evidence_provider in {
+        'uniprot', 'pubmed', 'ncbi_gene', 'kegg', 'ucsc', 'gencode'
+    }:
         significant_genes = pd.read_csv(de_csv)
         significant_genes = significant_genes.loc[
             significant_genes['significant'], 'gene_id'
@@ -620,6 +626,8 @@ def run_omics_analysis(expression_csv, metadata_csv, gene_sets_csv, output_dir,
             provider=evidence_provider,
             cache_dir=evidence_cache_dir,
             timeout=evidence_timeout,
+            genome=genome,
+            gencode_gtf=gencode_gtf,
         )
     report_meta = generate_omics_report(de_csv, pathway_csv, report_md, evidence)
     manifest = {
@@ -632,6 +640,8 @@ def run_omics_analysis(expression_csv, metadata_csv, gene_sets_csv, output_dir,
             'evidence_csv': str(evidence_csv) if evidence_csv else None,
             'evidence_provider': evidence_provider,
             'evidence_cache_dir': str(evidence_cache_dir) if evidence_cache_dir else None,
+            'genome': genome,
+            'gencode_gtf': str(gencode_gtf) if gencode_gtf else None,
             'statistics_backend': statistics_backend,
         },
         'differential_expression': de_meta,
@@ -665,10 +675,12 @@ TOOLS = {
             'evidence_csv': {'type': 'string'},
             'condition_a': {'type': 'string'},
             'condition_b': {'type': 'string'},
-            'evidence_provider': {'type': 'string', 'enum': ['local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg']},
+            'evidence_provider': {'type': 'string', 'enum': ['local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg', 'ucsc', 'gencode']},
             'evidence_cache_dir': {'type': 'string'},
             'evidence_timeout': {'type': 'number'},
             'statistics_backend': {'type': 'string', 'enum': list(STATISTICS_BACKENDS)},
+            'genome': {'type': 'string'},
+            'gencode_gtf': {'type': 'string'},
         }, required=('expression_csv', 'metadata_csv', 'gene_sets_csv', 'output_dir')),
         'function': run_omics_analysis,
     },
@@ -715,9 +727,11 @@ TOOLS = {
         'parameters': _parameters({
             'gene_ids': {'type': 'array', 'items': {'type': 'string'}},
             'evidence_csv': {'type': 'string'},
-            'provider': {'type': 'string', 'enum': ['local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg']},
+            'provider': {'type': 'string', 'enum': ['local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg', 'ucsc', 'gencode']},
             'cache_dir': {'type': 'string'},
             'timeout': {'type': 'number'},
+            'genome': {'type': 'string'},
+            'gencode_gtf': {'type': 'string'},
         }, required=('gene_ids',)),
         'function': search_gene_evidence,
     },

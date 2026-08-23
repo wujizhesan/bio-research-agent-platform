@@ -303,6 +303,59 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(cached['n_matches'], 1)
             mocked_get.assert_not_called()
 
+    @patch('src.evidence_providers.requests.get')
+    def test_ucsc_evidence_provider_normalizes_positions_and_caches(self, mocked_get):
+        response = Mock()
+        response.json.return_value = {
+            'genome': 'hg38',
+            'positionMatches': [{
+                'trackName': 'knownGene',
+                'description': 'Gencode Genes',
+                'matches': [{
+                    'position': 'chr17:7661779-7687550',
+                    'hgFindMatches': 'ENST00000269305.9',
+                    'posName': 'TP53 (ENST00000269305.9)',
+                    'canonical': True,
+                    'description': 'tumor protein p53',
+                }],
+            }],
+        }
+        mocked_get.return_value = response
+        with tempfile.TemporaryDirectory(prefix='cadd_ucsc_cache_') as raw:
+            result = search_gene_evidence(
+                ['TP53'], provider='ucsc', cache_dir=raw, genome='hg38', timeout=3
+            )
+            self.assertEqual(result['provider'], 'ucsc')
+            self.assertEqual(result['n_matches'], 1)
+            self.assertEqual(result['matches'][0]['chromosome'], 'chr17')
+            self.assertEqual(result['matches'][0]['start'], 7661779)
+            self.assertTrue(result['matches'][0]['canonical'])
+            mocked_get.reset_mock()
+            cached = search_gene_evidence(
+                ['TP53'], provider='ucsc', cache_dir=raw, genome='hg38', timeout=3
+            )
+            self.assertEqual(cached['n_matches'], 1)
+            mocked_get.assert_not_called()
+
+    def test_gencode_evidence_provider_reads_versioned_gene_ids(self):
+        with tempfile.TemporaryDirectory(prefix='cadd_gencode_') as raw:
+            gtf_path = Path(raw) / 'gencode.test.gtf'
+            gtf_path.write_text(
+                '##gff-version 2\n'
+                'chr17\tHAVANA\tgene\t7661779\t7687550\t.\t-\t.\t'
+                'gene_id "ENSG00000141510.17"; gene_type "protein_coding"; '
+                'gene_name "TP53"; level 2;\n',
+                encoding='utf-8',
+            )
+            result = search_gene_evidence(
+                ['ENSG00000141510'], provider='gencode', gencode_gtf=gtf_path
+            )
+        self.assertEqual(result['provider'], 'gencode')
+        self.assertEqual(result['n_matches'], 1)
+        self.assertEqual(result['matches'][0]['gene_id'], 'ENSG00000141510.17')
+        self.assertEqual(result['matches'][0]['gene_name'], 'TP53')
+        self.assertEqual(result['matches'][0]['gene_type'], 'protein_coding')
+
     def test_domain_registry_exposes_cadd_and_omics_tools(self):
         specs = tool_specs()
         names = {spec['name'] for spec in specs}

@@ -1,7 +1,9 @@
 """Evidence providers for the omics Agent."""
+import gzip
 import hashlib
-import os
 import json
+import os
+import re
 from pathlib import Path
 from urllib.parse import quote
 
@@ -478,7 +480,165 @@ class KeggEvidenceProvider:
         }
 
 
-def get_evidence_provider(provider='local', evidence_csv=None, cache_dir=None, timeout=15):
+class UcscEvidenceProvider:
+    endpoint = 'https://api.genome.ucsc.edu/search'
+
+    def __init__(self, genome='hg38', cache_dir=None, timeout=15):
+        self.genome = str(genome or 'hg38')
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.timeout = float(timeout)
+        if self.cache_dir:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _cache_path(self, gene_id):
+        if not self.cache_dir:
+            return None
+        key = hashlib.sha256(
+            f'ucsc:{self.genome}:{gene_id}'.encode('utf-8')
+        ).hexdigest()
+        return self.cache_dir / f'ucsc_{key}.json'
+
+    def _request(self, gene_id):
+        cache_path = self._cache_path(gene_id)
+        if cache_path and cache_path.exists():
+            return json.loads(cache_path.read_text(encoding='utf-8'))
+        response = requests.get(
+            self.endpoint,
+            params={'search': str(gene_id), 'genome': self.genome},
+            headers={'Accept': 'application/json', 'User-Agent': 'cadd-agent/omics'},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if cache_path:
+            cache_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
+                encoding='utf-8',
+            )
+        return payload
+
+    def _records(self, gene_id, payload):
+        records = []
+        for group in payload.get('positionMatches', []):
+            track = group.get('trackName') or group.get('name', '')
+            for match in group.get('matches', []):
+                position = str(match.get('position') or '')
+                if ':' not in position or '-' not in position:
+                    continue
+                chromosome, coordinates = position.rsplit(':', 1)
+                start, end = coordinates.split('-', 1)
+                try:
+                    start = int(start)
+                    end = int(end)
+                except ValueError:
+                    continue
+                title = match.get('posName') or match.get('hgFindMatches') or track
+                records.append({
+                    'gene_id': gene_id,
+                    'source': 'UCSC',
+                    'title': title,
+                    'evidence': match.get('description') or group.get('description', ''),
+                    'genome': self.genome,
+                    'track': track,
+                    'chromosome': chromosome,
+                    'start': start,
+                    'end': end,
+                    'match_id': match.get('hgFindMatches', ''),
+                    'canonical': bool(match.get('canonical', False)),
+                    'position': position,
+                    'url': (
+                        'https://genome.ucsc.edu/cgi-bin/hgTracks?'
+                        f'db={self.genome}&position={position}'
+                    ),
+                })
+        return records
+
+    def search(self, gene_ids):
+        requested = sorted({str(gene_id) for gene_id in gene_ids})
+        matches = []
+        for gene_id in requested:
+            matches.extend(self._records(gene_id, self._request(gene_id)))
+        return {
+            'status': 'ok',
+            'provider': 'ucsc',
+            'requested_gene_ids': requested,
+            'matches': matches,
+            'n_matches': len(matches),
+            'endpoint': self.endpoint,
+            'genome': self.genome,
+            'cache_dir': str(self.cache_dir) if self.cache_dir else None,
+        }
+
+
+class GencodeEvidenceProvider:
+    _attribute_pattern = re.compile(r'([A-Za-z][A-Za-z0-9_]*)\s+(?:"([^"]*)"|([^;\s]+))')
+
+    def __init__(self, gencode_gtf=None):
+        if not gencode_gtf:
+            raise ValueError('gencode_gtf is required for the gencode provider')
+        self.gencode_gtf = Path(gencode_gtf)
+        if not self.gencode_gtf.is_file():
+            raise ValueError(f'GENCODE GTF does not exist: {self.gencode_gtf}')
+
+    @classmethod
+    def _attributes(cls, raw):
+        attributes = {}
+        for match in cls._attribute_pattern.finditer(raw):
+            attributes[match.group(1)] = match.group(2) or match.group(3) or ''
+        return attributes
+
+    @staticmethod
+    def _matches(value, requested):
+        value = str(value or '')
+        return value in requested or value.split('.', 1)[0] in requested
+
+    def search(self, gene_ids):
+        requested = sorted({str(gene_id).strip() for gene_id in gene_ids if str(gene_id).strip()})
+        if not requested:
+            raise ValueError('gene_ids must contain at least one non-empty identifier')
+        matches = []
+        opener = gzip.open if self.gencode_gtf.suffix.lower() == '.gz' else open
+        with opener(self.gencode_gtf, 'rt', encoding='utf-8', errors='replace') as handle:
+            for line in handle:
+                if not line.strip() or line.startswith('#'):
+                    continue
+                fields = line.rstrip('\n\r').split('\t')
+                if len(fields) != 9 or fields[2] != 'gene':
+                    continue
+                attributes = self._attributes(fields[8])
+                gene_id = attributes.get('gene_id', '')
+                gene_name = attributes.get('gene_name', '')
+                if not any(self._matches(value, set(requested)) for value in (gene_id, gene_name)):
+                    continue
+                matches.append({
+                    'gene_id': gene_id,
+                    'source': 'GENCODE',
+                    'title': gene_name or gene_id,
+                    'evidence': (
+                        f'GENCODE gene annotation; type={attributes.get("gene_type", "")}; '
+                        f'assembly coordinates={fields[0]}:{fields[3]}-{fields[4]}'
+                    ),
+                    'gene_name': gene_name,
+                    'gene_type': attributes.get('gene_type', ''),
+                    'chromosome': fields[0],
+                    'start': int(fields[3]),
+                    'end': int(fields[4]),
+                    'strand': fields[6],
+                    'level': attributes.get('level', ''),
+                    'gencode_gtf': str(self.gencode_gtf),
+                })
+        return {
+            'status': 'ok',
+            'provider': 'gencode',
+            'requested_gene_ids': requested,
+            'matches': matches,
+            'n_matches': len(matches),
+            'source_file': str(self.gencode_gtf),
+        }
+
+
+def get_evidence_provider(provider='local', evidence_csv=None, cache_dir=None,
+                          timeout=15, genome='hg38', gencode_gtf=None):
     if provider == 'local':
         return LocalEvidenceProvider(evidence_csv)
     if provider == 'uniprot':
@@ -489,4 +649,8 @@ def get_evidence_provider(provider='local', evidence_csv=None, cache_dir=None, t
         return NcbiGeneEvidenceProvider(cache_dir=cache_dir, timeout=timeout)
     if provider == 'kegg':
         return KeggEvidenceProvider(cache_dir=cache_dir, timeout=timeout)
+    if provider == 'ucsc':
+        return UcscEvidenceProvider(genome=genome, cache_dir=cache_dir, timeout=timeout)
+    if provider == 'gencode':
+        return GencodeEvidenceProvider(gencode_gtf=gencode_gtf)
     raise ValueError(f'unknown evidence provider: {provider}')

@@ -116,6 +116,18 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertFalse(result['ready'])
         self.assertIn('evidence_csv', result['missing_inputs'])
 
+    def test_research_planner_requires_gencode_gtf_for_gencode_evidence(self):
+        result = run_tool('research_build_workflow', {
+            'task': '根据 GENCODE GTF 注释查询 TP53 基因',
+            'domains': ['literature'],
+            'inputs': {
+                'gene_ids': ['TP53'],
+                'evidence_provider': 'gencode',
+            },
+        })
+        self.assertFalse(result['ready'])
+        self.assertIn('gencode_gtf', result['missing_inputs'])
+
     def test_bgi_preset_is_discoverable_and_dry_runnable(self):
         presets = run_tool('research_presets', {})
         self.assertEqual(presets['status'], 'ok')

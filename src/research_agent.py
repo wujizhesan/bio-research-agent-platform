@@ -55,6 +55,7 @@ _DOMAIN_KEYWORDS = {
         'nucleotide', 'translation',
     ),
     'literature': (
+        'ucsc', 'gencode', 'genome browser', 'gtf',
         'literature', 'pubmed', 'uniprot', 'ncbi', 'kegg', 'paper',
         'evidence', 'citation', 'database', '文献', '数据库',
     ),
@@ -70,6 +71,11 @@ _EVIDENCE_PROVIDER_KEYWORDS = (
     ('ncbi_gene', ('ncbi', 'gene annotation', '基因注释')),
     ('pubmed', ('pubmed', 'literature', 'paper', 'citation', '文献', '论文')),
     ('uniprot', ('uniprot', 'protein annotation', '蛋白注释')),
+)
+
+_EVIDENCE_PROVIDER_KEYWORDS += (
+    ('ucsc', ('ucsc', 'genome browser', 'genome coordinate')),
+    ('gencode', ('gencode', 'gtf', 'transcript annotation')),
 )
 
 _VARIANT_KEYWORDS = (
@@ -174,6 +180,8 @@ def _required_inputs(domains, task=None, inputs=None):
         ])
     if 'literature' in domains:
         required.append({'name': 'gene_ids', 'description': 'gene or protein identifiers'})
+        if _select_evidence_provider(task or '', inputs) == 'gencode':
+            required.append({'name': 'gencode_gtf', 'description': 'local GENCODE GTF annotation file'})
     if 'knowledge' in domains:
         required.append({'name': 'documents_dir', 'description': 'local scientific documents for retrieval'})
     return required
@@ -182,7 +190,7 @@ def _required_inputs(domains, task=None, inputs=None):
 def _select_evidence_provider(task, inputs=None):
     inputs = inputs or {}
     explicit = inputs.get('evidence_provider')
-    providers = {'local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg'}
+    providers = {'local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg', 'ucsc', 'gencode'}
     if explicit:
         if explicit not in providers:
             raise ValueError(f'unknown evidence provider: {explicit}')
@@ -203,6 +211,8 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
     rationale = []
     omics_ready = False
     variant_ready = False
+    if evidence_provider == 'gencode' and not inputs.get('gencode_gtf'):
+        missing.append('gencode_gtf')
 
     variant_task = _is_variant_task(task, inputs)
     if 'omics' in domains and variant_task:
@@ -237,7 +247,10 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
             args = {key: str(inputs[key]) for key in omics_required}
             args['output_dir'] = output_dir
             args['evidence_provider'] = evidence_provider
-            for key in ('evidence_csv', 'condition_a', 'condition_b', 'evidence_timeout', 'statistics_backend'):
+            for key in (
+                'evidence_csv', 'condition_a', 'condition_b', 'evidence_timeout',
+                'statistics_backend', 'genome', 'gencode_gtf',
+            ):
                 if inputs.get(key) is not None:
                     args[key] = inputs[key]
             if inputs.get('evidence_cache_dir'):
@@ -267,6 +280,10 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
             search_args['evidence_csv'] = str(inputs['evidence_csv'])
         if inputs.get('evidence_cache_dir'):
             search_args['cache_dir'] = str(inputs['evidence_cache_dir'])
+        if inputs.get('genome'):
+            search_args['genome'] = str(inputs['genome'])
+        if inputs.get('gencode_gtf'):
+            search_args['gencode_gtf'] = str(inputs['gencode_gtf'])
         steps.extend([
             {
                 'id': 'variant_evidence_search',
@@ -294,6 +311,10 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
                 search_args['evidence_csv'] = str(inputs['evidence_csv'])
             if inputs.get('evidence_cache_dir'):
                 search_args['cache_dir'] = str(inputs['evidence_cache_dir'])
+            if inputs.get('genome'):
+                search_args['genome'] = str(inputs['genome'])
+            if inputs.get('gencode_gtf'):
+                search_args['gencode_gtf'] = str(inputs['gencode_gtf'])
             steps.extend([
                 {
                     'id': 'literature_search',
