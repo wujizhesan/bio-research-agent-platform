@@ -108,6 +108,27 @@ class FastApiAppTests(unittest.TestCase):
             finally:
                 self._close_app(app)
 
+    def test_capabilities_expose_rest_sse_mcp_and_embedded_surfaces(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_capabilities_') as raw:
+            app = self._app(raw)
+            try:
+                with TestClient(app) as client:
+                    response = client.get('/api/v1/capabilities')
+                    self.assertEqual(response.status_code, 200)
+                    payload = response.json()
+                    self.assertGreater(payload['tool_count'], 0)
+                    self.assertEqual(
+                        set(payload['interfaces']),
+                        {'rest', 'sse', 'mcp', 'embedded'},
+                    )
+                    self.assertEqual(payload['interfaces']['rest']['openapi'], '/openapi.json')
+                    self.assertEqual(payload['interfaces']['sse']['status'], 'available')
+                    self.assertIn(payload['interfaces']['mcp']['status'], {'available', 'dependency_missing'})
+                    self.assertEqual(payload['interfaces']['embedded']['status'], 'available')
+                    self.assertIn('/api/v1/capabilities', client.get('/openapi.json').json()['paths'])
+            finally:
+                self._close_app(app)
+
     def test_redis_job_reads_use_redis_before_database(self):
         with tempfile.TemporaryDirectory(prefix='fastapi_redis_read_') as raw:
             manager = RedisReadJobManager()

@@ -5,6 +5,7 @@ import json
 import os
 import asyncio
 import secrets
+from importlib.util import find_spec
 from pathlib import Path
 from time import monotonic, time
 from typing import Any
@@ -309,6 +310,41 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
             return {'status': 'ok', 'tools': _public_specs(domain)}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get('/api/v1/capabilities', dependencies=[Depends(require_permission('catalog:read'))], tags=['catalog'])
+    async def capabilities_catalog():
+        tool_count = len(active_tool_specs())
+        return {
+            'status': 'ok',
+            'service': API_NAME,
+            'version': API_VERSION,
+            'tool_count': tool_count,
+            'interfaces': {
+                'rest': {
+                    'status': 'available',
+                    'protocol': 'HTTP REST',
+                    'docs': '/docs',
+                    'openapi': '/openapi.json',
+                },
+                'sse': {
+                    'status': 'available',
+                    'protocol': 'Server-Sent Events',
+                    'endpoint': '/api/v1/jobs/{job_id}/events',
+                },
+                'mcp': {
+                    'status': 'available' if find_spec('mcp') is not None else 'dependency_missing',
+                    'protocol': 'Model Context Protocol',
+                    'transport': 'stdio',
+                    'entrypoint': 'bio-agent-mcp',
+                    'tool_count': tool_count,
+                },
+                'embedded': {
+                    'status': 'available',
+                    'protocol': 'Python call',
+                    'entrypoint': 'src.domain_registry.run_tool',
+                },
+            },
+        }
 
     @app.get('/api/v1/runs', dependencies=[Depends(require_permission('runs:read'))], tags=['runs'])
     async def runs(limit: int = Query(default=20, ge=1, le=100)):

@@ -37,6 +37,22 @@ type Plugin = {
   version?: string
 }
 
+type CapabilityInterface = {
+  status: string
+  protocol: string
+  docs?: string
+  openapi?: string
+  endpoint?: string
+  transport?: string
+  entrypoint?: string
+  tool_count?: number
+}
+
+type Capabilities = {
+  tool_count: number
+  interfaces: Record<string, CapabilityInterface>
+}
+
 type Job = {
   job_id: string
   tool: string
@@ -269,6 +285,7 @@ function App() {
   const [apiBase] = useState(defaultApiBase)
   const [token, setToken] = useState(() => localStorage.getItem('bio-agent-token') || import.meta.env.VITE_API_TOKEN || 'change-me-in-development')
   const [plugins, setPlugins] = useState<Plugin[]>([])
+  const [capabilities, setCapabilities] = useState<Capabilities | null>(null)
   const [jobs, setJobs] = useState<Job[]>([])
   const [selectedJob, setSelectedJob] = useState<Job | null>(null)
   const [events, setEvents] = useState<EventItem[]>([])
@@ -301,11 +318,13 @@ function App() {
   const refresh = useCallback(async () => {
     setError('')
     try {
-      const [pluginPayload, jobPayload] = await Promise.all([
+      const [pluginPayload, jobPayload, capabilityPayload] = await Promise.all([
         apiFetch<{ plugins: Plugin[] }>(apiBase, token, '/api/v1/plugins'),
         apiFetch<{ jobs: Job[] }>(apiBase, token, '/api/v1/jobs?limit=8'),
+        apiFetch<Capabilities>(apiBase, token, '/api/v1/capabilities'),
       ])
       setPlugins(pluginPayload.plugins || [])
+      setCapabilities(capabilityPayload)
       setJobs((current) => mergeJobList(current, jobPayload.jobs || []))
       setConnected(true)
     } catch (err) {
@@ -672,6 +691,7 @@ function App() {
                   <Metric label="LIVE RUNS" value={String(runningJobs).padStart(2, '0')} icon={<Radio size={14} />} />
                 </div>
               </section>
+              <CapabilityStrip capabilities={capabilities} />
               <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#3f527c] bg-[#111d32]/80 px-5 py-4"><div><div className="font-mono text-[10px] tracking-[0.16em] text-[#9cb9ff]">INTERVIEW DEMO / BGI MULTI-OMICS</div><div className="mt-1 text-sm text-[#b9c8e8]">Genomics QC → 10x single-cell → microbiome → evidence → mRNA</div></div><button aria-label="Run BGI multi-omics demo" onClick={() => void submitBgiMultiomicsDemo()} disabled={loading} className="rounded-lg bg-[#aebfff] px-3 py-2 text-xs font-semibold text-[#111a34] transition hover:bg-[#c4d0ff] disabled:cursor-not-allowed disabled:opacity-50">Run BGI Demo</button></div>
 
               <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#28524b] bg-[#102b2a]/70 px-5 py-4"><div><div className="font-mono text-[10px] tracking-[0.16em] text-[#8fe5c1]">INTERVIEW DEMO / RNA-SEQ AGENT</div><div className="mt-1 text-sm text-[#b4cdc6]">差异表达 → 通路富集 → 基因证据 → 可追溯报告</div></div><button onClick={() => void submitOmicsDemo()} disabled={loading} className="rounded-lg bg-[#8fe5c1] px-3 py-2 text-xs font-semibold text-[#092521] transition hover:bg-[#b8f4d8] disabled:cursor-not-allowed disabled:opacity-50">运行 RNA-seq Agent</button></div>
@@ -725,6 +745,17 @@ function App() {
       </div>
     </div>
   )
+}
+
+function CapabilityStrip({ capabilities }: { capabilities: Capabilities | null }) {
+  if (!capabilities) return null
+  const cards = [
+    { key: 'rest', label: 'REST / OPENAPI', icon: Server, detail: capabilities.interfaces.rest?.openapi || '/openapi.json' },
+    { key: 'sse', label: 'SSE EVENTS', icon: Radio, detail: capabilities.interfaces.sse?.endpoint || 'job event stream' },
+    { key: 'mcp', label: 'MCP / STDIO', icon: Terminal, detail: `${capabilities.interfaces.mcp?.tool_count || capabilities.tool_count} tools` },
+    { key: 'embedded', label: 'EMBEDDED CALL', icon: Boxes, detail: capabilities.interfaces.embedded?.entrypoint || 'run_tool' },
+  ]
+  return <section className="mb-5" aria-label="Integration surfaces"><div className="mb-2 flex items-center justify-between"><div className="eyebrow">INTEGRATION SURFACES</div><div className="font-mono text-[10px] text-[#66857e]">{capabilities.tool_count} CONTRACTED TOOLS</div></div><div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">{cards.map((card) => { const capability = capabilities.interfaces[card.key]; const Icon = card.icon; const available = capability?.status === 'available'; return <div key={card.key} className="rounded-xl border border-white/[0.08] bg-white/[0.035] px-3 py-3"><div className="flex items-center justify-between gap-2"><div className="flex items-center gap-2 text-xs font-medium text-[#c9e5dc]"><Icon size={14} className="text-[#8fe5c1]" />{card.label}</div><span className={`status-badge ${available ? 'status-ok' : 'status-failed'}`}>{available ? 'READY' : capability?.status || 'UNKNOWN'}</span></div><div className="mt-2 truncate font-mono text-[9px] text-[#66857e]" title={card.detail}>{card.detail}</div></div> })}</div></section>
 }
 
 function Metric({ label, value, icon }: { label: string; value: string; icon: React.ReactNode }) {
