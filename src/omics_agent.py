@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,7 +16,7 @@ import pandas as pd
 from scipy.stats import hypergeom, ttest_ind
 
 PLUGIN_NAME = 'RNA-seq and omics domain'
-PLUGIN_VERSION = '0.6.0'
+PLUGIN_VERSION = '0.7.0'
 PLUGIN_API_VERSION = 1
 PLUGIN_CAPABILITIES = (
     'omics.end_to_end',
@@ -31,6 +32,7 @@ PLUGIN_CAPABILITIES = (
     'omics.rnaseq_quantification',
     'omics.toolchain',
     'omics.genomics_qc',
+    'omics.fastq_qc',
     'omics.single_cell_qc',
     'omics.metagenomics_qc',
 )
@@ -43,6 +45,8 @@ TOOLCHAIN_EXECUTABLES = {
     'hisat2': 'hisat2',
     'hisat2-build': 'hisat2-build',
     'featureCounts': 'featureCounts',
+    'fastqc': 'fastqc',
+    'multiqc': 'multiqc',
     'vep': 'vep',
 }
 DESEQ2_RUNNER = Path(__file__).resolve().parents[1] / 'tools' / 'deseq2_runner.R'
@@ -1244,6 +1248,132 @@ def run_genomics_qc(input_path, output_dir, input_type='auto', timeout=300):
     })
 
 
+def _parse_fastqc_summary(zip_path):
+    with zipfile.ZipFile(zip_path) as archive:
+        summary_name = next(
+            (name for name in archive.namelist() if name.endswith('/summary.txt')),
+            None,
+        )
+        if not summary_name:
+            return []
+        text = archive.read(summary_name).decode('utf-8', errors='replace')
+    records = []
+    for line in text.splitlines():
+        fields = line.split('\t', 2)
+        if len(fields) == 3:
+            records.append({
+                'status': fields[0].lower(),
+                'module': fields[1],
+                'details': fields[2],
+            })
+    return records
+
+
+def _fastqc_reports(output_dir):
+    reports = []
+    summaries = []
+    for zip_path in sorted(output_dir.glob('*_fastqc.zip')):
+        try:
+            summary = _parse_fastqc_summary(zip_path)
+        except (OSError, zipfile.BadZipFile) as exc:
+            summary = [{'status': 'error', 'module': 'summary', 'details': str(exc)}]
+        summaries.append({
+            'archive': str(zip_path),
+            'summary': summary,
+        })
+        reports.append(str(zip_path))
+    reports.extend(str(path) for path in sorted(output_dir.glob('*_fastqc.html')))
+    return reports, summaries
+
+
+def run_fastq_qc(fastq_paths, output_dir, fastq_r2_paths=None, threads=1,
+                 timeout=900):
+    paths = _normalize_fastq_paths(fastq_paths)
+    mate_paths = _normalize_fastq_paths(fastq_r2_paths) if fastq_r2_paths is not None else []
+    if mate_paths and len(paths) != len(mate_paths):
+        raise ValueError('fastq_r2_paths must match the number of FASTQ R1 inputs')
+    all_paths = paths + mate_paths
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fastqc_dir = output_dir / 'fastqc'
+    fastqc_dir.mkdir(parents=True, exist_ok=True)
+    threads = max(1, min(int(threads), 64))
+    timeout = max(1, min(int(timeout), 3600))
+    provenance = {
+        'inputs': [
+            {'path': str(path), 'sha256': _file_sha256(path)} for path in all_paths
+        ],
+        'parameters': {
+            'threads': threads,
+            'layout': 'paired_end' if mate_paths else 'single_end',
+        },
+        'tools': {},
+    }
+    fastqc = shutil.which('fastqc')
+    multiqc = shutil.which('multiqc')
+    missing_tools = [name for name, path in (('fastqc', fastqc), ('multiqc', multiqc)) if not path]
+    if missing_tools:
+        return _write_omics_manifest(output_dir, 'fastq_qc.json', {
+            'status': 'unavailable',
+            'workflow': 'fastq_quality_control',
+            'inputs': [str(path) for path in all_paths],
+            'missing_tools': missing_tools,
+            'reason': 'install FastQC and MultiQC in the execution environment',
+            'provenance': provenance,
+        })
+    provenance['tools'] = {
+        'fastqc': {'path': fastqc, **_external_tool_version(fastqc)},
+        'multiqc': {'path': multiqc, **_external_tool_version(multiqc)},
+    }
+    fastqc_command = [
+        fastqc, '--quiet', '--threads', str(threads),
+        '--outdir', str(fastqc_dir),
+        *[str(path) for path in all_paths],
+    ]
+    fastqc_result = _run_variant_command(
+        fastqc_command, timeout, output_dir / 'fastqc.log'
+    )
+    if fastqc_result['status'] != 'completed':
+        return _write_omics_manifest(output_dir, 'fastq_qc.json', {
+            'status': 'failed',
+            'workflow': 'fastq_quality_control',
+            'inputs': [str(path) for path in all_paths],
+            'fastqc': fastqc_result,
+            'command': fastqc_command,
+            'provenance': provenance,
+        })
+    multiqc_command = [
+        multiqc, '--force', '--outdir', str(output_dir),
+        '--filename', 'multiqc_report.html', str(fastqc_dir),
+    ]
+    multiqc_result = _run_variant_command(
+        multiqc_command, timeout, output_dir / 'multiqc.log'
+    )
+    reports, summaries = _fastqc_reports(fastqc_dir)
+    module_status_counts = {}
+    for report in summaries:
+        for record in report['summary']:
+            status = record['status']
+            module_status_counts[status] = module_status_counts.get(status, 0) + 1
+    if (output_dir / 'multiqc_report.html').is_file():
+        reports.append(str(output_dir / 'multiqc_report.html'))
+    return _write_omics_manifest(output_dir, 'fastq_qc.json', {
+        'status': 'completed' if multiqc_result['status'] == 'completed' else 'failed',
+        'workflow': 'fastq_quality_control',
+        'inputs': [str(path) for path in all_paths],
+        'reports': reports,
+        'fastqc_summaries': summaries,
+        'module_status_counts': module_status_counts,
+        'fastqc': fastqc_result,
+        'multiqc': multiqc_result,
+        'commands': {
+            'fastqc': fastqc_command,
+            'multiqc': multiqc_command,
+        },
+        'provenance': provenance,
+    })
+
+
 def _parse_flagstat_total(text):
     match = re.search(r'^(\d+)\s*\+\s*(\d+)\s+in total', str(text or ''), re.MULTILINE)
     if not match:
@@ -2055,7 +2185,7 @@ TOOLS = {
         'function': annotate_variants,
     },
     'inspect_toolchain': {
-        'description': 'Report whether HISAT2, SAMtools, bcftools, featureCounts, GATK and VEP are available in the execution environment.',
+        'description': 'Report whether FastQC, MultiQC, HISAT2, SAMtools, bcftools, featureCounts, GATK and VEP are available in the execution environment.',
         'parameters': _parameters({}),
         'function': toolchain_status,
     },
@@ -2073,6 +2203,27 @@ TOOLS = {
             'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 3600},
         }, required=('input_path', 'output_dir')),
         'function': run_genomics_qc,
+    },
+    'run_fastq_qc': {
+        'description': 'Run native FastQC on single-end or paired-end FASTQ files and aggregate the reports with MultiQC.',
+        'parameters': _parameters({
+            'fastq_paths': {
+                'oneOf': [
+                    {'type': 'string'},
+                    {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1},
+                ],
+            },
+            'output_dir': {'type': 'string'},
+            'fastq_r2_paths': {
+                'oneOf': [
+                    {'type': 'string'},
+                    {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1},
+                ],
+            },
+            'threads': {'type': 'integer', 'minimum': 1, 'maximum': 64},
+            'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 3600},
+        }, required=('fastq_paths', 'output_dir')),
+        'function': run_fastq_qc,
     },
     'run_variant_calling': {
         'description': 'Call small variants from an indexed BAM/CRAM against a reference FASTA with SAMtools and bcftools, producing a VCF and provenance manifest.',

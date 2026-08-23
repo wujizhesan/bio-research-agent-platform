@@ -139,13 +139,33 @@ class ResearchAgentTests(unittest.TestCase):
             'task': 'Run FASTQ sequencing quality control',
             'domains': ['omics'],
             'inputs': {
-                'input_path': 'examples/rnaseq/expression.csv',
+                'input_path': 'examples/omics/rnaseq_fastq_fixture/A1.fastq',
                 'input_type': 'fastq',
             },
         })
         self.assertTrue(result['ready'])
-        self.assertEqual(result['selected_tools'], ['omics_run_genomics_qc'])
-        self.assertEqual(result['workflow']['steps'][0]['args']['input_type'], 'fastq')
+        self.assertEqual(result['selected_tools'], ['omics_run_fastq_qc'])
+        self.assertEqual(result['workflow']['steps'][0]['args']['fastq_paths'], 'examples/omics/rnaseq_fastq_fixture/A1.fastq')
+
+    def test_research_planner_inserts_fastq_qc_before_alignment(self):
+        result = run_tool('research_build_workflow', {
+            'task': 'Run FastQC and align paired-end RNA-seq reads',
+            'domains': ['omics'],
+            'inputs': {
+                'fastq_paths': ['data/A1_R1.fastq'],
+                'fastq_r2_paths': ['data/A1_R2.fastq'],
+                'reference_fasta': 'data/reference.fa',
+                'qc_threads': 2,
+            },
+        })
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['selected_tools'], [
+            'omics_run_fastq_qc', 'omics_run_rnaseq_alignment',
+        ])
+        qc_step, alignment_step = result['workflow']['steps']
+        self.assertEqual(qc_step['args']['fastq_r2_paths'], ['data/A1_R2.fastq'])
+        self.assertEqual(qc_step['args']['threads'], 2)
+        self.assertEqual(alignment_step['depends_on'], ['fastq_qc'])
 
     def test_research_planner_builds_variant_calling_workflow(self):
         result = run_tool('research_build_workflow', {

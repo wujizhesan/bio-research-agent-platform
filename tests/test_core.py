@@ -19,7 +19,7 @@ from src.audit_external_overlap import audit_overlap, remove_structure_overlap
 from src.build_hard_decoy_benchmark import build_hard_decoy_benchmark, build_random_control_benchmark
 from src.compare_benchmarks import compare_benchmarks, compare_benchmark_replicates
 from src.run_benchmark_replicates import _normalize_id, _validate_control, _validate_hard_benchmark
-from src.omics_agent import TOOLS as OMICS_TOOLS, _external_tool_version, _resolve_statistics_backend, annotate_variants, normalize_variants, run_feature_counts, run_genomics_qc, run_metagenomics_qc, run_omics_analysis, run_rnaseq_alignment, run_single_cell_10x_qc, run_single_cell_qc, run_tool as run_omics_tool, run_variant_calling, search_gene_evidence, statistics_backend_status, toolchain_status
+from src.omics_agent import TOOLS as OMICS_TOOLS, _external_tool_version, _resolve_statistics_backend, annotate_variants, normalize_variants, run_fastq_qc, run_feature_counts, run_genomics_qc, run_metagenomics_qc, run_omics_analysis, run_rnaseq_alignment, run_single_cell_10x_qc, run_single_cell_qc, run_tool as run_omics_tool, run_variant_calling, search_gene_evidence, statistics_backend_status, toolchain_status
 from src.domain_registry import run_tool as run_domain_tool, tool_specs, validate_tool_map
 from src.workflow_runner import run_workflow
 from src.resplit_external import joint_split_indices
@@ -520,6 +520,30 @@ class CoreTests(unittest.TestCase):
         self.assertAlmostEqual(result['metrics']['mean_quality'], 26.667, places=3)
         self.assertEqual(manifest['manifest_path'], result['manifest_path'])
         self.assertIn('run_genomics_qc', OMICS_TOOLS)
+
+    @patch('src.omics_agent.shutil.which', return_value=None)
+    def test_fastq_qc_reports_missing_native_tools(self, mocked_which):
+        with tempfile.TemporaryDirectory(prefix='cadd_fastqc_missing_') as raw:
+            root = Path(raw)
+            fastq_path = root / 'reads.fastq'
+            fastq_path.write_text('@read1\nACGT\n+\nIIII\n', encoding='utf-8')
+            result = run_fastq_qc(fastq_path, root / 'qc')
+            manifest = json.loads((root / 'qc' / 'fastq_qc.json').read_text(encoding='utf-8'))
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertEqual(result['missing_tools'], ['fastqc', 'multiqc'])
+        self.assertEqual(manifest['workflow'], 'fastq_quality_control')
+        self.assertIn('run_fastq_qc', OMICS_TOOLS)
+        mocked_which.assert_has_calls([unittest.mock.call('fastqc'), unittest.mock.call('multiqc')])
+
+    def test_fastq_qc_validates_paired_inputs(self):
+        with tempfile.TemporaryDirectory(prefix='cadd_fastqc_pairs_') as raw:
+            root = Path(raw)
+            r1_path = root / 'A1_R1.fastq'
+            r2_path = root / 'A1_R2.fastq'
+            r1_path.write_text('@read1\nACGT\n+\nIIII\n', encoding='utf-8')
+            r2_path.write_text('@read1\nTGCA\n+\nIIII\n', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'must match'):
+                run_fastq_qc([r1_path, r2_path], root / 'qc', fastq_r2_paths=[r2_path])
 
     @patch('src.omics_agent.subprocess.run')
     @patch('src.omics_agent.shutil.which')

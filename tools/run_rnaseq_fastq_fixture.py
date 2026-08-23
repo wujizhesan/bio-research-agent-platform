@@ -2,7 +2,7 @@ import argparse
 import json
 from pathlib import Path
 
-from src.omics_agent import run_feature_counts, run_omics_analysis, run_rnaseq_alignment
+from src.omics_agent import run_fastq_qc, run_feature_counts, run_omics_analysis, run_rnaseq_alignment
 
 
 def run_fixture(fixture_dir, output_dir, statistics_backend='scipy'):
@@ -12,6 +12,13 @@ def run_fixture(fixture_dir, output_dir, statistics_backend='scipy'):
     fastq_paths = sorted(fixture_dir.glob('*.fastq'))
     if len(fastq_paths) != 6:
         raise ValueError(f'expected six FASTQ fixture files, found {len(fastq_paths)}')
+    fastq_qc = run_fastq_qc(
+        fastq_paths,
+        output_dir / 'fastq_qc',
+        threads=1,
+    )
+    if fastq_qc.get('status') != 'completed':
+        raise RuntimeError(json.dumps(fastq_qc, ensure_ascii=False))
     alignment = run_rnaseq_alignment(
         fastq_paths,
         fixture_dir / 'reference.fa',
@@ -41,6 +48,7 @@ def run_fixture(fixture_dir, output_dir, statistics_backend='scipy'):
         'status': 'completed',
         'fixture_dir': str(fixture_dir),
         'output_dir': str(output_dir),
+        'fastq_qc': fastq_qc,
         'alignment': alignment,
         'feature_counts': counts,
         'analysis': analysis,

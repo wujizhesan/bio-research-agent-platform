@@ -92,6 +92,7 @@ _VARIANT_KEYWORDS = (
 
 _GENOMICS_QC_KEYWORDS = (
     'fastq', 'bam', 'cram', 'bcf', 'quality control', 'quality-control',
+    'fastqc', 'multiqc', 'fastq quality', 'sequencing quality',
     'sequencing qc', '测序质控', '质量控制',
 )
 
@@ -234,10 +235,22 @@ def _is_variant_annotation_task(task, inputs=None):
 
 def _is_genomics_qc_task(task, inputs=None):
     inputs = inputs or {}
-    if any(key in inputs for key in ('input_path', 'fastq_path', 'bam_path', 'cram_path')):
+    if any(key in inputs for key in ('input_path', 'fastq_path', 'fastq_paths', 'bam_path', 'cram_path')):
         return True
     text = str(task or '').lower()
     return any(keyword in text for keyword in _GENOMICS_QC_KEYWORDS)
+
+
+def _is_fastq_qc_task(task, inputs=None):
+    inputs = inputs or {}
+    input_type = str(inputs.get('input_type', '')).lower()
+    text = str(task or '').lower()
+    if any(keyword in text for keyword in (
+        'fastqc', 'multiqc', 'fastq quality', 'sequencing quality',
+        'quality control', 'quality-control',
+    )):
+        return True
+    return input_type == 'fastq' and not _is_rnaseq_alignment_task(task, inputs)
 
 
 def _is_single_cell_task(task, inputs=None):
@@ -346,7 +359,16 @@ def _required_inputs(domains, task=None, inputs=None):
                 {'name': 'reference_fasta', 'description': 'reference genome FASTA with matching contigs'},
             ])
         elif _is_genomics_qc_task(task, inputs):
-            required.append({'name': 'input_path', 'description': 'FASTQ, BAM/CRAM or VCF/BCF input file'})
+            if inputs and inputs.get('fastq_paths'):
+                input_name = 'fastq_paths'
+            elif inputs and inputs.get('fastq_path'):
+                input_name = 'fastq_path'
+            else:
+                input_name = 'input_path'
+            required.append({
+                'name': input_name,
+                'description': 'single-end or paired-end FASTQ files' if input_name in {'fastq_path', 'fastq_paths'} else 'FASTQ, BAM/CRAM or VCF/BCF input file',
+            })
         elif _is_variant_task(task, inputs):
             required.append({'name': 'vcf_path', 'description': 'VCF variant file'})
             annotation_backend = (inputs or {}).get('annotation_backend', 'auto')
@@ -414,6 +436,7 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
     variant_normalization_task = _is_variant_normalization_task(task, inputs)
     variant_calling_task = _is_variant_calling_task(task, inputs)
     qc_task = _is_genomics_qc_task(task, inputs)
+    fastq_qc_task = _is_fastq_qc_task(task, inputs)
     if 'omics' in domains and metagenomics_task:
         abundance_csv = inputs.get('abundance_csv') or inputs.get('metagenomics_abundance')
         if not abundance_csv:
@@ -486,6 +509,7 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
             if not annotation_gtf:
                 missing.append('annotation_gtf')
         if fastq_paths and reference_fasta:
+            alignment_dependencies = []
             alignment_args = {
                 'fastq_paths': [str(path) for path in fastq_paths] if isinstance(fastq_paths, (list, tuple)) else str(fastq_paths),
                 'reference_fasta': str(reference_fasta),
@@ -496,9 +520,27 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
                     alignment_args[key] = inputs[key]
             if inputs.get('fastq_r2_paths') is not None:
                 alignment_args['fastq_r2_paths'] = inputs['fastq_r2_paths']
+            if fastq_qc_task:
+                qc_args = {
+                    'fastq_paths': alignment_args['fastq_paths'],
+                    'output_dir': str(Path(output_dir) / 'fastq_qc'),
+                }
+                if inputs.get('fastq_r2_paths') is not None:
+                    qc_args['fastq_r2_paths'] = inputs['fastq_r2_paths']
+                for key in ('qc_threads', 'qc_timeout'):
+                    if inputs.get(key) is not None:
+                        qc_args[key.removeprefix('qc_')] = inputs[key]
+                steps.append({
+                    'id': 'fastq_qc',
+                    'tool': 'omics_run_fastq_qc',
+                    'args': qc_args,
+                })
+                alignment_dependencies.append('fastq_qc')
+                rationale.append('FastQC evaluates per-file sequencing quality and MultiQC aggregates a reviewable multi-sample report before alignment')
             steps.append({
                 'id': 'rnaseq_alignment',
                 'tool': 'omics_run_rnaseq_alignment',
+                **({'depends_on': alignment_dependencies} if alignment_dependencies else {}),
                 'args': alignment_args,
             })
             rationale.append('HISAT2 aligns RNA-seq FASTQ reads to a reference and emits sorted indexed BAM files with alignment provenance')
@@ -707,6 +749,7 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
         qc_input = (
             inputs.get('input_path')
             or inputs.get('fastq_path')
+            or inputs.get('fastq_paths')
             or inputs.get('bam_path')
             or inputs.get('cram_path')
             or inputs.get('vcf_path')
@@ -719,17 +762,34 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
                 serialized_input = [str(path) for path in qc_input]
             else:
                 serialized_input = str(qc_input)
-            steps.append({
-                'id': 'genomics_qc',
-                'tool': 'omics_run_genomics_qc',
-                'args': {
-                    'input_path': serialized_input,
+            if fastq_qc_task:
+                qc_args = {
+                    'fastq_paths': serialized_input,
                     'output_dir': output_dir,
-                    'input_type': str(inputs.get('input_type', 'auto')),
-                    'timeout': int(inputs.get('qc_timeout', 300)),
-                },
-            })
-            rationale.append('genomics QC uses a reproducible FASTQ parser or fixed SAMtools/bcftools commands')
+                    'timeout': int(inputs.get('qc_timeout', 900)),
+                }
+                if inputs.get('fastq_r2_paths') is not None:
+                    qc_args['fastq_r2_paths'] = inputs['fastq_r2_paths']
+                if inputs.get('qc_threads') is not None:
+                    qc_args['threads'] = int(inputs['qc_threads'])
+                steps.append({
+                    'id': 'fastq_qc',
+                    'tool': 'omics_run_fastq_qc',
+                    'args': qc_args,
+                })
+                rationale.append('native FastQC evaluates sequencing quality and MultiQC aggregates a reviewable report')
+            else:
+                steps.append({
+                    'id': 'genomics_qc',
+                    'tool': 'omics_run_genomics_qc',
+                    'args': {
+                        'input_path': serialized_input,
+                        'output_dir': output_dir,
+                        'input_type': str(inputs.get('input_type', 'auto')),
+                        'timeout': int(inputs.get('qc_timeout', 300)),
+                    },
+                })
+                rationale.append('genomics QC uses a reproducible FASTQ parser or fixed SAMtools/bcftools commands')
     elif 'omics' in domains and variant_task:
         vcf_path = inputs.get('vcf_path') or inputs.get('vcf') or inputs.get('variants_vcf')
         annotation_backend = str(inputs.get('annotation_backend', 'auto'))
