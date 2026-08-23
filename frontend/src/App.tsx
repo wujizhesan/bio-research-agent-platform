@@ -107,6 +107,13 @@ type UploadedFile = {
   download_url: string
 }
 
+type RnaPreflightItem = {
+  label: string
+  detail: string
+  ready: boolean
+  required: boolean
+}
+
 type View = 'workspace' | 'domains'
 type RunMode = 'research' | 'rnaseq' | 'variant' | 'sequence' | 'cadd'
 type PlannerMode = 'auto' | 'deterministic' | 'llm'
@@ -349,6 +356,25 @@ function App() {
   const activeDomains = useMemo(() => plugins.filter((plugin) => plugin.status === 'available').length, [plugins])
   const toolCount = useMemo(() => plugins.reduce((total, plugin) => total + (plugin.tool_count || 0), 0), [plugins])
   const runningJobs = jobs.filter((job) => job.status === 'queued' || job.status === 'running').length
+  const rnaseqPreflight = useMemo(() => {
+    const taskText = rnaseqTask.toLowerCase()
+    const pairedEnd = /paired[- ]?end|双端|双末端/.test(taskText)
+    const alignment = /align|hisat|比对|featurecounts|计数|定量/.test(taskText)
+    const differential = /differential|deseq|差异表达|差异分析/.test(taskText)
+    const enrichment = /enrichment|pathway|gene set|富集|通路|基因集/.test(taskText)
+    const r1Count = rnaFiles.fastq_r1.length
+    const r2Count = rnaFiles.fastq_r2.length
+    const pairMismatch = r2Count > 0 && (r1Count === 0 || r1Count !== r2Count)
+    const checks: RnaPreflightItem[] = [
+      { label: 'R1 FASTQ', detail: r1Count ? `${r1Count} 个文件` : '待上传', ready: r1Count > 0, required: true },
+      { label: 'R2 FASTQ', detail: r2Count ? `${r2Count} 个文件` : pairedEnd ? '双端任务需要上传' : '未上传，按单端处理', ready: !pairedEnd && r2Count === 0 ? true : r2Count > 0 && !pairMismatch, required: pairedEnd },
+      { label: 'Reference FASTA', detail: rnaFiles.reference_fasta.length ? '已上传' : alignment ? '比对任务需要上传' : 'Planner 可继续检查', ready: !alignment || rnaFiles.reference_fasta.length > 0, required: alignment },
+      { label: 'Annotation GTF', detail: rnaFiles.annotation_gtf.length ? '已上传' : differential ? '差异分析前需要计数注释' : 'featureCounts / 差异分析需要', ready: !differential || rnaFiles.annotation_gtf.length > 0, required: differential },
+      { label: 'Metadata CSV', detail: rnaFiles.metadata.length ? '已上传' : differential ? '差异分析需要' : '可选', ready: !differential || rnaFiles.metadata.length > 0, required: differential },
+      { label: 'Gene sets CSV', detail: rnaFiles.gene_sets.length ? '已上传' : enrichment ? '富集分析需要' : '可选', ready: !enrichment || rnaFiles.gene_sets.length > 0, required: enrichment },
+    ]
+    return { checks, pairMismatch }
+  }, [rnaFiles, rnaseqTask])
 
   function saveToken() {
     localStorage.setItem('bio-agent-token', token)
@@ -854,6 +880,7 @@ function App() {
                        <RnaFileField id="rna-metadata-file" label="样本 metadata CSV（可选）" files={rnaFiles.metadata} accept=".csv,.tsv,text/csv,text/tab-separated-values" uploading={uploadingRnaFile === 'metadata'} onChange={(files) => void handleRnaFileUpload('metadata', files)} />
                        <RnaFileField id="rna-gene-sets-file" label="gene sets CSV（可选）" files={rnaFiles.gene_sets} accept=".csv,.tsv,text/csv,text/tab-separated-values" uploading={uploadingRnaFile === 'gene_sets'} onChange={(files) => void handleRnaFileUpload('gene_sets', files)} />
                      </div>
+                     <RnaPreflightCard items={rnaseqPreflight.checks} pairMismatch={rnaseqPreflight.pairMismatch} />
                      <p className="mt-3 text-xs leading-5 text-[#688983]">R1/R2 可批量选择；Planner 会根据任务文本检查输入，并决定是否继续比对、featureCounts、差异分析和富集。</p>
                   </> : mode === 'variant' ? <>
                     <label className="mt-6 block"><span className="field-label">Variant research task</span><textarea value={variantTask} onChange={(event) => { setVariantTask(event.target.value); setResearchPlan(null) }} rows={3} className="input-area" placeholder="Describe the VCF annotation and evidence task" /></label>
@@ -869,7 +896,7 @@ function App() {
                     <div className="mt-5 grid gap-4 sm:grid-cols-2"><div><label className="field-label" htmlFor="cadd-max-ligands">演示候选数</label><input id="cadd-max-ligands" type="number" min="1" max="17" value={caddMaxLigands} onChange={(event) => { setCaddMaxLigands(event.target.value); setResearchPlan(null) }} className="input-control font-mono" /><span className="mt-2 block text-xs text-[#688983]">完整筛选可调到 17，演示建议 3。</span></div><div><label className="field-label" htmlFor="cadd-exhaustiveness">Vina exhaustiveness</label><input id="cadd-exhaustiveness" type="number" min="1" max="32" value={caddExhaustiveness} onChange={(event) => { setCaddExhaustiveness(event.target.value); setResearchPlan(null) }} className="input-control font-mono" /><span className="mt-2 block text-xs text-[#688983]">数值越高越稳定，但运行时间更长。</span></div></div>
                     <p className="mt-3 text-xs leading-5 text-[#688983]">CADD 入口会记录受体、数据集、Vina 参数与结果报告。Docker 优先读取本机挂载的 data/4hjo.pdb 和 output/bindingdb_egfr_10000.csv，也支持上传替换。</p>
                   </>}
-                  <div className="mt-6 flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2 font-mono text-[10px] text-[#66847e]"><CircleDot size={13} className="text-[#70e3ad]" />ASYNC / TRACEABLE / REPLAYABLE</div><button onClick={submitRun} disabled={loading || (mode === 'research' ? !task.trim() : mode === 'rnaseq' ? !rnaseqTask.trim() : mode === 'variant' ? !variantTask.trim() : mode === 'sequence' ? !protein.trim() : false)} className="group inline-flex items-center gap-2 rounded-xl bg-[#a8f0d2] px-4 py-2.5 text-sm font-semibold text-[#092521] transition hover:bg-[#c6f8e1] disabled:cursor-not-allowed disabled:opacity-50">{loading ? <RefreshCw size={15} className="animate-spin" /> : <Play size={15} />}{loading ? '执行中…' : '开始运行'}<ArrowUpRight size={14} className="transition group-hover:translate-x-0.5 group-hover:-translate-y-0.5" /></button></div>
+                  <div className="mt-6 flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2 font-mono text-[10px] text-[#66847e]"><CircleDot size={13} className="text-[#70e3ad]" />ASYNC / TRACEABLE / REPLAYABLE</div><button onClick={submitRun} disabled={loading || (mode === 'research' ? !task.trim() : mode === 'rnaseq' ? !rnaseqTask.trim() || rnaseqPreflight.pairMismatch : mode === 'variant' ? !variantTask.trim() : mode === 'sequence' ? !protein.trim() : false)} className="group inline-flex items-center gap-2 rounded-xl bg-[#a8f0d2] px-4 py-2.5 text-sm font-semibold text-[#092521] transition hover:bg-[#c6f8e1] disabled:cursor-not-allowed disabled:opacity-50">{loading ? <RefreshCw size={15} className="animate-spin" /> : <Play size={15} />}{loading ? '执行中…' : '开始运行'}<ArrowUpRight size={14} className="transition group-hover:translate-x-0.5 group-hover:-translate-y-0.5" /></button></div>
                 </div>
 
                 <div className="panel flex min-h-[326px] flex-col p-5 sm:p-6"><div className="flex items-start justify-between"><div><div className="eyebrow">02 / EXECUTION STREAM</div><h2 className="mt-2 text-xl font-semibold">实时执行轨迹</h2></div><div className="flex items-center gap-1.5 rounded-full border border-[#28524b] bg-[#102b2a] px-2.5 py-1 font-mono text-[10px] text-[#8fe5c1]"><span className="size-1.5 animate-pulse rounded-full bg-[#70e3ad]" />SSE</div></div>{selectedJob ? <div className="mt-7 flex flex-1 flex-col"><div className="flex items-center justify-between border-b border-white/10 pb-4"><div><div className="font-mono text-[11px] text-[#6f9189]">{formatJobId(selectedJob.job_id)}</div><div className="mt-1 text-sm font-medium">{selectedJob.tool}</div></div><StatusBadge status={selectedJob.status} /></div><div className="mt-5 space-y-3">{events.slice(-4).map((event, index) => <div key={`${event.at}-${index}`} className="flex items-start gap-3 text-xs"><div className="mt-1.5 size-1.5 rounded-full bg-[#83e3bc] shadow-[0_0_12px_#83e3bc]" /><div className="min-w-0 flex-1"><div className="text-[#b2cbc4]">{event.detail}</div><div className="mt-1 font-mono text-[10px] text-[#5f7c76]">{event.at} · {event.status}</div></div></div>)}</div><div className="mt-auto flex items-center gap-2 pt-5 font-mono text-[10px] text-[#64827b]"><Clock3 size={13} />{selectedJob.status === 'completed' ? `完成于 ${formatTime(selectedJob.finished_at)}` : '等待状态更新…'}</div></div> : <EmptyStream />}</div>
@@ -932,6 +959,16 @@ function RnaFileField({ id, label, accept, files, multiple = false, uploading, o
       <div className="min-w-0"><div className="truncate text-xs font-medium text-[#b8d8ce]">{uploading ? '上传中…' : files.length ? `${files.length} 个文件已选择` : '选择输入文件'}</div><div className="mt-1 truncate font-mono text-[9px] text-[#668983]">{files.length ? files.map((file) => file.filename).join(', ') : '服务端安全存储并计算 SHA-256'}</div></div>
       {uploading ? <RefreshCw size={15} className="shrink-0 animate-spin text-[#8fe5c1]" /> : <Upload size={15} className="shrink-0 text-[#78cdaa]" />}
     </label>
+  </div>
+}
+
+function RnaPreflightCard({ items, pairMismatch }: { items: RnaPreflightItem[]; pairMismatch: boolean }) {
+  const requiredCount = items.filter((item) => item.required).length
+  const readyRequiredCount = items.filter((item) => item.required && item.ready).length
+  const allRequiredReady = !pairMismatch && readyRequiredCount === requiredCount
+  return <div className="mt-5 rounded-xl border border-[#244b45] bg-[#0a211f]/75 p-4" role="status" aria-live="polite">
+    <div className="flex flex-wrap items-center justify-between gap-2"><div><div className="field-label">RUN PREFLIGHT</div><div className="mt-1 text-xs text-[#9bc3b8]">{readyRequiredCount}/{requiredCount} 个任务必需输入已满足</div></div><span className={`status-badge ${pairMismatch ? 'status-failed' : allRequiredReady ? 'status-ok' : 'status-running'}`}><span className="size-1.5 rounded-full bg-current" />{pairMismatch ? '配对数量不一致' : allRequiredReady ? '输入已就绪' : '待补齐输入'}</span></div>
+    <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{items.map((item) => <div key={item.label} className="flex min-w-0 items-start gap-2 rounded-lg border border-white/[0.06] bg-[#071719]/70 px-2.5 py-2"><div className={`mt-0.5 shrink-0 ${item.ready ? 'text-[#70e3ad]' : item.required ? 'text-[#e6c875]' : 'text-[#6d8d86]'}`}>{item.ready ? <Check size={13} /> : <XCircle size={13} />}</div><div className="min-w-0"><div className="truncate text-[11px] font-medium text-[#b8d8ce]">{item.label}{item.required ? <span className="ml-1 text-[#e6c875]">必需</span> : <span className="ml-1 text-[#688983]">可选</span>}</div><div className="mt-0.5 truncate text-[10px] text-[#6f9189]">{item.detail}</div></div></div>)}</div>
   </div>
 }
 
