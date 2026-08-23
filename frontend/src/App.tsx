@@ -614,6 +614,41 @@ function App() {
     }
   }
 
+  async function retryJob(sourceJob: Job) {
+    if (!['failed', 'cancelled'].includes(sourceJob.status)) return
+    const controller = beginJobStream()
+    setLoading(true)
+    setError('')
+    setEvents([])
+    try {
+      const response = await apiFetch<{ job: Job }>(apiBase, token, `/api/v1/jobs/${sourceJob.job_id}/retry`, { method: 'POST' })
+      const job = response.job
+      setSelectedJob(job)
+      setJobs((current) => [job, ...current.filter((item) => item.job_id !== job.job_id)])
+      setEvents([{ at: formatTime(new Date().toISOString()), type: 'retry', status: job.status, detail: `任务已重试，来源 ${formatJobId(sourceJob.job_id)}` }])
+      await followJob(apiBase, token, job.job_id, (type, data) => {
+        if (!data.job) return
+        setSelectedJob(data.job)
+        setJobs((current) => [data.job!, ...current.filter((item) => item.job_id !== data.job!.job_id)])
+        setEvents((current) => [...current, {
+          at: formatTime(new Date().toISOString()),
+          type,
+          status: data.job!.status,
+          detail: type === 'timeout' ? 'SSE 订阅超时，任务仍可通过列表查询' : `状态更新为${statusLabels[data.job!.status] || data.job!.status}`,
+        }])
+      }, controller.signal)
+    } catch (err) {
+      if (!isCurrentStream(controller) || (err instanceof Error && err.name === 'AbortError')) return
+      setError(err instanceof Error ? err.message : '任务重试失败')
+    } finally {
+      if (isCurrentStream(controller)) {
+        streamController.current = null
+        setLoading(false)
+        void refresh()
+      }
+    }
+  }
+
   async function downloadJobArtifact(jobId: string, artifactPath: string) {
     setError('')
     try {
@@ -699,6 +734,7 @@ function App() {
               <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#28524b] bg-[#102b2a]/70 px-5 py-4"><div><div className="font-mono text-[10px] tracking-[0.16em] text-[#8fe5c1]">INTERVIEW DEMO / RNA-SEQ AGENT</div><div className="mt-1 text-sm text-[#b4cdc6]">差异表达 → 通路富集 → 基因证据 → 可追溯报告</div></div><button onClick={() => void submitOmicsDemo()} disabled={loading} className="rounded-lg bg-[#8fe5c1] px-3 py-2 text-xs font-semibold text-[#092521] transition hover:bg-[#b8f4d8] disabled:cursor-not-allowed disabled:opacity-50">运行 RNA-seq Agent</button></div>
 
               {selectedJob && ['queued', 'running'].includes(selectedJob.status) && <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#5c4930] bg-[#211d16] px-5 py-4"><div className="flex items-center gap-3"><Ban size={16} className="text-[#e6c875]" /><div><div className="text-sm font-medium text-[#f1dfaa]">任务控制</div><div className="mt-1 text-xs text-[#aa9767]">排队中的任务会立即取消，运行中的任务采用协作式取消。</div></div></div><button onClick={() => void cancelSelectedJob()} disabled={selectedJob.cancel_requested} className="rounded-lg border border-[#80643c] px-3 py-2 text-xs font-medium text-[#f1d889] transition hover:bg-[#392d1c] disabled:cursor-not-allowed disabled:opacity-50">{selectedJob.cancel_requested ? '取消请求已发送' : '取消任务'}</button></div>}
+              {selectedJob && ['failed', 'cancelled'].includes(selectedJob.status) && <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#3f527c] bg-[#111d32] px-5 py-4"><div className="flex items-center gap-3"><RefreshCw size={16} className="text-[#aebfff]" /><div><div className="text-sm font-medium text-[#d7ddff]">任务恢复</div><div className="mt-1 text-xs text-[#99a6cf]">保留原任务记录，复制原始参数重新提交。</div></div></div><button aria-label="Retry selected task" onClick={() => void retryJob(selectedJob)} disabled={loading} className="rounded-lg bg-[#aebfff] px-3 py-2 text-xs font-semibold text-[#111a34] transition hover:bg-[#c4d0ff] disabled:cursor-not-allowed disabled:opacity-50">重试任务</button></div>}
 
               <section className="grid gap-5 xl:grid-cols-[1.08fr_0.92fr]">
                 <div className="panel p-5 sm:p-6">

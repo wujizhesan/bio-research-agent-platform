@@ -304,6 +304,27 @@ class FastApiAppTests(unittest.TestCase):
             finally:
                 self._close_app(app)
 
+    def test_retry_endpoint_creates_child_job_with_original_arguments(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_retry_') as raw:
+            app = self._app(raw)
+            try:
+                with TestClient(app) as client:
+                    response = client.post('/api/v1/jobs', json={'tool': 'research_catalog', 'arguments': {}})
+                    job_id = response.json()['job']['job_id']
+                    for _ in range(100):
+                        record = client.get(f'/api/v1/jobs/{job_id}').json()['job']
+                        if record['status'] in {'completed', 'failed'}:
+                            break
+                        time.sleep(0.05)
+                    retried = client.post(f'/api/v1/jobs/{job_id}/retry')
+                    self.assertEqual(retried.status_code, 202)
+                    self.assertEqual(retried.json()['status'], 'accepted')
+                    child = retried.json()['job']
+                    self.assertEqual(child['retry_of'], job_id)
+                    self.assertEqual(child['tool'], 'research_catalog')
+            finally:
+                self._close_app(app)
+
     def test_job_events_stream_reaches_terminal_state(self):
         with tempfile.TemporaryDirectory(prefix='fastapi_events_') as raw:
             app = self._app(raw)
