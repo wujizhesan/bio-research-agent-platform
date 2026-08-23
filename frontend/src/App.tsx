@@ -794,6 +794,26 @@ function JobResultSummary({ job, onDownload }: { job: Job; onDownload: (path: st
   const omicsReport = omicsResult.report && typeof omicsResult.report === 'object' && !Array.isArray(omicsResult.report) ? omicsResult.report as Record<string, unknown> : {}
   const caddStep = steps.find((step) => step.tool === 'cadd_run_screening')
   const caddResult = caddStep?.result && typeof caddStep.result === 'object' && !Array.isArray(caddStep.result) ? caddStep.result as Record<string, unknown> : {}
+  const genomicsStep = steps.find((step) => step.tool === 'omics_run_genomics_qc')
+  const genomicsResult = genomicsStep?.result && typeof genomicsStep.result === 'object' && !Array.isArray(genomicsStep.result) ? genomicsStep.result as Record<string, unknown> : {}
+  const genomicsMetrics = genomicsResult.metrics && typeof genomicsResult.metrics === 'object' && !Array.isArray(genomicsResult.metrics) ? genomicsResult.metrics as Record<string, unknown> : {}
+  const singleCellStep = steps.find((step) => step.tool === 'omics_run_single_cell_10x_qc')
+  const singleCellResult = singleCellStep?.result && typeof singleCellStep.result === 'object' && !Array.isArray(singleCellStep.result) ? singleCellStep.result as Record<string, unknown> : {}
+  const singleCellMetrics = singleCellResult.metrics && typeof singleCellResult.metrics === 'object' && !Array.isArray(singleCellResult.metrics) ? singleCellResult.metrics as Record<string, unknown> : {}
+  const singleCellOutputs = singleCellResult.outputs && typeof singleCellResult.outputs === 'object' && !Array.isArray(singleCellResult.outputs) ? singleCellResult.outputs as Record<string, unknown> : {}
+  const metagenomicsStep = steps.find((step) => step.tool === 'omics_run_metagenomics_qc')
+  const metagenomicsResult = metagenomicsStep?.result && typeof metagenomicsStep.result === 'object' && !Array.isArray(metagenomicsStep.result) ? metagenomicsStep.result as Record<string, unknown> : {}
+  const metagenomicsMetrics = metagenomicsResult.metrics && typeof metagenomicsResult.metrics === 'object' && !Array.isArray(metagenomicsResult.metrics) ? metagenomicsResult.metrics as Record<string, unknown> : {}
+  const metagenomicsOutputs = metagenomicsResult.outputs && typeof metagenomicsResult.outputs === 'object' && !Array.isArray(metagenomicsResult.outputs) ? metagenomicsResult.outputs as Record<string, unknown> : {}
+  const evidenceStep = steps.find((step) => step.tool === 'literature_search')
+  const evidenceEnvelope = evidenceStep?.result && typeof evidenceStep.result === 'object' && !Array.isArray(evidenceStep.result) ? evidenceStep.result as Record<string, unknown> : {}
+  const evidenceResult = evidenceEnvelope.result && typeof evidenceEnvelope.result === 'object' && !Array.isArray(evidenceEnvelope.result) ? evidenceEnvelope.result as Record<string, unknown> : {}
+  const knowledgeIngestStep = steps.find((step) => step.tool === 'knowledge_ingest_directory')
+  const knowledgeIngestEnvelope = knowledgeIngestStep?.result && typeof knowledgeIngestStep.result === 'object' && !Array.isArray(knowledgeIngestStep.result) ? knowledgeIngestStep.result as Record<string, unknown> : {}
+  const knowledgeIngestResult = knowledgeIngestEnvelope.result && typeof knowledgeIngestEnvelope.result === 'object' && !Array.isArray(knowledgeIngestEnvelope.result) ? knowledgeIngestEnvelope.result as Record<string, unknown> : {}
+  const knowledgeSearchStep = steps.find((step) => step.tool === 'knowledge_search')
+  const knowledgeSearchEnvelope = knowledgeSearchStep?.result && typeof knowledgeSearchStep.result === 'object' && !Array.isArray(knowledgeSearchStep.result) ? knowledgeSearchStep.result as Record<string, unknown> : {}
+  const knowledgeSearchResult = knowledgeSearchEnvelope.result && typeof knowledgeSearchEnvelope.result === 'object' && !Array.isArray(knowledgeSearchEnvelope.result) ? knowledgeSearchEnvelope.result as Record<string, unknown> : {}
   const sequenceStep = steps.find((step) => step.tool === 'sequence_pipeline')
   const sequenceEnvelope = sequenceStep?.result && typeof sequenceStep.result === 'object' && !Array.isArray(sequenceStep.result) ? sequenceStep.result as Record<string, unknown> : payload
   const sequenceResult = sequenceEnvelope.result && typeof sequenceEnvelope.result === 'object' && !Array.isArray(sequenceEnvelope.result) ? sequenceEnvelope.result as Record<string, unknown> : sequenceEnvelope
@@ -815,6 +835,18 @@ function JobResultSummary({ job, onDownload }: { job: Job; onDownload: (path: st
     best_affinity: payload.best_affinity ?? caddResult.best_affinity,
     cadd_exhaustiveness: payload.exhaustiveness ?? caddResult.exhaustiveness,
     cadd_max_ligands: payload.max_ligands ?? caddResult.max_ligands,
+    fastq_reads: genomicsMetrics.reads,
+    fastq_bases: genomicsMetrics.bases,
+    fastq_manifest: genomicsResult.manifest_path,
+    single_cell_passed: singleCellMetrics.n_cells_passed,
+    single_cell_metrics: singleCellOutputs.cell_metrics,
+    metagenomics_taxa: metagenomicsMetrics.n_taxa_retained,
+    metagenomics_samples: metagenomicsMetrics.n_samples,
+    metagenomics_relative_abundance: metagenomicsOutputs.relative_abundance,
+    metagenomics_sample_metrics: metagenomicsOutputs.sample_metrics,
+    evidence_matches: evidenceResult.n_matches,
+    knowledge_matches: knowledgeSearchResult.n_matches,
+    knowledge_index: knowledgeIngestResult.output_path,
     pipeline: payload.pipeline ?? sequenceResult.pipeline,
     mrna_len: payload.mrna_len ?? sequenceResult.mrna_len,
     verdict: payload.verdict ?? sequenceResult.verdict,
@@ -828,7 +860,7 @@ function JobResultSummary({ job, onDownload }: { job: Job; onDownload: (path: st
     cadd_report: caddResult.report,
   }
   const visible = Object.entries(summary).filter(([, value]) => value !== undefined && value !== null)
-  const artifactKeys = new Set(['output_csv', 'cadd_result_csv', 'manifest_path', 'report_path', 'cadd_report'])
+  const artifactKeys = new Set(['output_csv', 'cadd_result_csv', 'manifest_path', 'report_path', 'cadd_report', 'fastq_manifest', 'single_cell_metrics', 'metagenomics_relative_abundance', 'metagenomics_sample_metrics', 'knowledge_index'])
   const rawGeneIds = payload.gene_ids ?? annotationResult.gene_ids
   const geneIds = Array.isArray(rawGeneIds) ? rawGeneIds.filter((value): value is string => typeof value === 'string') : []
   return <section className="panel mt-5 overflow-hidden" aria-live="polite">
