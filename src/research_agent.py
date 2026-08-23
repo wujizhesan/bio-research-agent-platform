@@ -109,6 +109,11 @@ _RNASEQ_COUNTING_KEYWORDS = (
     'rna-seq quantification', 'rna-seq counting', '转录组计数', '基因计数',
 )
 
+_RNASEQ_ANALYSIS_KEYWORDS = (
+    'differential expression', 'pathway', 'gene set', 'gene-set',
+    'enrichment', 'omics report', '差异表达', '通路', '富集分析',
+)
+
 
 RESEARCH_PRESETS = {
     'bgi_research_demo': {
@@ -265,6 +270,14 @@ def _is_rnaseq_counting_task(task, inputs=None):
     return any(keyword in text for keyword in _RNASEQ_COUNTING_KEYWORDS)
 
 
+def _is_rnaseq_analysis_task(task, inputs=None):
+    inputs = inputs or {}
+    if inputs.get('metadata_csv') and inputs.get('gene_sets_csv'):
+        return True
+    text = str(task or '').lower()
+    return any(keyword in text for keyword in _RNASEQ_ANALYSIS_KEYWORDS)
+
+
 def _required_inputs(domains, task=None, inputs=None):
     required = []
     if 'omics' in domains:
@@ -284,6 +297,11 @@ def _required_inputs(domains, task=None, inputs=None):
                 {'name': 'alignment_paths', 'description': 'aligned BAM/CRAM files for RNA-seq read counting'},
                 {'name': 'annotation_gtf', 'description': 'GTF gene annotation for featureCounts'},
             ])
+            if _is_rnaseq_analysis_task(task, inputs):
+                required.extend([
+                    {'name': 'metadata_csv', 'description': 'sample condition metadata for differential expression'},
+                    {'name': 'gene_sets_csv', 'description': 'pathway or gene-set table for enrichment analysis'},
+                ])
         elif _is_variant_normalization_task(task, inputs):
             required.extend([
                 {'name': 'vcf_path', 'description': 'input VCF/BCF variant file'},
@@ -364,6 +382,7 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
     single_cell_task = _is_single_cell_task(task, inputs)
     single_cell_10x_task = _is_single_cell_10x_task(task, inputs)
     rnaseq_counting_task = _is_rnaseq_counting_task(task, inputs)
+    rnaseq_analysis_task = _is_rnaseq_analysis_task(task, inputs)
     variant_normalization_task = _is_variant_normalization_task(task, inputs)
     variant_calling_task = _is_variant_calling_task(task, inputs)
     qc_task = _is_genomics_qc_task(task, inputs)
@@ -461,6 +480,41 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
                 'args': counting_args,
             })
             rationale.append('featureCounts converts aligned RNA-seq BAM/CRAM files plus GTF exon annotations into a gene-by-sample count matrix with provenance')
+            if rnaseq_analysis_task:
+                metadata_csv = inputs.get('metadata_csv')
+                gene_sets_csv = inputs.get('gene_sets_csv')
+                if not metadata_csv:
+                    missing.append('metadata_csv')
+                if not gene_sets_csv:
+                    missing.append('gene_sets_csv')
+                if metadata_csv and gene_sets_csv:
+                    analysis_args = {
+                        'expression_csv': '${rnaseq_feature_counts.output_csv}',
+                        'metadata_csv': str(metadata_csv),
+                        'gene_sets_csv': str(gene_sets_csv),
+                        'output_dir': output_dir,
+                        'evidence_provider': evidence_provider,
+                    }
+                    for key in (
+                        'evidence_csv', 'condition_a', 'condition_b', 'evidence_timeout',
+                        'statistics_backend', 'genome',
+                    ):
+                        if inputs.get(key) is not None:
+                            analysis_args[key] = inputs[key]
+                    if inputs.get('evidence_cache_dir'):
+                        analysis_args['evidence_cache_dir'] = str(inputs['evidence_cache_dir'])
+                    elif evidence_provider != 'local':
+                        analysis_args['evidence_cache_dir'] = str(Path(output_dir) / 'evidence_cache')
+                    if evidence_provider == 'gencode':
+                        analysis_args['gencode_gtf'] = str(inputs.get('gencode_gtf') or annotation_gtf)
+                    steps.append({
+                        'id': 'omics_analysis',
+                        'tool': 'omics_run_analysis',
+                        'depends_on': ['rnaseq_feature_counts'],
+                        'args': analysis_args,
+                    })
+                    omics_ready = True
+                    rationale.append(f'count matrix is forwarded to {evidence_provider} differential expression, pathway enrichment and report generation')
     elif 'omics' in domains and variant_normalization_task:
         vcf_path = inputs.get('vcf_path') or inputs.get('vcf') or inputs.get('variants_vcf')
         reference_fasta = inputs.get('reference_fasta') or inputs.get('reference_path') or inputs.get('reference_genome')

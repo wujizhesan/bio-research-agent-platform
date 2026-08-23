@@ -183,6 +183,30 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(step['args']['strand'], 1)
         self.assertIn('featureCounts', result['rationale'][0])
 
+    def test_research_planner_chains_feature_counts_into_rnaseq_analysis(self):
+        result = run_tool('research_build_workflow', {
+            'task': 'Quantify aligned RNA-seq reads and run differential expression and pathway enrichment',
+            'domains': ['omics'],
+            'inputs': {
+                'alignment_paths': ['data/control.bam', 'data/treated.bam'],
+                'annotation_gtf': 'data/gencode.gtf',
+                'metadata_csv': 'examples/rnaseq/metadata.csv',
+                'gene_sets_csv': 'examples/rnaseq/gene_sets.csv',
+                'statistics_backend': 'scipy',
+            },
+        })
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['selected_tools'], [
+            'omics_run_feature_counts', 'omics_run_analysis',
+        ])
+        analysis_step = result['workflow']['steps'][1]
+        self.assertEqual(analysis_step['depends_on'], ['rnaseq_feature_counts'])
+        self.assertEqual(
+            analysis_step['args']['expression_csv'],
+            '${rnaseq_feature_counts.output_csv}',
+        )
+        self.assertEqual(analysis_step['args']['statistics_backend'], 'scipy')
+
     def test_research_planner_chains_variant_normalization_and_annotation(self):
         result = run_tool('research_build_workflow', {
             'task': 'Normalize variants and annotate them before interpretation',
