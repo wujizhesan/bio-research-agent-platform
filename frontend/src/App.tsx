@@ -107,6 +107,7 @@ type UploadedFile = {
 
 type View = 'workspace' | 'domains'
 type RunMode = 'research' | 'variant' | 'sequence' | 'cadd'
+type PlannerMode = 'auto' | 'deterministic' | 'llm'
 
 const runtimeApiBase = new URLSearchParams(window.location.search).get('api') || ''
 const defaultApiBase = runtimeApiBase || import.meta.env.VITE_API_BASE_URL || (
@@ -284,6 +285,7 @@ function formatJobId(value: string) {
 function App() {
   const [view, setView] = useState<View>('workspace')
   const [mode, setMode] = useState<RunMode>('research')
+  const [plannerMode, setPlannerMode] = useState<PlannerMode>('auto')
   const [apiBase] = useState(defaultApiBase)
   const [token, setToken] = useState(() => localStorage.getItem('bio-agent-token') || import.meta.env.VITE_API_TOKEN || 'change-me-in-development')
   const [plugins, setPlugins] = useState<Plugin[]>([])
@@ -458,7 +460,7 @@ function App() {
       setResearchPlan(null)
       await submitToolJob(
         'research_plan',
-        { task, inputs: buildResearchInputs(), planner_mode: 'auto' },
+        { task, inputs: buildResearchInputs(), planner_mode: plannerMode },
         '研究计划已进入执行队列',
         (job) => setResearchPlan(extractResearchPlan(job)),
       )
@@ -742,6 +744,7 @@ function App() {
                   <div className="mt-7 grid grid-cols-2 gap-1 rounded-xl bg-[#071719] p-1 sm:grid-cols-4"><button onClick={() => setMode('research')} className={`mode-tab ${mode === 'research' ? 'mode-tab-active' : ''}`}><Workflow size={14} />研究规划</button><button onClick={() => setMode('variant')} className={`mode-tab ${mode === 'variant' ? 'mode-tab-active' : ''}`}><GitBranch size={14} />VCF 变异</button><button onClick={() => setMode('sequence')} className={`mode-tab ${mode === 'sequence' ? 'mode-tab-active' : ''}`}><Dna size={14} />mRNA 设计</button><button onClick={() => setMode('cadd')} className={`mode-tab ${mode === 'cadd' ? 'mode-tab-active' : ''}`}><Beaker size={14} />CADD 对接</button></div>
                   {mode === 'research' ? <>
                     <label className="mt-6 block"><span className="field-label">科学问题</span><textarea value={task} onChange={(event) => { setTask(event.target.value); setResearchPlan(null) }} rows={4} className="input-area" placeholder="描述你希望 Agent 协助完成的研究任务" /></label>
+                    <div className="mt-5 grid gap-4 sm:grid-cols-[0.8fr_1.2fr]"><div><label className="field-label" htmlFor="planner-mode">Planner 模式</label><select id="planner-mode" value={plannerMode} onChange={(event) => { setPlannerMode(event.target.value as PlannerMode); setResearchPlan(null) }} className="input-control"><option value="auto">Auto：有 Key 用 LLM</option><option value="deterministic">Deterministic：规则规划</option><option value="llm">LLM：必须调用模型</option></select></div><div className="flex items-end pb-1 text-xs leading-5 text-[#688983]">Auto 会在配置模型密钥时调用 LLM；模型不可用时保留 fallback 原因并回退到确定性规划。</div></div>
                     <div className="mt-5 grid gap-4 sm:grid-cols-[1fr_0.8fr]">
                       <div><label className="field-label" htmlFor="protein-context">蛋白输入上下文</label><input id="protein-context" value={protein} onChange={(event) => { setProtein(event.target.value.toUpperCase()); setResearchPlan(null) }} className="input-control font-mono tracking-[0.18em]" placeholder="例如 MKT" /></div>
                       <div><label className="field-label" htmlFor="evidence-provider">证据源</label><select id="evidence-provider" value={evidenceProvider} onChange={(event) => { setEvidenceProvider(event.target.value); setResearchPlan(null) }} className="input-control"><option value="local">本地证据</option><option value="kegg">KEGG</option><option value="ncbi_gene">NCBI Gene</option><option value="pubmed">PubMed</option><option value="uniprot">UniProt</option></select></div>
@@ -829,6 +832,7 @@ function ResearchPlanCard({ plan, loading, onExecute }: { plan: ResearchPlan | n
         {plan.selected_domains.map((domain) => <span key={domain} className="status-badge status-ok"><span className="size-1.5 rounded-full bg-current" />{domainLabels[domain] || domain}</span>)}
         <span className="status-badge status-running">证据：{providerLabels[execution?.evidence_provider || plan.evidence_provider] || execution?.evidence_provider}</span>
         {plan.planner && <span className="status-badge">规划器：{plan.planner.backend === 'llm' ? 'LLM' : plan.planner.backend === 'deterministic' ? 'Deterministic' : plan.planner.backend}</span>}
+        {plan.planner?.model && <span className="status-badge">Model: {plan.planner.model}</span>}
       </div>
       <div className="grid gap-4 lg:grid-cols-[0.7fr_1.3fr]">
         <div className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-4">
@@ -836,6 +840,7 @@ function ResearchPlanCard({ plan, loading, onExecute }: { plan: ResearchPlan | n
           {execution?.ready ? <div className="flex items-center gap-2 text-sm text-[#9be6c5]"><Check size={15} />输入已满足，可执行</div> : <div className="text-sm text-[#efb19f]">缺少必要输入</div>}
           {!execution?.ready && <div className="mt-3 flex flex-wrap gap-1.5">{(execution?.missing_inputs || []).map((item) => <span key={item} className="rounded-md border border-[#70483f] bg-[#2b1b1b] px-2 py-1 font-mono text-[10px] text-[#e9a694]">{item}</span>)}</div>}
           {execution?.rationale?.length ? <div className="mt-4 space-y-2 text-xs leading-5 text-[#789791]">{execution.rationale.map((item) => <div key={item} className="flex gap-2"><span className="mt-2 size-1 rounded-full bg-[#78cdaa]" />{item}</div>)}</div> : null}
+          {plan.planner?.fallback_reason && <div className="mt-4 rounded-lg border border-[#705b35] bg-[#251f15] px-3 py-2 text-xs leading-5 text-[#d8c18a]">Planner fallback：{plan.planner.fallback_reason}</div>}
         </div>
         <div className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-4">
           <div className="field-label">SELECTED TOOLCHAIN</div>
