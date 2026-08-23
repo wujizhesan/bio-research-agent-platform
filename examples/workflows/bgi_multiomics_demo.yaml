@@ -82,10 +82,20 @@ steps:
       molecule: linear
       method: greedy
 
+  - id: sequence_benchmark
+    tool: sequence_benchmark
+    depends_on:
+      - sequence_design
+    args:
+      protein: MKT
+      molecule: linear
+      use_vaxpress: false
+
   - id: sequence_report
     tool: sequence_report
     depends_on:
       - sequence_design
+      - sequence_benchmark
     args:
       result: ${sequence_design.result}
       output_path: output/bgi_multiomics_demo/mrna_sequence_report.html

@@ -951,30 +951,43 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
         if not inputs.get('protein'):
             missing.append('protein')
         else:
-            steps.extend([
-                {
-                    'id': 'sequence_design',
-                    'tool': 'sequence_pipeline',
+            steps.append({
+                'id': 'sequence_design',
+                'tool': 'sequence_pipeline',
+                'args': {
+                    'protein': str(inputs['protein']),
+                    'molecule': inputs.get('molecule', 'linear'),
+                    'method': inputs.get('method', 'greedy'),
+                },
+            })
+            report_dependencies = ['sequence_design']
+            if inputs.get('include_benchmark', False):
+                steps.append({
+                    'id': 'sequence_benchmark',
+                    'tool': 'sequence_benchmark',
+                    'depends_on': ['sequence_design'],
                     'args': {
                         'protein': str(inputs['protein']),
                         'molecule': inputs.get('molecule', 'linear'),
-                        'method': inputs.get('method', 'greedy'),
+                        'use_vaxpress': bool(inputs.get('use_vaxpress', False)),
                     },
+                })
+                report_dependencies.append('sequence_benchmark')
+            steps.append({
+                'id': 'sequence_report',
+                'tool': 'sequence_report',
+                'depends_on': report_dependencies,
+                'args': {
+                    'result': '${sequence_design.result}',
+                    'output_path': str(inputs.get(
+                        'sequence_report_path',
+                        Path(output_dir) / 'sequence_report.html',
+                    )),
                 },
-                {
-                    'id': 'sequence_report',
-                    'tool': 'sequence_report',
-                    'depends_on': ['sequence_design'],
-                    'args': {
-                        'result': '${sequence_design.result}',
-                        'output_path': str(inputs.get(
-                            'sequence_report_path',
-                            Path(output_dir) / 'sequence_report.html',
-                        )),
-                    },
-                },
-            ])
+            })
             rationale.append('sequence pipeline includes optimization, scoring and translation verification')
+            if inputs.get('include_benchmark', False):
+                rationale.append('benchmark compares naive and greedy codon strategies and records optional VaxPress fallback')
 
     if 'cadd' in domains:
         ligand_library = inputs.get('ligand_library') or inputs.get('external_dataset')
