@@ -6,6 +6,7 @@ steps:
       expression_csv: examples/rnaseq/expression.csv
       metadata_csv: examples/rnaseq/metadata.csv
       output_csv: output/workflow_demo/differential_expression.csv
+      statistics_backend: auto
   - id: pathway_enrichment
     tool: omics_run_pathway_enrichment
     depends_on:

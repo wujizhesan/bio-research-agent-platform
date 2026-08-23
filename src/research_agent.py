@@ -164,7 +164,7 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
             args = {key: str(inputs[key]) for key in omics_required}
             args['output_dir'] = output_dir
             args['evidence_provider'] = evidence_provider
-            for key in ('evidence_csv', 'condition_a', 'condition_b', 'evidence_timeout'):
+            for key in ('evidence_csv', 'condition_a', 'condition_b', 'evidence_timeout', 'statistics_backend'):
                 if inputs.get(key) is not None:
                     args[key] = inputs[key]
             if inputs.get('evidence_cache_dir'):

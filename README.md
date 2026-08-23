@@ -171,7 +171,7 @@ python -m venv .venv
 .venv/Scripts/python -m src.omics_agent --expression examples/rnaseq/expression.csv --metadata examples/rnaseq/metadata.csv --gene-sets examples/rnaseq/gene_sets.csv --evidence-provider ncbi_gene --cache-dir output/ncbi_gene_cache --out-dir output/rnaseq_ncbi_gene
 .venv/Scripts/python -m src.omics_agent --expression examples/rnaseq/expression.csv --metadata examples/rnaseq/metadata.csv --gene-sets examples/rnaseq/gene_sets.csv --evidence-provider kegg --cache-dir output/kegg_cache --out-dir output/rnaseq_kegg
 
-# MVP uses a replaceable SciPy statistics backend; production RNA-seq can swap in DESeq2 or edgeR without changing the Agent tool contract.
+# RNA-seq differential expression supports `auto`, `scipy` and optional `deseq2` backends. `auto` uses DESeq2 when Rscript and the DESeq2 package are available, otherwise records an explicit SciPy fallback without changing the Agent tool contract.
 # 验收(自检 5 项断言)
 .venv/Scripts/python src/qa_verify.py
 ```
@@ -295,4 +295,4 @@ export MRNA_FORGE_ROOT=/path/to/EnornaAgent
 
 ## 科学边界
 
-RNA-seq 当前使用可替换的 SciPy 统计后端，适合作为可复现演示和平台契约验证；生产分析可以替换为 DESeq2 或 edgeR。mRNA 的 CAI、GC、GC3、UpA、UpU 和表达评分来自确定性规则或可选后端，不应被表述为经过大规模实验数据训练的预测模型。CADD 和序列结果都需要结合实验或领域专业判断验证。
+RNA-seq 差异表达支持 `auto`、`scipy` 和可选的 `deseq2` 后端；`auto` 会在检测到 Rscript 与 DESeq2 时使用 DESeq2，否则在结果清单中明确记录 SciPy fallback。mRNA 的 CAI、GC、GC3、UpA、UpU 和表达评分来自确定性规则或可选后端，不应被表述为经过大规模实验数据训练的预测模型。CADD 和序列结果都需要结合实验或领域专业判断验证。

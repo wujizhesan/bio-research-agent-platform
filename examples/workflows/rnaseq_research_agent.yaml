@@ -9,3 +9,4 @@ steps:
       output_dir: output/rnaseq_research_agent
       evidence_csv: examples/rnaseq/evidence.csv
       evidence_provider: local
+      statistics_backend: auto

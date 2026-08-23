@@ -6,6 +6,7 @@ steps:
       expression_csv: examples/rnaseq/expression.csv
       metadata_csv: examples/rnaseq/metadata.csv
       output_csv: output/bgi_research_demo/differential_expression.csv
+      statistics_backend: auto
 
   - id: literature_search
     tool: literature_search

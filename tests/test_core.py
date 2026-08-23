@@ -19,7 +19,7 @@ from src.audit_external_overlap import audit_overlap, remove_structure_overlap
 from src.build_hard_decoy_benchmark import build_hard_decoy_benchmark, build_random_control_benchmark
 from src.compare_benchmarks import compare_benchmarks, compare_benchmark_replicates
 from src.run_benchmark_replicates import _normalize_id, _validate_control, _validate_hard_benchmark
-from src.omics_agent import TOOLS as OMICS_TOOLS, run_omics_analysis, run_tool as run_omics_tool, search_gene_evidence
+from src.omics_agent import TOOLS as OMICS_TOOLS, _resolve_statistics_backend, run_omics_analysis, run_tool as run_omics_tool, search_gene_evidence, statistics_backend_status
 from src.domain_registry import run_tool as run_domain_tool, tool_specs, validate_tool_map
 from src.workflow_runner import run_workflow
 from src.resplit_external import joint_split_indices
@@ -372,6 +372,8 @@ class CoreTests(unittest.TestCase):
             de = pd.read_csv(out_dir / 'differential_expression.csv')
             self.assertEqual(result['status'], 'completed')
             self.assertGreater(result['differential_expression']['n_significant'], 0)
+            self.assertIn(result['differential_expression']['backend'], {'scipy', 'deseq2'})
+            self.assertEqual(result['differential_expression']['backend_requested'], 'auto')
             self.assertIn('GeneA', set(de.loc[de['significant'], 'gene_id']))
             self.assertGreater(result['pathway_enrichment']['n_pathways'], 0)
             self.assertEqual(result['report']['n_evidence_matches'], 1)
@@ -386,8 +388,24 @@ class CoreTests(unittest.TestCase):
             })
             self.assertEqual(agent_result['status'], 'completed')
             self.assertEqual(agent_result['report']['n_evidence_matches'], 1)
+            self.assertEqual(agent_result['differential_expression']['backend_requested'], 'auto')
+            self.assertIn(agent_result['differential_expression']['backend'], {'scipy', 'deseq2'})
             tool_result = run_omics_tool('unknown', {})
             self.assertEqual(tool_result['status'], 'error')
+
+    def test_omics_statistics_backend_catalog_is_explicit(self):
+        status = statistics_backend_status()
+        self.assertTrue(status['scipy']['available'])
+        self.assertIn('available', status['deseq2'])
+
+    def test_explicit_deseq2_does_not_silently_fallback(self):
+        unavailable = {'available': False, 'backend': 'deseq2', 'reason': 'test unavailable'}
+        with patch('src.omics_agent._deseq2_runtime', return_value=unavailable):
+            resolved = _resolve_statistics_backend('auto')
+            self.assertEqual(resolved['backend'], 'scipy')
+            self.assertEqual(resolved['fallback_reason'], 'test unavailable')
+            with self.assertRaisesRegex(RuntimeError, 'test unavailable'):
+                _resolve_statistics_backend('deseq2')
 
     def test_agent_uses_project_llm_config(self):
         base_url, model, _ = load_llm_config()

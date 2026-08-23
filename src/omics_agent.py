@@ -1,6 +1,9 @@
 """RNA-seq domain adapter with structured tools and reproducible outputs."""
 import argparse
 import json
+import os
+import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,6 +15,8 @@ PLUGIN_NAME = 'RNA-seq and omics domain'
 PLUGIN_VERSION = '0.1.0'
 PLUGIN_API_VERSION = 1
 PLUGIN_CAPABILITIES = ('omics.end_to_end', 'omics.differential_expression', 'omics.pathway', 'omics.evidence', 'omics.report')
+STATISTICS_BACKENDS = ('auto', 'scipy', 'deseq2')
+DESEQ2_RUNNER = Path(__file__).resolve().parents[1] / 'tools' / 'deseq2_runner.R'
 
 
 
@@ -65,9 +70,81 @@ def load_expression_matrix(expression_csv, metadata_csv):
     return expression, metadata
 
 
-def run_differential_expression(expression_csv, metadata_csv, output_csv,
-                                condition_a=None, condition_b=None):
-    expression, metadata = load_expression_matrix(expression_csv, metadata_csv)
+def _deseq2_runtime():
+    executable = os.environ.get('DESEQ2_RSCRIPT', 'Rscript')
+    rscript = shutil.which(executable)
+    if not rscript:
+        return {'available': False, 'backend': 'deseq2', 'reason': 'Rscript not found'}
+    try:
+        probe = subprocess.run(
+            [rscript, '-e', "quit(status=ifelse(requireNamespace('DESeq2', quietly=TRUE), 0, 1))"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {'available': False, 'backend': 'deseq2', 'reason': str(exc)}
+    if probe.returncode != 0:
+        return {'available': False, 'backend': 'deseq2', 'reason': 'DESeq2 R package not installed'}
+    return {'available': True, 'backend': 'deseq2', 'executable': rscript}
+
+
+def statistics_backend_status():
+    status = _deseq2_runtime()
+    return {
+        'scipy': {'available': True, 'backend': 'scipy', 'mode': 'reproducible_fallback'},
+        'deseq2': status,
+    }
+
+
+def _resolve_statistics_backend(requested):
+    requested = str(requested or 'auto').lower()
+    if requested not in STATISTICS_BACKENDS:
+        raise ValueError(f'unknown statistics backend: {requested}')
+    if requested == 'scipy':
+        return {'requested': requested, 'backend': 'scipy', 'fallback_reason': None}
+    status = _deseq2_runtime()
+    if requested == 'deseq2' and not status['available']:
+        raise RuntimeError(status['reason'])
+    if status['available']:
+        return {'requested': requested, 'backend': 'deseq2', 'fallback_reason': None}
+    return {'requested': requested, 'backend': 'scipy', 'fallback_reason': status['reason']}
+
+
+def _run_deseq2_backend(expression_csv, metadata_csv, output_csv, condition_a, condition_b):
+    status = _deseq2_runtime()
+    if not status['available']:
+        raise RuntimeError(status['reason'])
+    if not DESEQ2_RUNNER.is_file():
+        raise RuntimeError(f'DESeq2 runner not found: {DESEQ2_RUNNER}')
+    output_csv = Path(output_csv)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    timeout = int(os.environ.get('DESEQ2_TIMEOUT_SECONDS', '300'))
+    result = subprocess.run(
+        [
+            status['executable'],
+            str(DESEQ2_RUNNER),
+            str(expression_csv),
+            str(metadata_csv),
+            str(output_csv),
+            str(condition_a),
+            str(condition_b),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or 'DESeq2 process failed').strip()
+        raise RuntimeError(detail)
+    if not output_csv.is_file():
+        raise RuntimeError('DESeq2 completed without producing an output CSV')
+    return pd.read_csv(output_csv)
+
+
+def _condition_pair(metadata, condition_a=None, condition_b=None):
     conditions = sorted(metadata['condition'].astype(str).unique())
     condition_a = str(condition_a or conditions[0])
     condition_b = str(condition_b or conditions[1])
@@ -75,6 +152,38 @@ def run_differential_expression(expression_csv, metadata_csv, output_csv,
         raise ValueError(f'conditions must be the two observed values: {conditions}')
     samples_a = metadata.loc[metadata['condition'].astype(str) == condition_a, 'sample_id'].tolist()
     samples_b = metadata.loc[metadata['condition'].astype(str) == condition_b, 'sample_id'].tolist()
+    return condition_a, condition_b, samples_a, samples_b
+
+
+def run_differential_expression(expression_csv, metadata_csv, output_csv,
+                                condition_a=None, condition_b=None,
+                                statistics_backend='scipy'):
+    expression, metadata = load_expression_matrix(expression_csv, metadata_csv)
+    condition_a, condition_b, samples_a, samples_b = _condition_pair(metadata, condition_a, condition_b)
+    backend = _resolve_statistics_backend(statistics_backend)
+    if backend['backend'] == 'deseq2':
+        result = _run_deseq2_backend(
+            expression_csv, metadata_csv, output_csv, condition_a, condition_b
+        )
+        _require_columns(result, {'gene_id', 'log2_fc', 'p_value', 'padj'}, 'DESeq2 result')
+        result['significant'] = (result['padj'] <= 0.05) & (result['log2_fc'].abs() >= 1.0)
+        result = result.sort_values(['padj', 'p_value', 'gene_id']).reset_index(drop=True)
+        output_csv = Path(output_csv)
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        result.to_csv(output_csv, index=False)
+        return {
+            'status': 'completed',
+            'output_csv': str(output_csv),
+            'condition_a': condition_a,
+            'condition_b': condition_b,
+            'n_genes': int(len(result)),
+            'n_significant': int(result['significant'].sum()),
+            'samples_a': samples_a,
+            'samples_b': samples_b,
+            'backend_requested': backend['requested'],
+            'backend': backend['backend'],
+            'fallback_reason': backend['fallback_reason'],
+        }
     values_a = expression[samples_a].to_numpy(dtype=float)
     values_b = expression[samples_b].to_numpy(dtype=float)
     means_a = values_a.mean(axis=1)
@@ -102,6 +211,9 @@ def run_differential_expression(expression_csv, metadata_csv, output_csv,
         'n_significant': int(result['significant'].sum()),
         'samples_a': samples_a,
         'samples_b': samples_b,
+        'backend_requested': backend['requested'],
+        'backend': backend['backend'],
+        'fallback_reason': backend['fallback_reason'],
     }
 
 
@@ -241,14 +353,15 @@ def generate_omics_report(de_csv, pathway_csv, output_md, evidence=None):
 def run_omics_analysis(expression_csv, metadata_csv, gene_sets_csv, output_dir,
                        evidence_csv=None, condition_a=None, condition_b=None,
                        evidence_provider='local', evidence_cache_dir=None,
-                       evidence_timeout=15):
+                       evidence_timeout=15, statistics_backend='auto'):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     de_csv = output_dir / 'differential_expression.csv'
     pathway_csv = output_dir / 'pathway_enrichment.csv'
     report_md = output_dir / 'omics_report.md'
     de_meta = run_differential_expression(
-        expression_csv, metadata_csv, de_csv, condition_a, condition_b
+        expression_csv, metadata_csv, de_csv, condition_a, condition_b,
+        statistics_backend=statistics_backend,
     )
     pathway_meta = run_pathway_enrichment(de_csv, gene_sets_csv, pathway_csv)
     evidence = None
@@ -275,6 +388,7 @@ def run_omics_analysis(expression_csv, metadata_csv, gene_sets_csv, output_dir,
             'evidence_csv': str(evidence_csv) if evidence_csv else None,
             'evidence_provider': evidence_provider,
             'evidence_cache_dir': str(evidence_cache_dir) if evidence_cache_dir else None,
+            'statistics_backend': statistics_backend,
         },
         'differential_expression': de_meta,
         'pathway_enrichment': pathway_meta,
@@ -310,6 +424,7 @@ TOOLS = {
             'evidence_provider': {'type': 'string', 'enum': ['local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg']},
             'evidence_cache_dir': {'type': 'string'},
             'evidence_timeout': {'type': 'number'},
+            'statistics_backend': {'type': 'string', 'enum': list(STATISTICS_BACKENDS)},
         }, required=('expression_csv', 'metadata_csv', 'gene_sets_csv', 'output_dir')),
         'function': run_omics_analysis,
     },
@@ -321,6 +436,7 @@ TOOLS = {
             'output_csv': {'type': 'string'},
             'condition_a': {'type': 'string'},
             'condition_b': {'type': 'string'},
+            'statistics_backend': {'type': 'string', 'enum': list(STATISTICS_BACKENDS)},
         }, required=('expression_csv', 'metadata_csv', 'output_csv')),
         'function': run_differential_expression,
     },
@@ -376,6 +492,7 @@ def main(argv=None):
     parser.add_argument('--out-dir', required=True)
     parser.add_argument('--evidence')
     parser.add_argument('--evidence-provider', choices=('local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg'), default='local')
+    parser.add_argument('--statistics-backend', choices=STATISTICS_BACKENDS, default='auto')
     parser.add_argument('--cache-dir')
     parser.add_argument('--condition-a')
     parser.add_argument('--condition-b')
@@ -390,6 +507,7 @@ def main(argv=None):
         args.condition_b,
         evidence_provider=args.evidence_provider,
         evidence_cache_dir=args.cache_dir,
+        statistics_backend=args.statistics_backend,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
