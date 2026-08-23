@@ -38,6 +38,46 @@ class RedisReadJobManager:
         return None
 
 
+class RedisEventPubSub:
+    def __init__(self):
+        self.closed = False
+
+    def get_message(self, ignore_subscribe_messages=True, timeout=0):
+        return {
+            'type': 'message',
+            'data': json.dumps({
+                'job_id': 'redis-job',
+                'tool': 'research_catalog',
+                'status': 'completed',
+                'created_at': '2026-08-23T00:00:00+00:00',
+                'result': {'status': 'ok'},
+                'attempts': 1,
+            }),
+        }
+
+    def close(self):
+        self.closed = True
+
+
+class RedisEventJobManager(RedisReadJobManager):
+    def __init__(self):
+        super().__init__()
+        self.pubsub = RedisEventPubSub()
+
+    def get(self, job_id):
+        self.read_count += 1
+        return {
+            'job_id': job_id,
+            'tool': 'research_catalog',
+            'status': 'running',
+            'created_at': '2026-08-23T00:00:00+00:00',
+            'attempts': 1,
+        }
+
+    def subscribe_job_events(self, job_id):
+        return self.pubsub
+
+
 class FastApiAppTests(unittest.TestCase):
     def _app(self, root, file_storage=None, audit_log=None):
         app = create_app(
@@ -81,6 +121,25 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(response.status_code, 200)
                     self.assertEqual(response.json()['job']['status'], 'completed')
                     self.assertEqual(manager.read_count, 1)
+            finally:
+                self._close_app(app)
+
+    def test_redis_sse_uses_pubsub_and_closes_subscription(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_redis_sse_') as raw:
+            manager = RedisEventJobManager()
+            app = create_app(
+                job_manager=manager,
+                plugin_manager=PluginManager(state_path=Path(raw) / 'plugins.json'),
+                database=Database(f"sqlite+aiosqlite:///{(Path(raw) / 'api.sqlite3').as_posix()}"),
+                audit_log=AuditLogger(Path(raw) / 'audit.jsonl'),
+            )
+            try:
+                with TestClient(app) as client:
+                    with client.stream('GET', '/api/v1/jobs/redis-job/events') as events:
+                        body = ''.join(events.iter_text())
+                    self.assertEqual(events.status_code, 200)
+                    self.assertIn('"status": "completed"', body)
+                    self.assertTrue(manager.pubsub.closed)
             finally:
                 self._close_app(app)
 

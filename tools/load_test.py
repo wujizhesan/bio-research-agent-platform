@@ -95,6 +95,42 @@ async def poll_job(client, semaphore, base_url, submitted, poll_interval, deadli
     return {'status': 'timeout', 'latency': perf_counter() - started}
 
 
+async def stream_job(client, semaphore, base_url, submitted, poll_interval, poll_timeout):
+    started = submitted['submitted_at']
+    try:
+        async with semaphore:
+            async with client.stream(
+                'GET',
+                f'{base_url}/api/v1/jobs/{submitted["job_id"]}/events',
+                params={'interval_seconds': poll_interval, 'timeout_seconds': poll_timeout},
+            ) as response:
+                if response.status_code != 200:
+                    return {'status': 'http_error', 'latency': perf_counter() - started, 'status_code': response.status_code}
+                event_name = None
+                data_lines = []
+                async for line in response.aiter_lines():
+                    if line.startswith('event: '):
+                        event_name = line[7:]
+                    elif line.startswith('data: '):
+                        data_lines.append(line[6:])
+                    elif not line and data_lines:
+                        payload = json.loads('\n'.join(data_lines))
+                        record = payload.get('job', {})
+                        if event_name == 'job' and record.get('status') in TERMINAL_STATUSES:
+                            return {
+                                'status': record['status'],
+                                'latency': perf_counter() - started,
+                                'record': record,
+                            }
+                        if event_name == 'timeout':
+                            return {'status': 'timeout', 'latency': perf_counter() - started, 'record': record}
+                        event_name = None
+                        data_lines = []
+    except Exception as exc:
+        return {'status': 'request_error', 'latency': perf_counter() - started, 'error': str(exc)}
+    return {'status': 'timeout', 'latency': perf_counter() - started}
+
+
 async def run_load_test(args):
     base_url = args.base_url.rstrip('/')
     run_started = perf_counter()
@@ -118,10 +154,16 @@ async def run_load_test(args):
         deadline = perf_counter() + args.poll_timeout
         polls = []
         if accepted:
-            polls = await asyncio.gather(*(
-                poll_job(client, semaphore, base_url, item, args.poll_interval, deadline)
-                for item in accepted
-            ))
+            if args.transport == 'sse':
+                polls = await asyncio.gather(*(
+                    stream_job(client, semaphore, base_url, item, args.poll_interval, args.poll_timeout)
+                    for item in accepted
+                ))
+            else:
+                polls = await asyncio.gather(*(
+                    poll_job(client, semaphore, base_url, item, args.poll_interval, deadline)
+                    for item in accepted
+                ))
 
     terminal_counts = {}
     for result in polls:
@@ -133,6 +175,7 @@ async def run_load_test(args):
         'tool': args.tool,
         'requested': args.requests,
         'concurrency': args.concurrency,
+        'transport': args.transport,
         'accepted': len(accepted),
         'submit_errors': len(submissions) - len(accepted),
         'terminal_counts': terminal_counts,
@@ -156,6 +199,7 @@ def main(argv=None):
     parser.add_argument('--poll-interval', type=float, default=0.2)
     parser.add_argument('--poll-timeout', type=float, default=60)
     parser.add_argument('--request-timeout', type=float, default=10)
+    parser.add_argument('--transport', choices=('poll', 'sse'), default='poll')
     parser.add_argument('--token')
     parser.add_argument('--output')
     args = parser.parse_args(argv)

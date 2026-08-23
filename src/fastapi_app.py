@@ -340,28 +340,54 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
     ):
         if await read_job(job_id) is None:
             raise HTTPException(status_code=404, detail=f'job not found: {job_id}')
+        subscriber = None
+        if app.state.job_backend == 'redis':
+            subscribe = getattr(jobs, 'subscribe_job_events', None)
+            if subscribe is not None:
+                subscriber = subscribe(job_id)
 
         async def stream():
             last_signature = None
             deadline = monotonic() + timeout_seconds
-            while True:
-                record = await read_job(job_id)
-                if record is None:
-                    payload = {'status': 'error', 'error': f'job not found: {job_id}'}
-                    yield f'event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n'
-                    return
-                signature = json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
-                if signature != last_signature:
-                    payload = {'status': 'ok', 'job': record}
-                    yield f'event: job\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n'
-                    last_signature = signature
-                if record.get('status') in {'completed', 'failed', 'cancelled'}:
-                    return
-                if monotonic() >= deadline:
-                    payload = {'status': 'timeout', 'job': record}
-                    yield f'event: timeout\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n'
-                    return
-                await asyncio.sleep(interval_seconds)
+            try:
+                while True:
+                    record = None
+                    if subscriber is not None:
+                        message = await asyncio.to_thread(
+                            subscriber.get_message,
+                            ignore_subscribe_messages=True,
+                            timeout=1,
+                        )
+                        if message and message.get('type') == 'message':
+                            raw = message.get('data')
+                            if isinstance(raw, bytes):
+                                raw = raw.decode('utf-8')
+                            record = json.loads(raw)
+                    if record is None:
+                        record = await read_job(job_id)
+                    if record is None:
+                        payload = {'status': 'error', 'error': f'job not found: {job_id}'}
+                        yield f'event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n'
+                        return
+                    signature = json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
+                    emitted = signature != last_signature
+                    if emitted:
+                        payload = {'status': 'ok', 'job': record}
+                        yield f'event: job\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n'
+                        last_signature = signature
+                    if record.get('status') in {'completed', 'failed', 'cancelled'}:
+                        return
+                    if monotonic() >= deadline:
+                        payload = {'status': 'timeout', 'job': record}
+                        yield f'event: timeout\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n'
+                        return
+                    if not emitted:
+                        yield ': keep-alive\n\n'
+                    if subscriber is None:
+                        await asyncio.sleep(interval_seconds)
+            finally:
+                if subscriber is not None:
+                    await asyncio.to_thread(subscriber.close)
 
         return StreamingResponse(
             stream(),

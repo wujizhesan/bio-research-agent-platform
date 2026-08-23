@@ -95,6 +95,9 @@ class RedisJobManager:
     def _execution_result_key(self, value):
         return f'{self.namespace}:jobs:execution:{value}'
 
+    def _event_key(self, job_id):
+        return f'{self.namespace}:job:{job_id}:events'
+
     @staticmethod
     def _public_record(record):
         output = dict(record)
@@ -122,6 +125,9 @@ class RedisJobManager:
         self.redis.zadd(self._index_key, {record['job_id']: score})
         if self.state_store is not None:
             self.state_store.save(record)
+        publish = getattr(self.redis, 'publish', None)
+        if publish:
+            publish(self._event_key(record['job_id']), json.dumps(self._public_record(record), ensure_ascii=False, default=str))
 
     def _load(self, job_id):
         payload = self.redis.get(self._key(job_id))
@@ -191,6 +197,14 @@ class RedisJobManager:
     def get(self, job_id):
         record = self._load(str(job_id))
         return self._public_record(record) if record else None
+
+    def subscribe_job_events(self, job_id):
+        pubsub_factory = getattr(self.redis, 'pubsub', None)
+        if pubsub_factory is None:
+            return None
+        pubsub = pubsub_factory()
+        pubsub.subscribe(self._event_key(str(job_id)))
+        return pubsub
 
     def list(self, limit=20):
         try:
