@@ -11,7 +11,7 @@ FROM python:3.12-slim AS runtime
 ARG INSTALL_DESEQ2=0
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends samtools bcftools \
+    && apt-get install -y --no-install-recommends samtools bcftools subread \
     && if [ "$INSTALL_DESEQ2" = "1" ]; then \
          apt-get install -y --no-install-recommends r-base r-bioc-deseq2; \
        fi \

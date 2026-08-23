@@ -19,7 +19,7 @@ from src.audit_external_overlap import audit_overlap, remove_structure_overlap
 from src.build_hard_decoy_benchmark import build_hard_decoy_benchmark, build_random_control_benchmark
 from src.compare_benchmarks import compare_benchmarks, compare_benchmark_replicates
 from src.run_benchmark_replicates import _normalize_id, _validate_control, _validate_hard_benchmark
-from src.omics_agent import TOOLS as OMICS_TOOLS, _resolve_statistics_backend, annotate_variants, normalize_variants, run_genomics_qc, run_metagenomics_qc, run_omics_analysis, run_single_cell_10x_qc, run_single_cell_qc, run_tool as run_omics_tool, run_variant_calling, search_gene_evidence, statistics_backend_status, toolchain_status
+from src.omics_agent import TOOLS as OMICS_TOOLS, _resolve_statistics_backend, annotate_variants, normalize_variants, run_feature_counts, run_genomics_qc, run_metagenomics_qc, run_omics_analysis, run_single_cell_10x_qc, run_single_cell_qc, run_tool as run_omics_tool, run_variant_calling, search_gene_evidence, statistics_backend_status, toolchain_status
 from src.domain_registry import run_tool as run_domain_tool, tool_specs, validate_tool_map
 from src.workflow_runner import run_workflow
 from src.resplit_external import joint_split_indices
@@ -640,6 +640,64 @@ class CoreTests(unittest.TestCase):
         self.assertIn('-m', result['steps'][1]['command'])
         self.assertIn('-any', result['steps'][1]['command'])
         self.assertIn('normalize_variants', OMICS_TOOLS)
+
+    @patch('src.omics_agent._external_tool_version', return_value={'available': True, 'version': 'test'})
+    @patch('src.omics_agent.shutil.which')
+    @patch('src.omics_agent.subprocess.run')
+    def test_feature_counts_builds_gene_by_sample_matrix(self, mocked_run, mocked_which, mocked_version):
+        mocked_which.return_value = '/usr/bin/featureCounts'
+
+        def fake_run(command, **kwargs):
+            raw_counts = Path(command[command.index('-o') + 1])
+            raw_counts.write_text(
+                '# Program:featureCounts\n'
+                'Geneid\tChr\tStart\tEnd\tStrand\tLength\tdata/sample_a.bam\tdata/sample_b.bam\n'
+                'GeneA\t1\t1\t100\t+\t100\t10\t20\n'
+                'GeneB\t1\t200\t300\t-\t101\t0\t5\n',
+                encoding='utf-8',
+            )
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+        mocked_run.side_effect = fake_run
+        with tempfile.TemporaryDirectory(prefix='cadd_feature_counts_') as raw:
+            root = Path(raw)
+            bam_a = root / 'sample_a.bam'
+            bam_b = root / 'sample_b.bam'
+            annotation = root / 'genes.gtf'
+            bam_a.write_bytes(b'placeholder-a')
+            bam_b.write_bytes(b'placeholder-b')
+            annotation.write_text('chr1\tsrc\texon\t1\t100\t.\t+\t.\tgene_id "GeneA";\n', encoding='utf-8')
+            result = run_feature_counts(
+                [bam_a, bam_b], annotation, root / 'counts',
+                paired_end=True, threads=4, strand=1,
+            )
+            counts = pd.read_csv(root / 'counts' / 'expression_counts.csv')
+            manifest = json.loads((root / 'counts' / 'feature_counts.json').read_text(encoding='utf-8'))
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['n_genes'], 2)
+        self.assertEqual(result['n_samples'], 2)
+        self.assertEqual(result['sample_names'], ['sample_a', 'sample_b'])
+        self.assertEqual(counts.columns.tolist(), ['gene_id', 'sample_a', 'sample_b'])
+        self.assertEqual(counts['sample_b'].tolist(), [20, 5])
+        self.assertEqual(manifest['manifest_path'], result['manifest_path'])
+        command = mocked_run.call_args.args[0]
+        self.assertIn('-p', command)
+        self.assertIn('run_feature_counts', OMICS_TOOLS)
+
+    @patch('src.omics_agent.shutil.which', return_value=None)
+    def test_feature_counts_reports_missing_subread_without_fallback(self, mocked_which):
+        with tempfile.TemporaryDirectory(prefix='cadd_feature_counts_missing_') as raw:
+            root = Path(raw)
+            bam_path = root / 'sample.bam'
+            annotation = root / 'genes.gtf'
+            bam_path.write_bytes(b'placeholder')
+            annotation.write_text('chr1\tsrc\texon\t1\t100\t.\t+\t.\tgene_id "GeneA";\n', encoding='utf-8')
+            result = run_feature_counts(bam_path, annotation, root / 'counts')
+            manifest = json.loads((root / 'counts' / 'feature_counts.json').read_text(encoding='utf-8'))
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertEqual(result['missing_tools'], ['featureCounts'])
+        self.assertEqual(manifest['workflow'], 'rnaseq_feature_counts')
+        mocked_which.assert_called_once_with('featureCounts')
 
     def test_single_cell_qc_calculates_metrics_and_filters_cells(self):
         with tempfile.TemporaryDirectory(prefix='cadd_single_cell_qc_') as raw:

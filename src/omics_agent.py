@@ -15,7 +15,7 @@ import pandas as pd
 from scipy.stats import hypergeom, ttest_ind
 
 PLUGIN_NAME = 'RNA-seq and omics domain'
-PLUGIN_VERSION = '0.5.0'
+PLUGIN_VERSION = '0.6.0'
 PLUGIN_API_VERSION = 1
 PLUGIN_CAPABILITIES = (
     'omics.end_to_end',
@@ -27,6 +27,7 @@ PLUGIN_CAPABILITIES = (
     'omics.variant_calling',
     'omics.variant_normalization',
     'omics.gtf_annotation',
+    'omics.rnaseq_quantification',
     'omics.toolchain',
     'omics.genomics_qc',
     'omics.single_cell_qc',
@@ -38,6 +39,7 @@ TOOLCHAIN_EXECUTABLES = {
     'gatk': 'gatk',
     'samtools': 'samtools',
     'bcftools': 'bcftools',
+    'featureCounts': 'featureCounts',
     'vep': 'vep',
 }
 DESEQ2_RUNNER = Path(__file__).resolve().parents[1] / 'tools' / 'deseq2_runner.R'
@@ -608,6 +610,151 @@ def normalize_variants(vcf_path, reference_fasta, output_dir, output_vcf=None,
     })
 
 
+def _normalize_alignment_paths(alignment_paths):
+    values = alignment_paths if isinstance(alignment_paths, (list, tuple)) else [alignment_paths]
+    if not values or any(value is None or not str(value).strip() for value in values):
+        raise ValueError('alignment_paths must contain at least one BAM/CRAM path')
+    paths = [Path(str(value)) for value in values]
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise ValueError(f'alignment files do not exist: {missing}')
+    invalid = [str(path) for path in paths if path.suffix.lower() not in {'.bam', '.cram'}]
+    if invalid:
+        raise ValueError(f'featureCounts requires BAM/CRAM inputs: {invalid}')
+    return paths
+
+
+def _feature_counts_sample_name(value):
+    normalized = str(value).replace('\\', '/')
+    name = normalized.rsplit('/', 1)[-1]
+    for suffix in ('.bam', '.cram'):
+        if name.lower().endswith(suffix):
+            return name[:-len(suffix)]
+    return Path(name).stem
+
+
+def _parse_feature_counts_output(counts_path, output_csv):
+    frame = pd.read_csv(counts_path, sep='\t', comment='#')
+    if frame.empty or 'Geneid' not in frame.columns:
+        raise ValueError('featureCounts output is missing the Geneid column')
+    sample_columns = list(frame.columns[6:])
+    if not sample_columns:
+        raise ValueError('featureCounts output has no sample count columns')
+    sample_names = [_feature_counts_sample_name(column) for column in sample_columns]
+    if len(set(sample_names)) != len(sample_names):
+        raise ValueError('featureCounts sample names are not unique after normalization')
+    result = frame.loc[:, ['Geneid', *sample_columns]].rename(columns={'Geneid': 'gene_id'})
+    result['gene_id'] = result['gene_id'].astype(str)
+    if result['gene_id'].eq('').any() or result['gene_id'].duplicated().any():
+        raise ValueError('featureCounts gene identifiers must be non-empty and unique')
+    result = result.rename(columns=dict(zip(sample_columns, sample_names)))
+    result[sample_names] = result[sample_names].apply(pd.to_numeric, errors='raise')
+    if result[sample_names].isna().any().any() or (result[sample_names] < 0).any().any():
+        raise ValueError('featureCounts counts must be non-negative numbers')
+    output_csv = Path(output_csv)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    result.to_csv(output_csv, index=False)
+    return result, sample_names
+
+
+def run_feature_counts(alignment_paths, annotation_gtf, output_dir, output_csv=None,
+                       feature_type='exon', gene_id_attribute='gene_id', strand=0,
+                       paired_end=False, threads=1, timeout=900):
+    paths = _normalize_alignment_paths(alignment_paths)
+    annotation_gtf = Path(annotation_gtf)
+    if not annotation_gtf.is_file():
+        raise ValueError(f'GTF annotation does not exist: {annotation_gtf}')
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_csv = Path(output_csv) if output_csv else output_dir / 'expression_counts.csv'
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    raw_counts = output_dir / 'featurecounts.tsv'
+    summary_path = Path(str(raw_counts) + '.summary')
+    timeout = max(1, min(int(timeout), 3600))
+    threads = max(1, min(int(threads), 64))
+    strand = int(strand)
+    if strand not in {0, 1, 2}:
+        raise ValueError('strand must be 0, 1 or 2')
+    executable = shutil.which('featureCounts')
+    provenance = {
+        'inputs': {
+            'alignments': [
+                {'path': str(path), 'sha256': _file_sha256(path)} for path in paths
+            ],
+            'annotation_gtf': {
+                'path': str(annotation_gtf),
+                'sha256': _file_sha256(annotation_gtf),
+            },
+        },
+        'parameters': {
+            'feature_type': str(feature_type),
+            'gene_id_attribute': str(gene_id_attribute),
+            'strand': strand,
+            'paired_end': bool(paired_end),
+            'threads': threads,
+        },
+        'tool': {},
+    }
+    if not executable:
+        return _write_omics_manifest(output_dir, 'feature_counts.json', {
+            'status': 'unavailable',
+            'workflow': 'rnaseq_feature_counts',
+            'output_csv': str(output_csv),
+            'missing_tools': ['featureCounts'],
+            'reason': 'featureCounts not found in PATH; install the Subread package',
+            'provenance': provenance,
+        })
+    provenance['tool'] = {
+        'path': executable,
+        **_external_tool_version(executable),
+    }
+    command = [
+        executable, '-T', str(threads), '-a', str(annotation_gtf),
+        '-t', str(feature_type), '-g', str(gene_id_attribute),
+        '-s', str(strand), '-o', str(raw_counts),
+    ]
+    if paired_end:
+        command.append('-p')
+    command.extend(str(path) for path in paths)
+    result = _run_variant_command(command, timeout, output_dir / 'featurecounts.log')
+    if result['status'] != 'completed' or not raw_counts.is_file():
+        return _write_omics_manifest(output_dir, 'feature_counts.json', {
+            'status': 'failed',
+            'workflow': 'rnaseq_feature_counts',
+            'output_csv': str(output_csv),
+            'featurecounts_output': str(raw_counts),
+            'summary_path': str(summary_path),
+            'command': command,
+            'command_result': result,
+            'provenance': provenance,
+        })
+    try:
+        counts, sample_names = _parse_feature_counts_output(raw_counts, output_csv)
+    except Exception as exc:
+        return _write_omics_manifest(output_dir, 'feature_counts.json', {
+            'status': 'failed',
+            'workflow': 'rnaseq_feature_counts',
+            'output_csv': str(output_csv),
+            'featurecounts_output': str(raw_counts),
+            'summary_path': str(summary_path),
+            'command': command,
+            'error': str(exc),
+            'provenance': provenance,
+        })
+    return _write_omics_manifest(output_dir, 'feature_counts.json', {
+        'status': 'completed',
+        'workflow': 'rnaseq_feature_counts',
+        'output_csv': str(output_csv),
+        'featurecounts_output': str(raw_counts),
+        'summary_path': str(summary_path),
+        'command': command,
+        'n_genes': int(len(counts)),
+        'n_samples': len(sample_names),
+        'sample_names': sample_names,
+        'provenance': provenance,
+    })
+
+
 GENOMICS_QC_TYPES = ('auto', 'fastq', 'bam', 'vcf')
 
 
@@ -692,7 +839,11 @@ def _write_qc_manifest(output_dir, payload):
 
 
 def _write_variant_manifest(output_dir, payload):
-    manifest_path = Path(output_dir) / 'variant_normalization.json'
+    return _write_omics_manifest(output_dir, 'variant_normalization.json', payload)
+
+
+def _write_omics_manifest(output_dir, filename, payload):
+    manifest_path = Path(output_dir) / filename
     payload['manifest_path'] = str(manifest_path)
     manifest_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
@@ -1653,7 +1804,7 @@ TOOLS = {
         'function': annotate_variants,
     },
     'inspect_toolchain': {
-        'description': 'Report whether GATK, SAMtools, bcftools and VEP are available in the execution environment.',
+        'description': 'Report whether GATK, SAMtools, bcftools, featureCounts and VEP are available in the execution environment.',
         'parameters': _parameters({}),
         'function': toolchain_status,
     },
@@ -1697,6 +1848,27 @@ TOOLS = {
             'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 3600},
         }, required=('vcf_path', 'reference_fasta', 'output_dir')),
         'function': normalize_variants,
+    },
+    'run_feature_counts': {
+        'description': 'Generate a gene-by-sample RNA-seq count matrix from BAM/CRAM alignments and a GTF annotation using featureCounts.',
+        'parameters': _parameters({
+            'alignment_paths': {
+                'oneOf': [
+                    {'type': 'string'},
+                    {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1},
+                ],
+            },
+            'annotation_gtf': {'type': 'string'},
+            'output_dir': {'type': 'string'},
+            'output_csv': {'type': 'string'},
+            'feature_type': {'type': 'string'},
+            'gene_id_attribute': {'type': 'string'},
+            'strand': {'type': 'integer', 'enum': [0, 1, 2]},
+            'paired_end': {'type': 'boolean'},
+            'threads': {'type': 'integer', 'minimum': 1, 'maximum': 64},
+            'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 3600},
+        }, required=('alignment_paths', 'annotation_gtf', 'output_dir')),
+        'function': run_feature_counts,
     },
     'run_single_cell_qc': {
         'description': 'Calculate single-cell expression QC metrics and write a filtered cell matrix without requiring Scanpy.',

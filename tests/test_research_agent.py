@@ -163,6 +163,26 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(result['workflow']['steps'][0]['args']['region'], 'chr1:1-1000')
         self.assertIn('bcftools mpileup/call', result['rationale'][0])
 
+    def test_research_planner_builds_feature_counts_workflow(self):
+        result = run_tool('research_build_workflow', {
+            'task': 'Generate gene counts from aligned RNA-seq BAM using featureCounts',
+            'domains': ['omics'],
+            'inputs': {
+                'bam_path': 'data/sample.bam',
+                'annotation_gtf': 'data/gencode.gtf',
+                'strand': 1,
+                'threads': 4,
+            },
+        })
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['selected_tools'], ['omics_run_feature_counts'])
+        step = result['workflow']['steps'][0]
+        self.assertEqual(step['id'], 'rnaseq_feature_counts')
+        self.assertEqual(step['args']['alignment_paths'], 'data/sample.bam')
+        self.assertEqual(step['args']['annotation_gtf'], 'data/gencode.gtf')
+        self.assertEqual(step['args']['strand'], 1)
+        self.assertIn('featureCounts', result['rationale'][0])
+
     def test_research_planner_chains_variant_normalization_and_annotation(self):
         result = run_tool('research_build_workflow', {
             'task': 'Normalize variants and annotate them before interpretation',

@@ -50,6 +50,8 @@ _DOMAIN_KEYWORDS = {
         'metagenome', 'microbiome', '16s', 'taxonomy', '宏基因组', '微生物组', '物种丰度',
         'variant', 'vcf', 'mutation', 'gatk', 'samtools',
         'fastq', 'bam', 'cram', 'quality control', 'quality-control', 'qc',
+        'featurecounts', 'feature counts', 'read counting', 'gene counting',
+        'rna-seq quantification', 'rna-seq counting', '转录组计数', '基因计数',
         'gene annotation', 'variant annotation', '变异', '突变',
     ),
     'sequence': (
@@ -99,6 +101,12 @@ _SINGLE_CELL_KEYWORDS = (
 _METAGENOMICS_KEYWORDS = (
     'metagenome', 'metagenomics', 'microbiome', '16s', 'amplicon',
     'taxonomy', '宏基因组', '微生物组', '物种丰度',
+)
+
+
+_RNASEQ_COUNTING_KEYWORDS = (
+    'featurecounts', 'feature counts', 'read counting', 'gene counting',
+    'rna-seq quantification', 'rna-seq counting', '转录组计数', '基因计数',
 )
 
 
@@ -245,6 +253,18 @@ def _is_metagenomics_task(task, inputs=None):
     return any(keyword in text for keyword in _METAGENOMICS_KEYWORDS)
 
 
+def _is_rnaseq_counting_task(task, inputs=None):
+    inputs = inputs or {}
+    has_alignment = any(key in inputs for key in (
+        'alignment_paths', 'bam_paths', 'bam_path', 'cram_path',
+    ))
+    has_annotation = bool(inputs.get('annotation_gtf') or inputs.get('gencode_gtf'))
+    if has_alignment and has_annotation:
+        return True
+    text = str(task or '').lower()
+    return any(keyword in text for keyword in _RNASEQ_COUNTING_KEYWORDS)
+
+
 def _required_inputs(domains, task=None, inputs=None):
     required = []
     if 'omics' in domains:
@@ -259,6 +279,11 @@ def _required_inputs(domains, task=None, inputs=None):
                 ])
             else:
                 required.append({'name': 'matrix_csv', 'description': 'cell-by-gene count matrix CSV'})
+        elif _is_rnaseq_counting_task(task, inputs):
+            required.extend([
+                {'name': 'alignment_paths', 'description': 'aligned BAM/CRAM files for RNA-seq read counting'},
+                {'name': 'annotation_gtf', 'description': 'GTF gene annotation for featureCounts'},
+            ])
         elif _is_variant_normalization_task(task, inputs):
             required.extend([
                 {'name': 'vcf_path', 'description': 'input VCF/BCF variant file'},
@@ -338,6 +363,7 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
     metagenomics_task = _is_metagenomics_task(task, inputs)
     single_cell_task = _is_single_cell_task(task, inputs)
     single_cell_10x_task = _is_single_cell_10x_task(task, inputs)
+    rnaseq_counting_task = _is_rnaseq_counting_task(task, inputs)
     variant_normalization_task = _is_variant_normalization_task(task, inputs)
     variant_calling_task = _is_variant_calling_task(task, inputs)
     qc_task = _is_genomics_qc_task(task, inputs)
@@ -401,6 +427,40 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
                     'args': single_cell_args,
                 })
                 rationale.append('single-cell QC calculates genes-per-cell, total counts and mitochondrial fraction')
+    elif 'omics' in domains and rnaseq_counting_task:
+        alignment_paths = (
+            inputs.get('alignment_paths') or inputs.get('bam_paths')
+            or inputs.get('bam_path') or inputs.get('cram_path')
+        )
+        annotation_gtf = inputs.get('annotation_gtf') or inputs.get('gencode_gtf')
+        if not alignment_paths:
+            missing.append('alignment_paths')
+        if not annotation_gtf:
+            missing.append('annotation_gtf')
+        if alignment_paths and annotation_gtf:
+            if isinstance(alignment_paths, (list, tuple)):
+                serialized_alignments = [str(path) for path in alignment_paths]
+            else:
+                serialized_alignments = str(alignment_paths)
+            counting_args = {
+                'alignment_paths': serialized_alignments,
+                'annotation_gtf': str(annotation_gtf),
+                'output_dir': output_dir,
+            }
+            if inputs.get('output_csv') or inputs.get('counts_csv'):
+                counting_args['output_csv'] = str(inputs.get('output_csv') or inputs['counts_csv'])
+            for key in (
+                'feature_type', 'gene_id_attribute', 'strand', 'paired_end',
+                'threads', 'timeout',
+            ):
+                if inputs.get(key) is not None:
+                    counting_args[key] = inputs[key]
+            steps.append({
+                'id': 'rnaseq_feature_counts',
+                'tool': 'omics_run_feature_counts',
+                'args': counting_args,
+            })
+            rationale.append('featureCounts converts aligned RNA-seq BAM/CRAM files plus GTF exon annotations into a gene-by-sample count matrix with provenance')
     elif 'omics' in domains and variant_normalization_task:
         vcf_path = inputs.get('vcf_path') or inputs.get('vcf') or inputs.get('variants_vcf')
         reference_fasta = inputs.get('reference_fasta') or inputs.get('reference_path') or inputs.get('reference_genome')
