@@ -329,9 +329,10 @@ def _file_sha256(path, chunk_size=1024 * 1024):
 
 
 def _external_tool_version(executable):
+    version_command = [executable, '-v'] if Path(executable).name.lower() == 'featurecounts' else [executable, '--version']
     try:
         result = subprocess.run(
-            [executable, '--version'],
+            version_command,
             capture_output=True,
             text=True,
             timeout=10,
