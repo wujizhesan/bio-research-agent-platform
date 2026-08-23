@@ -95,6 +95,8 @@ type ResearchPlan = {
 
 type ResearchFileSlot = 'expression' | 'metadata' | 'gene_sets' | 'vcf' | 'annotation' | 'receptor' | 'ligand_library'
 
+type RnaFileSlot = 'fastq_r1' | 'fastq_r2' | 'reference_fasta' | 'annotation_gtf' | 'metadata' | 'gene_sets'
+
 type UploadedFile = {
   file_id: string
   filename: string
@@ -106,7 +108,7 @@ type UploadedFile = {
 }
 
 type View = 'workspace' | 'domains'
-type RunMode = 'research' | 'variant' | 'sequence' | 'cadd'
+type RunMode = 'research' | 'rnaseq' | 'variant' | 'sequence' | 'cadd'
 type PlannerMode = 'auto' | 'deterministic' | 'llm'
 
 const runtimeApiBase = new URLSearchParams(window.location.search).get('api') || ''
@@ -294,6 +296,7 @@ function App() {
   const [selectedJob, setSelectedJob] = useState<Job | null>(null)
   const [events, setEvents] = useState<EventItem[]>([])
   const [task, setTask] = useState('分析 RNA-seq 差异表达并设计 mRNA 序列')
+  const [rnaseqTask, setRnaseqTask] = useState('Run FastQC and align paired-end RNA-seq reads')
   const [variantTask, setVariantTask] = useState('Annotate VCF variants and retrieve gene evidence')
   const [protein, setProtein] = useState('MKT')
   const [evidenceProvider, setEvidenceProvider] = useState('local')
@@ -301,7 +304,9 @@ function App() {
   const [caddExhaustiveness, setCaddExhaustiveness] = useState('4')
   const [caddMaxLigands, setCaddMaxLigands] = useState('3')
   const [uploadedFiles, setUploadedFiles] = useState<Record<ResearchFileSlot, UploadedFile | null>>({ expression: null, metadata: null, gene_sets: null, vcf: null, annotation: null, receptor: null, ligand_library: null })
+  const [rnaFiles, setRnaFiles] = useState<Record<RnaFileSlot, UploadedFile[]>>({ fastq_r1: [], fastq_r2: [], reference_fasta: [], annotation_gtf: [], metadata: [], gene_sets: [] })
   const [uploadingFile, setUploadingFile] = useState<ResearchFileSlot | ''>('')
+  const [uploadingRnaFile, setUploadingRnaFile] = useState<RnaFileSlot | ''>('')
   const [researchPlan, setResearchPlan] = useState<ResearchPlan | null>(null)
   const [loading, setLoading] = useState(false)
   const [connected, setConnected] = useState(false)
@@ -373,6 +378,19 @@ function App() {
     }
   }
 
+  function buildRnaseqInputs() {
+    return {
+      fastq_paths: rnaFiles.fastq_r1.length ? rnaFiles.fastq_r1.map((file) => file.path) : undefined,
+      fastq_r2_paths: rnaFiles.fastq_r2.length ? rnaFiles.fastq_r2.map((file) => file.path) : undefined,
+      reference_fasta: rnaFiles.reference_fasta[0]?.path,
+      annotation_gtf: rnaFiles.annotation_gtf[0]?.path,
+      metadata_csv: rnaFiles.metadata[0]?.path,
+      gene_sets_csv: rnaFiles.gene_sets[0]?.path,
+      output_dir: 'output/frontend_rnaseq_custom',
+      statistics_backend: 'scipy',
+    }
+  }
+
   function buildCaddInputs() {
     return {
       receptor: uploadedFiles.receptor?.path || 'data/4hjo.pdb',
@@ -395,6 +413,23 @@ function App() {
       setError(err instanceof Error ? err.message : '文件上传失败')
     } finally {
       setUploadingFile('')
+    }
+  }
+
+  async function handleRnaFileUpload(slot: RnaFileSlot, files?: FileList | null) {
+    if (!files?.length) return
+    setUploadingRnaFile(slot)
+    setError('')
+    try {
+      const uploaded: UploadedFile[] = []
+      for (const file of Array.from(files)) uploaded.push(await uploadFile(apiBase, token, file))
+      const values = slot === 'fastq_r1' || slot === 'fastq_r2' ? uploaded : uploaded.slice(0, 1)
+      setRnaFiles((current) => ({ ...current, [slot]: values }))
+      setResearchPlan(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'RNA-seq 文件上传失败')
+    } finally {
+      setUploadingRnaFile('')
     }
   }
 
@@ -466,6 +501,16 @@ function App() {
       )
       return
     }
+    if (mode === 'rnaseq') {
+      setResearchPlan(null)
+      await submitToolJob(
+        'research_plan',
+        { task: rnaseqTask, domains: ['omics'], planner_mode: 'deterministic', inputs: buildRnaseqInputs() },
+        'RNA-seq 工作流规划已进入队列',
+        (job) => setResearchPlan(extractResearchPlan(job)),
+      )
+      return
+    }
     if (mode === 'variant') {
       setResearchPlan(null)
       await submitToolJob(
@@ -513,13 +558,15 @@ function App() {
   async function executeResearchPlan() {
     const execution = researchPlan?.execution
     if (!researchPlan || !execution?.ready || !execution.workflow) return
-    const outputDir = mode === 'variant'
-      ? 'output/frontend_variant_research'
-      : mode === 'sequence'
-        ? 'output/frontend_sequence_research'
-        : mode === 'cadd'
-          ? 'output/frontend_cadd_research'
-          : 'output/frontend_auto_research'
+    const outputDir = mode === 'rnaseq'
+      ? 'output/frontend_rnaseq_custom'
+      : mode === 'variant'
+        ? 'output/frontend_variant_research'
+        : mode === 'sequence'
+          ? 'output/frontend_sequence_research'
+          : mode === 'cadd'
+            ? 'output/frontend_cadd_research'
+            : 'output/frontend_auto_research'
     await submitToolJob(
       'research_execute',
       {
@@ -783,7 +830,7 @@ function App() {
               <section className="grid gap-5 xl:grid-cols-[1.08fr_0.92fr]">
                 <div className="panel p-5 sm:p-6">
                   <div className="flex items-start justify-between gap-4"><div><div className="eyebrow">01 / START A RUN</div><h2 className="mt-2 text-xl font-semibold">启动一条研究路径</h2></div><div className="rounded-xl border border-[#21443f] bg-[#102b2a] p-2.5 text-[#8fe5c1]"><Play size={17} /></div></div>
-                  <div className="mt-7 grid grid-cols-2 gap-1 rounded-xl bg-[#071719] p-1 sm:grid-cols-4"><button onClick={() => setMode('research')} className={`mode-tab ${mode === 'research' ? 'mode-tab-active' : ''}`}><Workflow size={14} />研究规划</button><button onClick={() => setMode('variant')} className={`mode-tab ${mode === 'variant' ? 'mode-tab-active' : ''}`}><GitBranch size={14} />VCF 变异</button><button onClick={() => setMode('sequence')} className={`mode-tab ${mode === 'sequence' ? 'mode-tab-active' : ''}`}><Dna size={14} />mRNA 设计</button><button onClick={() => setMode('cadd')} className={`mode-tab ${mode === 'cadd' ? 'mode-tab-active' : ''}`}><Beaker size={14} />CADD 对接</button></div>
+                  <div className="mt-7 grid grid-cols-2 gap-1 rounded-xl bg-[#071719] p-1 sm:grid-cols-5"><button onClick={() => setMode('research')} className={`mode-tab ${mode === 'research' ? 'mode-tab-active' : ''}`}><Workflow size={14} />研究规划</button><button onClick={() => setMode('rnaseq')} className={`mode-tab ${mode === 'rnaseq' ? 'mode-tab-active' : ''}`}><Activity size={14} />RNA-seq 上传</button><button onClick={() => setMode('variant')} className={`mode-tab ${mode === 'variant' ? 'mode-tab-active' : ''}`}><GitBranch size={14} />VCF 变异</button><button onClick={() => setMode('sequence')} className={`mode-tab ${mode === 'sequence' ? 'mode-tab-active' : ''}`}><Dna size={14} />mRNA 设计</button><button onClick={() => setMode('cadd')} className={`mode-tab ${mode === 'cadd' ? 'mode-tab-active' : ''}`}><Beaker size={14} />CADD 对接</button></div>
                   {mode === 'research' ? <>
                     <label className="mt-6 block"><span className="field-label">科学问题</span><textarea value={task} onChange={(event) => { setTask(event.target.value); setResearchPlan(null) }} rows={4} className="input-area" placeholder="描述你希望 Agent 协助完成的研究任务" /></label>
                     <div className="mt-5 grid gap-4 sm:grid-cols-[0.8fr_1.2fr]"><div><label className="field-label" htmlFor="planner-mode">Planner 模式</label><select id="planner-mode" value={plannerMode} onChange={(event) => { setPlannerMode(event.target.value as PlannerMode); setResearchPlan(null) }} className="input-control"><option value="auto">Auto：有 Key 用 LLM</option><option value="deterministic">Deterministic：规则规划</option><option value="llm">LLM：必须调用模型</option></select></div><div className="flex items-end pb-1 text-xs leading-5 text-[#688983]">Auto 会在配置模型密钥时调用 LLM；模型不可用时保留 fallback 原因并回退到确定性规划。</div></div>
@@ -797,6 +844,17 @@ function App() {
                       <ResearchFileField id="gene-sets-file" label="基因集 CSV" file={uploadedFiles.gene_sets} uploading={uploadingFile === 'gene_sets'} onChange={(file) => void handleResearchFileUpload('gene_sets', file)} />
                     </div>
                     <p className="mt-3 text-xs leading-5 text-[#688983]">上传文件会在服务端校验、计算 SHA-256 并保存到本次研究输入目录；未上传的字段使用仓库示例数据。</p>
+                  </> : mode === 'rnaseq' ? <>
+                     <label className="mt-6 block"><span className="field-label">RNA-seq 工作流任务</span><textarea value={rnaseqTask} onChange={(event) => { setRnaseqTask(event.target.value); setResearchPlan(null) }} rows={3} className="input-area" placeholder="例如：Run FastQC and align paired-end RNA-seq reads" /></label>
+                     <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                       <RnaFileField id="rna-r1-files" label="R1 FASTQ（可多选）" files={rnaFiles.fastq_r1} multiple accept=".fastq,.fq,.fastq.gz,.fq.gz,application/gzip,text/plain" uploading={uploadingRnaFile === 'fastq_r1'} onChange={(files) => void handleRnaFileUpload('fastq_r1', files)} />
+                       <RnaFileField id="rna-r2-files" label="R2 FASTQ（可多选）" files={rnaFiles.fastq_r2} multiple accept=".fastq,.fq,.fastq.gz,.fq.gz,application/gzip,text/plain" uploading={uploadingRnaFile === 'fastq_r2'} onChange={(files) => void handleRnaFileUpload('fastq_r2', files)} />
+                       <RnaFileField id="rna-reference-file" label="参考基因组 FASTA" files={rnaFiles.reference_fasta} accept=".fa,.fasta,.fna,text/plain" uploading={uploadingRnaFile === 'reference_fasta'} onChange={(files) => void handleRnaFileUpload('reference_fasta', files)} />
+                       <RnaFileField id="rna-gtf-file" label="基因注释 GTF" files={rnaFiles.annotation_gtf} accept=".gtf,.gff,.gff3,text/plain" uploading={uploadingRnaFile === 'annotation_gtf'} onChange={(files) => void handleRnaFileUpload('annotation_gtf', files)} />
+                       <RnaFileField id="rna-metadata-file" label="样本 metadata CSV（可选）" files={rnaFiles.metadata} accept=".csv,.tsv,text/csv,text/tab-separated-values" uploading={uploadingRnaFile === 'metadata'} onChange={(files) => void handleRnaFileUpload('metadata', files)} />
+                       <RnaFileField id="rna-gene-sets-file" label="gene sets CSV（可选）" files={rnaFiles.gene_sets} accept=".csv,.tsv,text/csv,text/tab-separated-values" uploading={uploadingRnaFile === 'gene_sets'} onChange={(files) => void handleRnaFileUpload('gene_sets', files)} />
+                     </div>
+                     <p className="mt-3 text-xs leading-5 text-[#688983]">R1/R2 可批量选择；Planner 会根据任务文本检查输入，并决定是否继续比对、featureCounts、差异分析和富集。</p>
                   </> : mode === 'variant' ? <>
                     <label className="mt-6 block"><span className="field-label">Variant research task</span><textarea value={variantTask} onChange={(event) => { setVariantTask(event.target.value); setResearchPlan(null) }} rows={3} className="input-area" placeholder="Describe the VCF annotation and evidence task" /></label>
                     <div className="mt-5 grid gap-3 sm:grid-cols-2">
@@ -811,7 +869,7 @@ function App() {
                     <div className="mt-5 grid gap-4 sm:grid-cols-2"><div><label className="field-label" htmlFor="cadd-max-ligands">演示候选数</label><input id="cadd-max-ligands" type="number" min="1" max="17" value={caddMaxLigands} onChange={(event) => { setCaddMaxLigands(event.target.value); setResearchPlan(null) }} className="input-control font-mono" /><span className="mt-2 block text-xs text-[#688983]">完整筛选可调到 17，演示建议 3。</span></div><div><label className="field-label" htmlFor="cadd-exhaustiveness">Vina exhaustiveness</label><input id="cadd-exhaustiveness" type="number" min="1" max="32" value={caddExhaustiveness} onChange={(event) => { setCaddExhaustiveness(event.target.value); setResearchPlan(null) }} className="input-control font-mono" /><span className="mt-2 block text-xs text-[#688983]">数值越高越稳定，但运行时间更长。</span></div></div>
                     <p className="mt-3 text-xs leading-5 text-[#688983]">CADD 入口会记录受体、数据集、Vina 参数与结果报告。Docker 优先读取本机挂载的 data/4hjo.pdb 和 output/bindingdb_egfr_10000.csv，也支持上传替换。</p>
                   </>}
-                  <div className="mt-6 flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2 font-mono text-[10px] text-[#66847e]"><CircleDot size={13} className="text-[#70e3ad]" />ASYNC / TRACEABLE / REPLAYABLE</div><button onClick={submitRun} disabled={loading || (mode === 'research' ? !task.trim() : mode === 'variant' ? !variantTask.trim() : mode === 'sequence' ? !protein.trim() : false)} className="group inline-flex items-center gap-2 rounded-xl bg-[#a8f0d2] px-4 py-2.5 text-sm font-semibold text-[#092521] transition hover:bg-[#c6f8e1] disabled:cursor-not-allowed disabled:opacity-50">{loading ? <RefreshCw size={15} className="animate-spin" /> : <Play size={15} />}{loading ? '执行中…' : '开始运行'}<ArrowUpRight size={14} className="transition group-hover:translate-x-0.5 group-hover:-translate-y-0.5" /></button></div>
+                  <div className="mt-6 flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2 font-mono text-[10px] text-[#66847e]"><CircleDot size={13} className="text-[#70e3ad]" />ASYNC / TRACEABLE / REPLAYABLE</div><button onClick={submitRun} disabled={loading || (mode === 'research' ? !task.trim() : mode === 'rnaseq' ? !rnaseqTask.trim() : mode === 'variant' ? !variantTask.trim() : mode === 'sequence' ? !protein.trim() : false)} className="group inline-flex items-center gap-2 rounded-xl bg-[#a8f0d2] px-4 py-2.5 text-sm font-semibold text-[#092521] transition hover:bg-[#c6f8e1] disabled:cursor-not-allowed disabled:opacity-50">{loading ? <RefreshCw size={15} className="animate-spin" /> : <Play size={15} />}{loading ? '执行中…' : '开始运行'}<ArrowUpRight size={14} className="transition group-hover:translate-x-0.5 group-hover:-translate-y-0.5" /></button></div>
                 </div>
 
                 <div className="panel flex min-h-[326px] flex-col p-5 sm:p-6"><div className="flex items-start justify-between"><div><div className="eyebrow">02 / EXECUTION STREAM</div><h2 className="mt-2 text-xl font-semibold">实时执行轨迹</h2></div><div className="flex items-center gap-1.5 rounded-full border border-[#28524b] bg-[#102b2a] px-2.5 py-1 font-mono text-[10px] text-[#8fe5c1]"><span className="size-1.5 animate-pulse rounded-full bg-[#70e3ad]" />SSE</div></div>{selectedJob ? <div className="mt-7 flex flex-1 flex-col"><div className="flex items-center justify-between border-b border-white/10 pb-4"><div><div className="font-mono text-[11px] text-[#6f9189]">{formatJobId(selectedJob.job_id)}</div><div className="mt-1 text-sm font-medium">{selectedJob.tool}</div></div><StatusBadge status={selectedJob.status} /></div><div className="mt-5 space-y-3">{events.slice(-4).map((event, index) => <div key={`${event.at}-${index}`} className="flex items-start gap-3 text-xs"><div className="mt-1.5 size-1.5 rounded-full bg-[#83e3bc] shadow-[0_0_12px_#83e3bc]" /><div className="min-w-0 flex-1"><div className="text-[#b2cbc4]">{event.detail}</div><div className="mt-1 font-mono text-[10px] text-[#5f7c76]">{event.at} · {event.status}</div></div></div>)}</div><div className="mt-auto flex items-center gap-2 pt-5 font-mono text-[10px] text-[#64827b]"><Clock3 size={13} />{selectedJob.status === 'completed' ? `完成于 ${formatTime(selectedJob.finished_at)}` : '等待状态更新…'}</div></div> : <EmptyStream />}</div>
@@ -819,7 +877,7 @@ function App() {
 
               {selectedJob?.status === 'completed' && <JobResultSummary job={selectedJob} onDownload={(path) => void downloadJobArtifact(selectedJob.job_id, path)} />}
 
-              {(mode === 'research' || mode === 'variant' || mode === 'sequence' || mode === 'cadd') && selectedJob?.tool !== 'research_execute' && <ResearchPlanCard plan={researchPlan} loading={loading && selectedJob?.tool === 'research_plan'} onExecute={() => void executeResearchPlan()} />}
+              {(mode === 'research' || mode === 'rnaseq' || mode === 'variant' || mode === 'sequence' || mode === 'cadd') && selectedJob?.tool !== 'research_execute' && <ResearchPlanCard plan={researchPlan} loading={loading && selectedJob?.tool === 'research_plan'} onExecute={() => void executeResearchPlan()} />}
 
               <section className="panel mt-5 overflow-hidden"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-5 py-5 sm:px-6"><div><div className="eyebrow">03 / RECENT RUNS</div><h2 className="mt-2 text-xl font-semibold">最近任务</h2></div><button onClick={() => void refresh()} className="inline-flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-xs text-[#9bb7b0] transition hover:border-[#4f8c7d] hover:text-[#d6eee7]"><RefreshCw size={13} />刷新</button></div>{jobs.length ? <div className="overflow-x-auto"><table className="w-full min-w-[680px] text-left text-sm"><thead className="bg-white/[0.025] font-mono text-[10px] tracking-[0.12em] text-[#63817b]"><tr><th className="px-5 py-3 font-normal sm:px-6">TASK ID</th><th className="px-5 py-3 font-normal">TOOL</th><th className="px-5 py-3 font-normal">STATUS</th><th className="px-5 py-3 font-normal">CREATED</th><th className="px-5 py-3 font-normal" /></tr></thead><tbody>{jobs.map((job) => <tr key={job.job_id} onClick={() => { setSelectedJob(job); setEvents([]) }} className="cursor-pointer border-t border-white/[0.06] transition hover:bg-white/[0.035]"><td className="px-5 py-4 font-mono text-xs text-[#81aaa1] sm:px-6">{formatJobId(job.job_id)}</td><td className="px-5 py-4 font-medium text-[#c7ddd7]">{job.tool}</td><td className="px-5 py-4"><StatusBadge status={job.status} /></td><td className="px-5 py-4 font-mono text-xs text-[#66837d]">{formatTime(job.created_at)}</td><td className="px-5 py-4 text-right text-[#6b8f87]"><ChevronRight size={15} /></td></tr>)}</tbody></table></div> : <div className="px-6 py-12 text-center text-sm text-[#66837d]">还没有运行记录，先启动一条研究路径。</div>}</section>
             </>
@@ -861,6 +919,17 @@ function ResearchFileField({ id, label, accept = '.csv,.tsv,text/csv,text/tab-se
     <label htmlFor={id} className="flex min-h-[76px] cursor-pointer items-center justify-between gap-3 rounded-xl border border-dashed border-[#315d55] bg-[#071719]/70 px-3 py-3 transition hover:border-[#71cba7] hover:bg-[#102b2a]">
       <input id={id} type="file" accept={accept} className="sr-only" onChange={(event) => { onChange(event.target.files?.[0]); event.currentTarget.value = '' }} />
       <div className="min-w-0"><div className="truncate text-xs font-medium text-[#b8d8ce]">{uploading ? '上传中…' : file?.filename || '选择输入文件'}</div><div className="mt-1 truncate font-mono text-[9px] text-[#668983]">{file ? `${file.size_bytes} bytes · ${file.sha256.slice(0, 12)}` : '服务端安全存储'}</div></div>
+      {uploading ? <RefreshCw size={15} className="shrink-0 animate-spin text-[#8fe5c1]" /> : <Upload size={15} className="shrink-0 text-[#78cdaa]" />}
+    </label>
+  </div>
+}
+
+function RnaFileField({ id, label, accept, files, multiple = false, uploading, onChange }: { id: string; label: string; accept?: string; files: UploadedFile[]; multiple?: boolean; uploading: boolean; onChange: (files: FileList | null) => void }) {
+  return <div>
+    <div className="field-label">{label}</div>
+    <label htmlFor={id} className="flex min-h-[88px] cursor-pointer items-center justify-between gap-3 rounded-xl border border-dashed border-[#315d55] bg-[#071719]/70 px-3 py-3 transition hover:border-[#71cba7] hover:bg-[#102b2a]">
+      <input id={id} type="file" accept={accept} multiple={multiple} className="sr-only" onChange={(event) => { onChange(event.target.files); event.currentTarget.value = '' }} />
+      <div className="min-w-0"><div className="truncate text-xs font-medium text-[#b8d8ce]">{uploading ? '上传中…' : files.length ? `${files.length} 个文件已选择` : '选择输入文件'}</div><div className="mt-1 truncate font-mono text-[9px] text-[#668983]">{files.length ? files.map((file) => file.filename).join(', ') : '服务端安全存储并计算 SHA-256'}</div></div>
       {uploading ? <RefreshCw size={15} className="shrink-0 animate-spin text-[#8fe5c1]" /> : <Upload size={15} className="shrink-0 text-[#78cdaa]" />}
     </label>
   </div>
