@@ -682,6 +682,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(manifest['manifest_path'], result['manifest_path'])
         command = mocked_run.call_args.args[0]
         self.assertIn('-p', command)
+        self.assertIn('--countReadPairs', command)
         self.assertIn('run_feature_counts', OMICS_TOOLS)
 
     @patch('src.omics_agent.shutil.which', return_value=None)
@@ -724,6 +725,21 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result['status'], 'unavailable')
         self.assertEqual(result['missing_tools'], ['hisat2', 'hisat2-build', 'samtools'])
         self.assertEqual(mocked_which.call_count, 3)
+
+    def test_rnaseq_alignment_validates_paired_fastq_sample_names(self):
+        with tempfile.TemporaryDirectory(prefix='cadd_rnaseq_paired_') as raw:
+            root = Path(raw)
+            r1_path = root / 'A1_R1.fastq'
+            r2_path = root / 'B1_R2.fastq'
+            reference_path = root / 'reference.fa'
+            r1_path.write_text('@r1\nACGT\n+\nIIII\n', encoding='utf-8')
+            r2_path.write_text('@r1\nACGT\n+\nIIII\n', encoding='utf-8')
+            reference_path.write_text('>chr1\nACGT\n', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'sample names must match'):
+                run_rnaseq_alignment(
+                    [r1_path], reference_path, root / 'output',
+                    fastq_r2_paths=[r2_path],
+                )
 
     def test_single_cell_qc_calculates_metrics_and_filters_cells(self):
         with tempfile.TemporaryDirectory(prefix='cadd_single_cell_qc_') as raw:

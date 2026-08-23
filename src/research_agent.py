@@ -309,7 +309,7 @@ def _required_inputs(domains, task=None, inputs=None):
                 required.append({'name': 'matrix_csv', 'description': 'cell-by-gene count matrix CSV'})
         elif _is_rnaseq_alignment_task(task, inputs):
             required.extend([
-                {'name': 'fastq_paths', 'description': 'single-end RNA-seq FASTQ files'},
+                {'name': 'fastq_paths', 'description': 'single-end or paired-end RNA-seq R1 FASTQ files'},
                 {'name': 'reference_fasta', 'description': 'reference FASTA for HISAT2 alignment'},
             ])
             if _is_rnaseq_counting_task(task, inputs) or _is_rnaseq_analysis_task(task, inputs) or inputs.get('annotation_gtf'):
@@ -494,6 +494,8 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
             for key in ('output_alignment_paths', 'threads', 'timeout'):
                 if inputs.get(key) is not None:
                     alignment_args[key] = inputs[key]
+            if inputs.get('fastq_r2_paths') is not None:
+                alignment_args['fastq_r2_paths'] = inputs['fastq_r2_paths']
             steps.append({
                 'id': 'rnaseq_alignment',
                 'tool': 'omics_run_rnaseq_alignment',

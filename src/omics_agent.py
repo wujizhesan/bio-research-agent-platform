@@ -681,8 +681,13 @@ def _fastq_sample_name(path):
     name = Path(path).name
     for suffix in ('.fastq.gz', '.fq.gz', '.fastq', '.fq'):
         if name.lower().endswith(suffix):
-            return name[:-len(suffix)]
-    return Path(path).stem
+            name = name[:-len(suffix)]
+            break
+    for suffix in ('_R1', '_R2', '.R1', '.R2', '_1', '_2', '.1', '.2'):
+        if name.lower().endswith(suffix.lower()):
+            name = name[:-len(suffix)]
+            break
+    return name
 
 
 def _parse_hisat2_alignment_rate(stderr):
@@ -698,8 +703,12 @@ def _hisat2_index_complete(prefix):
 
 
 def run_rnaseq_alignment(fastq_paths, reference_fasta, output_dir,
-                         output_alignment_paths=None, threads=1, timeout=1800):
+                         output_alignment_paths=None, fastq_r2_paths=None,
+                         threads=1, timeout=1800):
     paths = _normalize_fastq_paths(fastq_paths)
+    mate_paths = _normalize_fastq_paths(fastq_r2_paths) if fastq_r2_paths is not None else None
+    if mate_paths is not None and len(mate_paths) != len(paths):
+        raise ValueError('fastq_r2_paths must match the number of FASTQ R1 inputs')
     reference_fasta = Path(reference_fasta)
     if not reference_fasta.is_file():
         raise ValueError(f'reference FASTA does not exist: {reference_fasta}')
@@ -710,6 +719,10 @@ def run_rnaseq_alignment(fastq_paths, reference_fasta, output_dir,
     sample_names = [_fastq_sample_name(path) for path in paths]
     if len(set(sample_names)) != len(sample_names):
         raise ValueError('FASTQ sample names must be unique')
+    if mate_paths is not None:
+        mate_sample_names = [_fastq_sample_name(path) for path in mate_paths]
+        if sample_names != mate_sample_names:
+            raise ValueError('FASTQ R1 and R2 sample names must match')
     if output_alignment_paths is None:
         alignment_paths = [output_dir / f'{sample_name}.bam' for sample_name in sample_names]
     else:
@@ -743,11 +756,15 @@ def run_rnaseq_alignment(fastq_paths, reference_fasta, output_dir,
             },
         },
         'parameters': {
-            'layout': 'single_end',
+            'layout': 'paired_end' if mate_paths is not None else 'single_end',
             'threads': threads,
         },
         'tools': {},
     }
+    if mate_paths is not None:
+        provenance['inputs']['fastq_r2'] = [
+            {'path': str(path), 'sha256': _file_sha256(path)} for path in mate_paths
+        ]
     if missing_tools:
         return _write_omics_manifest(output_dir, 'rnaseq_alignment.json', {
             'status': 'unavailable',
@@ -799,14 +816,21 @@ def run_rnaseq_alignment(fastq_paths, reference_fasta, output_dir,
             encoding='utf-8',
         )
     sample_results = []
-    for fastq_path, sample_name, alignment_path in zip(paths, sample_names, alignment_paths):
+    for fastq_path, mate_path, sample_name, alignment_path in zip(
+        paths, mate_paths or [None] * len(paths), sample_names, alignment_paths
+    ):
         sam_path = output_dir / f'{sample_name}.hisat2.sam'
         raw_bam = output_dir / f'{sample_name}.hisat2.raw.bam'
+        hisat2_reads = (
+            ['-1', str(fastq_path), '-2', str(mate_path)]
+            if mate_path is not None
+            else ['-U', str(fastq_path)]
+        )
         hisat2_result = execute(
             f'hisat2_{sample_name}',
             [
                 hisat2, '-p', str(threads), '--dta',
-                '-x', str(index_prefix), '-U', str(fastq_path),
+                '-x', str(index_prefix), *hisat2_reads,
                 '-S', str(sam_path),
             ],
             output_dir / f'{sample_name}.hisat2.log',
@@ -860,13 +884,18 @@ def run_rnaseq_alignment(fastq_paths, reference_fasta, output_dir,
             })
         sam_path.unlink(missing_ok=True)
         raw_bam.unlink(missing_ok=True)
-        sample_results.append({
+        sample_result = {
             'sample_id': sample_name,
-            'fastq_path': str(fastq_path),
             'bam_path': str(alignment_path),
             'bai_path': str(Path(str(alignment_path) + '.bai')),
             'overall_alignment_rate': _parse_hisat2_alignment_rate(hisat2_result.get('stderr')),
-        })
+        }
+        if mate_path is None:
+            sample_result['fastq_path'] = str(fastq_path)
+        else:
+            sample_result['fastq_r1_path'] = str(fastq_path)
+            sample_result['fastq_r2_path'] = str(mate_path)
+        sample_results.append(sample_result)
     return _write_omics_manifest(output_dir, 'rnaseq_alignment.json', {
         'status': 'completed',
         'workflow': 'rnaseq_alignment',
@@ -936,7 +965,7 @@ def run_feature_counts(alignment_paths, annotation_gtf, output_dir, output_csv=N
         '-s', str(strand), '-o', str(raw_counts),
     ]
     if paired_end:
-        command.append('-p')
+        command.extend(['-p', '--countReadPairs'])
     command.extend(str(path) for path in paths)
     result = _run_variant_command(command, timeout, output_dir / 'featurecounts.log')
     if result['status'] != 'completed' or not raw_counts.is_file():
@@ -2072,7 +2101,7 @@ TOOLS = {
         'function': normalize_variants,
     },
     'run_rnaseq_alignment': {
-        'description': 'Align single-end RNA-seq FASTQ files to a reference FASTA with HISAT2 and emit sorted indexed BAM files with alignment provenance.',
+        'description': 'Align single-end or paired-end RNA-seq FASTQ files to a reference FASTA with HISAT2 and emit sorted indexed BAM files with alignment provenance.',
         'parameters': _parameters({
             'fastq_paths': {
                 'oneOf': [
@@ -2082,6 +2111,12 @@ TOOLS = {
             },
             'reference_fasta': {'type': 'string'},
             'output_dir': {'type': 'string'},
+            'fastq_r2_paths': {
+                'oneOf': [
+                    {'type': 'string'},
+                    {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1},
+                ],
+            },
             'output_alignment_paths': {
                 'oneOf': [
                     {'type': 'string'},
