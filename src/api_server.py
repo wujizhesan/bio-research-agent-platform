@@ -21,8 +21,15 @@ API_NAME = 'cadd-bio-agent-api'
 API_VERSION = '0.1.0'
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_ROOT = PROJECT_ROOT / 'output'
-JOB_MANAGER = JobManager(store_path=OUTPUT_ROOT / 'jobs.sqlite3')
+JOB_MANAGER = None
 PLUGIN_MANAGER = PluginManager(state_path=OUTPUT_ROOT / 'plugin_state.json')
+
+
+def _default_job_manager():
+    global JOB_MANAGER
+    if JOB_MANAGER is None:
+        JOB_MANAGER = JobManager(store_path=OUTPUT_ROOT / 'jobs.sqlite3')
+    return JOB_MANAGER
 
 
 def is_authorized(target, headers=None, api_token=None):
@@ -107,8 +114,14 @@ def get_run_manifest(run_id, output_root=None):
 def route_request(method, target, payload=None, output_root=None, job_manager=None, plugin_manager=None):
     parsed = urlparse(target)
     path = parsed.path.rstrip('/') or '/'
-    jobs = job_manager or JOB_MANAGER
+    jobs = job_manager
     plugins = plugin_manager or PLUGIN_MANAGER
+
+    def get_jobs():
+        nonlocal jobs
+        if jobs is None:
+            jobs = _default_job_manager()
+        return jobs
     if method == 'GET' and path in {'/', '/health'}:
         return 200, {'status': 'ok', 'service': API_NAME, 'version': API_VERSION}
     if method == 'GET' and path == '/plugins':
@@ -149,14 +162,14 @@ def route_request(method, target, payload=None, output_root=None, job_manager=No
     if method == 'POST' and path.startswith('/jobs/') and path.endswith('/retry'):
         job_id = unquote(path[len('/jobs/'): -len('/retry')].rstrip('/'))
         try:
-            record = jobs.retry(job_id)
+            record = get_jobs().retry(job_id)
         except ValueError as exc:
             return 400, {'status': 'error', 'error': str(exc)}
         return 202, {'status': 'accepted', 'job': record}
     if method == 'POST' and path.startswith('/jobs/') and path.endswith('/cancel'):
         job_id = unquote(path[len('/jobs/'): -len('/cancel')].rstrip('/'))
         try:
-            record = jobs.cancel(job_id)
+            record = get_jobs().cancel(job_id)
         except ValueError as exc:
             status_code = 404 if str(exc).startswith('job not found:') else 400
             return status_code, {'status': 'error', 'error': str(exc)}
@@ -164,10 +177,10 @@ def route_request(method, target, payload=None, output_root=None, job_manager=No
         return 202, {'status': response_status, 'job': record}
     if method == 'GET' and path == '/jobs':
         limit = parse_qs(parsed.query).get('limit', ['20'])[0]
-        return 200, {'status': 'ok', 'jobs': jobs.list(limit)}
+        return 200, {'status': 'ok', 'jobs': get_jobs().list(limit)}
     if method == 'GET' and path.startswith('/jobs/'):
         job_id = unquote(path[len('/jobs/'):])
-        record = jobs.get(job_id)
+        record = get_jobs().get(job_id)
         if record is None:
             return 404, {'status': 'error', 'error': f'job not found: {job_id}'}
         return 200, {'status': 'ok', 'job': record}
@@ -176,7 +189,7 @@ def route_request(method, target, payload=None, output_root=None, job_manager=No
         try:
             name = body.get('tool')
             arguments = body.get('arguments', body.get('args', {}))
-            record = jobs.submit(name, arguments, idempotency_key=body.get('idempotency_key'))
+            record = get_jobs().submit(name, arguments, idempotency_key=body.get('idempotency_key'))
         except (TypeError, ValueError) as exc:
             return 400, {'status': 'error', 'error': str(exc)}
         return 202, {'status': 'deduplicated' if record.get('deduplicated') else 'accepted', 'job': record}

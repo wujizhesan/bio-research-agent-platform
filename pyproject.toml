@@ -81,6 +81,7 @@ py-modules = [
   "qa_verify",
   "report",
   "research_agent",
+  "research_planner",
   "resplit_external",
   "run_benchmark_replicates",
   "sequence_plugin",

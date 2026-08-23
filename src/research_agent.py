@@ -23,6 +23,14 @@ def _workflow_runner_module():
     return workflow_runner
 
 
+def _planner_module():
+    try:
+        from . import research_planner
+    except ImportError:
+        import research_planner
+    return research_planner
+
+
 def _project_root():
     try:
         from .config_loader import PROJECT_ROOT
@@ -120,6 +128,20 @@ def _select_domains(task, requested):
     }
     selected = [domain for domain, score in scores.items() if score > 0]
     return selected or sorted(available)
+
+
+def _resolve_domains(task, requested, inputs=None, planner_mode='deterministic'):
+    if requested:
+        return _select_domains(task, requested), {
+            'backend': 'explicit',
+            'mode': planner_mode,
+            'domains': list(requested),
+        }
+    available = _available_domain_names() - {'research'}
+    planner = _planner_module().select_domains(task, available, inputs, planner_mode)
+    selected = _select_domains(task, planner.get('domains')) if planner.get('domains') else _select_domains(task, None)
+    planner['domains'] = selected
+    return selected, planner
 
 
 def _is_variant_task(task, inputs=None):
@@ -426,12 +448,12 @@ def research_run_preset(preset, output_path='output/research_manifest.json',
     )
 
 
-def research_plan(task, domains=None, inputs=None, output_dir='output/research_auto'):
+def research_plan(task, domains=None, inputs=None, output_dir='output/research_auto', planner_mode='deterministic'):
     if not isinstance(task, str) or not task.strip():
         raise ValueError('task must be a non-empty string')
     if inputs is not None and not isinstance(inputs, dict):
         raise ValueError('inputs must be an object')
-    selected = _select_domains(task, domains)
+    selected, planner = _resolve_domains(task, domains, inputs, planner_mode)
     tool_specs = _domain_registry_module().active_tool_specs
     capabilities = [
         spec['name']
@@ -476,20 +498,28 @@ def research_plan(task, domains=None, inputs=None, output_dir='output/research_a
         'execution': execution,
         'evidence_provider': execution['evidence_provider'],
         'steps': steps,
+        'planner': planner,
+        'provenance': {
+            'planner': planner['backend'],
+            'planner_mode': planner['mode'],
+            'planner_model': planner.get('model'),
+            'fallback_reason': planner.get('fallback_reason'),
+        },
         'policy': {
-            'llm_may_select_tools': True,
+            'llm_may_select_tools': False,
+            'llm_may_select_domains': planner['backend'] == 'llm',
             'llm_may_invent_measurements': False,
             'execution_requires_validated_workflow': True,
         },
     }
 
 
-def research_build_workflow(task, inputs, domains=None, output_dir='output/research_auto'):
+def research_build_workflow(task, inputs, domains=None, output_dir='output/research_auto', planner_mode='deterministic'):
     if not isinstance(task, str) or not task.strip():
         raise ValueError('task must be a non-empty string')
     if not isinstance(inputs, dict):
         raise ValueError('inputs must be an object')
-    selected = _select_domains(task, domains)
+    selected, planner = _resolve_domains(task, domains, inputs, planner_mode)
     execution = _build_workflow(task, selected, inputs, output_dir)
     return {
         'status': 'planned',
@@ -498,7 +528,10 @@ def research_build_workflow(task, inputs, domains=None, output_dir='output/resea
         'selected_domains': selected,
         **execution,
         'provenance': {
-            'planner': 'deterministic-intent-router',
+            'planner': planner['backend'],
+            'planner_mode': planner['mode'],
+            'planner_model': planner.get('model'),
+            'fallback_reason': planner.get('fallback_reason'),
             'workflow_validation': 'delegated to research_execute',
         },
     }
@@ -644,6 +677,7 @@ TOOLS = {
             'domains': {'type': 'array', 'items': {'type': 'string'}},
             'inputs': {'type': 'object'},
             'output_dir': {'type': 'string'},
+            'planner_mode': {'type': 'string', 'enum': ['deterministic', 'auto', 'llm']},
         }, ('task',)),
         'function': research_plan,
     },
@@ -654,6 +688,7 @@ TOOLS = {
             'domains': {'type': 'array', 'items': {'type': 'string'}},
             'inputs': {'type': 'object'},
             'output_dir': {'type': 'string'},
+            'planner_mode': {'type': 'string', 'enum': ['deterministic', 'auto', 'llm']},
         }, ('task', 'inputs')),
         'function': research_build_workflow,
     },

@@ -73,6 +73,7 @@ type ResearchPlan = {
   capabilities: string[]
   required_inputs: Array<{ name: string; description: string }>
   evidence_provider: string
+  planner?: { backend: string; mode: string; model?: string | null; fallback_reason?: string }
   execution: ResearchPlanExecution
 }
 
@@ -436,7 +437,7 @@ function App() {
       setResearchPlan(null)
       await submitToolJob(
         'research_plan',
-        { task, inputs: buildResearchInputs() },
+        { task, inputs: buildResearchInputs(), planner_mode: 'auto' },
         '研究计划已进入执行队列',
         (job) => setResearchPlan(extractResearchPlan(job)),
       )
@@ -741,6 +742,7 @@ function ResearchPlanCard({ plan, loading, onExecute }: { plan: ResearchPlan | n
       <div className="flex flex-wrap items-center gap-2">
         {plan.selected_domains.map((domain) => <span key={domain} className="status-badge status-ok"><span className="size-1.5 rounded-full bg-current" />{domainLabels[domain] || domain}</span>)}
         <span className="status-badge status-running">证据：{providerLabels[execution?.evidence_provider || plan.evidence_provider] || execution?.evidence_provider}</span>
+        {plan.planner && <span className="status-badge">规划器：{plan.planner.backend === 'llm' ? 'LLM' : plan.planner.backend === 'deterministic' ? 'Deterministic' : plan.planner.backend}</span>}
       </div>
       <div className="grid gap-4 lg:grid-cols-[0.7fr_1.3fr]">
         <div className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-4">

@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import src.api_server as api_server
 from src.api_server import is_authorized, route_request
 from src.job_manager import JobManager
 
@@ -26,6 +27,13 @@ class ApiServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         domains = {item['domain'] for item in payload['plugins']}
         self.assertTrue({'cadd', 'omics', 'research', 'literature', 'knowledge'}.issubset(domains))
+
+    def test_read_only_routes_do_not_initialize_legacy_job_manager(self):
+        with patch.object(api_server, '_default_job_manager', side_effect=AssertionError('job manager should be lazy')):
+            status, _ = route_request('GET', '/health')
+            self.assertEqual(status, 200)
+            status, _ = route_request('GET', '/runs')
+            self.assertEqual(status, 200)
 
     def test_tools_are_filtered_by_domain(self):
         status, payload = route_request('GET', '/tools?domain=knowledge')

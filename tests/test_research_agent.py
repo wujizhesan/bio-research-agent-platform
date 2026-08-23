@@ -1,5 +1,9 @@
+import json
+import os
 import unittest
+from unittest.mock import patch
 
+from src import research_planner
 from src.domain_registry import available_domains, run_tool
 from src.workflow_runner import load_workflow
 
@@ -20,6 +24,48 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertFalse(result['policy']['llm_may_invent_measurements'])
         self.assertFalse(result['execution']['ready'])
         self.assertIn('expression_csv', result['execution']['missing_inputs'])
+
+    def test_llm_planner_selects_domains_before_deterministic_workflow_build(self):
+        response = {
+            'choices': [{
+                'message': {
+                    'content': json.dumps({
+                        'domains': ['omics', 'mRNA'],
+                        'rationale': ['The task combines expression analysis and mRNA design.'],
+                    }),
+                },
+            }],
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps(response).encode('utf-8')
+
+        environment = {
+            'RESEARCH_PLANNER_API_KEY': 'test-key',
+            'RESEARCH_PLANNER_BASE_URL': 'https://planner.test/v1',
+            'RESEARCH_PLANNER_MODEL': 'planner-test',
+            'CADD_API_KEY': '',
+            'OPENAI_API_KEY': '',
+        }
+        with patch.dict(os.environ, environment, clear=False):
+            with patch.object(research_planner.urllib.request, 'urlopen', return_value=FakeResponse()) as request:
+                result = run_tool('research_plan', {
+                    'task': '分析 RNA-seq 差异表达并设计 mRNA 序列',
+                    'planner_mode': 'llm',
+                })
+        self.assertEqual(result['planner']['backend'], 'llm')
+        self.assertEqual(result['planner']['model'], 'planner-test')
+        self.assertEqual(result['selected_domains'], ['omics', 'sequence'])
+        self.assertFalse(result['policy']['llm_may_select_tools'])
+        self.assertTrue(result['policy']['llm_may_select_domains'])
+        self.assertEqual(request.call_args.args[0].full_url, 'https://planner.test/v1/chat/completions')
 
     def test_research_planner_builds_kegg_rnaseq_sequence_workflow(self):
         inputs = {
