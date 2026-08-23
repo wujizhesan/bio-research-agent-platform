@@ -213,6 +213,20 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(omics_result['selected_domains'], ['omics'])
         self.assertEqual(omics_result['manifest']['completed_steps'], 1)
 
+    def test_bgi_multiomics_preset_is_discoverable_and_dry_runnable(self):
+        presets = run_tool('research_presets', {})
+        self.assertIn('bgi_multiomics_demo', {item['id'] for item in presets['presets']})
+        result = run_tool('research_run_preset', {
+            'preset': 'bgi_multiomics_demo',
+            'dry_run': True,
+            'output_path': 'output/test_bgi_multiomics_manifest.json',
+            'report_path': 'output/test_bgi_multiomics_report.md',
+        })
+        self.assertEqual(result['status'], 'planned')
+        self.assertEqual(result['selected_domains'], ['omics', 'literature', 'knowledge', 'sequence'])
+        self.assertEqual(result['manifest']['completed_steps'], 9)
+        self.assertEqual(result['manifest']['failed_steps'], 0)
+
     def test_research_execute_dry_run_is_domain_scoped(self):
         workflow = {
             'name': 'sequence validation',

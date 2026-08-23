@@ -111,6 +111,11 @@ RESEARCH_PRESETS = {
         'domains': ['omics'],
         'description': 'End-to-end RNA-seq analysis with differential expression, pathway enrichment, evidence retrieval and a traceable report.',
     },
+    'bgi_multiomics_demo': {
+        'path': 'examples/workflows/bgi_multiomics_demo.yaml',
+        'domains': ['omics', 'literature', 'knowledge', 'sequence'],
+        'description': 'Reproducible BGI interview demo combining genomics QC, 10x single-cell QC, metagenomics abundance QC, evidence grounding and mRNA design.',
+    },
     'bgi_variant_demo': {
         'path': 'examples/workflows/bgi_variant_demo.yaml',
         'domains': ['omics', 'literature'],

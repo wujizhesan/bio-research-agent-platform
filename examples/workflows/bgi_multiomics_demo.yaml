@@ -1,0 +1,76 @@
+name: bgi-multiomics-demo
+steps:
+  - id: genomics_qc
+    tool: omics_run_genomics_qc
+    args:
+      input_path: examples/omics/reads.fastq
+      input_type: fastq
+      output_dir: output/bgi_multiomics_demo/genomics_qc
+
+  - id: single_cell_10x_qc
+    tool: omics_run_single_cell_10x_qc
+    args:
+      matrix_mtx: examples/omics/tenx/matrix.mtx
+      barcodes_tsv: examples/omics/tenx/barcodes.tsv
+      features_tsv: examples/omics/tenx/features.tsv
+      output_dir: output/bgi_multiomics_demo/single_cell_10x_qc
+
+  - id: metagenomics_qc
+    tool: omics_run_metagenomics_qc
+    args:
+      abundance_csv: examples/omics/metagenome_abundance.csv
+      output_dir: output/bgi_multiomics_demo/metagenomics_qc
+      min_prevalence: 1
+
+  - id: evidence_search
+    tool: literature_search
+    depends_on:
+      - genomics_qc
+      - metagenomics_qc
+    args:
+      gene_ids:
+        - GeneA
+        - GeneB
+      provider: local
+      evidence_csv: examples/rnaseq/evidence.csv
+
+  - id: evidence_summary
+    tool: literature_summarize
+    depends_on:
+      - evidence_search
+    args:
+      evidence: ${evidence_search.result}
+
+  - id: knowledge_ingest
+    tool: knowledge_ingest_directory
+    depends_on:
+      - evidence_summary
+    args:
+      input_dir: examples/knowledge
+      output_path: output/bgi_multiomics_demo/knowledge_index.json
+
+  - id: knowledge_search
+    tool: knowledge_search
+    depends_on:
+      - knowledge_ingest
+    args:
+      query: multi-omics quality control evidence and mRNA sequence design
+      index_path: ${knowledge_ingest.result.output_path}
+      top_k: 3
+
+  - id: sequence_design
+    tool: sequence_pipeline
+    depends_on:
+      - knowledge_search
+    args:
+      protein: MKT
+      molecule: linear
+      method: greedy
+
+  - id: sequence_report
+    tool: sequence_report
+    depends_on:
+      - sequence_design
+    args:
+      result: ${sequence_design.result}
+      output_path: output/bgi_multiomics_demo/mrna_sequence_report.html
