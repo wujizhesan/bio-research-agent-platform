@@ -155,6 +155,31 @@ class FastApiAppTests(unittest.TestCase):
                 finally:
                     self._close_app(app)
 
+    def test_localhost_alias_is_allowed_by_cors(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_cors_') as raw:
+            env = {
+                'CADD_API_TOKEN': 'test-token',
+                'CORS_ORIGINS': 'http://localhost:5173,http://127.0.0.1:5173',
+            }
+            with patch.dict(os.environ, env, clear=False):
+                app = self._app(raw)
+                try:
+                    with TestClient(app) as client:
+                        response = client.get(
+                            '/api/v1/plugins',
+                            headers={
+                                'Authorization': 'Bearer test-token',
+                                'Origin': 'http://127.0.0.1:5173',
+                            },
+                        )
+                        self.assertEqual(response.status_code, 200)
+                        self.assertEqual(
+                            response.headers.get('access-control-allow-origin'),
+                            'http://127.0.0.1:5173',
+                        )
+                finally:
+                    self._close_app(app)
+
     def test_job_submission_and_persistence_read_model(self):
         with tempfile.TemporaryDirectory(prefix='fastapi_jobs_') as raw:
             app = self._app(raw)

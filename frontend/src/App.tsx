@@ -120,6 +120,18 @@ const domainLabels: Record<string, string> = {
   knowledge: 'Knowledge',
 }
 
+const terminalJobStatuses = new Set<Job['status']>(['completed', 'failed', 'cancelled'])
+
+function mergeJobState(previous: Job | undefined, next: Job) {
+  if (previous && terminalJobStatuses.has(previous.status) && !terminalJobStatuses.has(next.status)) return previous
+  return next
+}
+
+function mergeJobList(current: Job[], incoming: Job[]) {
+  const currentById = new Map(current.map((job) => [job.job_id, job]))
+  return incoming.map((job) => mergeJobState(currentById.get(job.job_id), job))
+}
+
 const domainIcons: Record<string, typeof Beaker> = {
   cadd: Beaker,
   omics: Activity,
@@ -271,7 +283,7 @@ function App() {
         apiFetch<{ jobs: Job[] }>(apiBase, token, '/api/v1/jobs?limit=8'),
       ])
       setPlugins(pluginPayload.plugins || [])
-      setJobs(jobPayload.jobs || [])
+      setJobs((current) => mergeJobList(current, jobPayload.jobs || []))
       setConnected(true)
     } catch (err) {
       setConnected(false)
