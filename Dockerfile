@@ -8,8 +8,13 @@ RUN python -m venv /opt/venv \
 
 FROM python:3.12-slim AS runtime
 
+ARG INSTALL_DESEQ2=0
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends samtools bcftools \
+    && if [ "$INSTALL_DESEQ2" = "1" ]; then \
+         apt-get install -y --no-install-recommends r-base r-bioc-deseq2; \
+       fi \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/opt/venv/bin:$PATH" \

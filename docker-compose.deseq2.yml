@@ -1,0 +1,10 @@
+services:
+  api:
+    build:
+      args:
+        INSTALL_DESEQ2: "1"
+
+  worker:
+    build:
+      args:
+        INSTALL_DESEQ2: "1"
