@@ -223,10 +223,13 @@ class ResearchAgentTests(unittest.TestCase):
             'report_path': 'output/test_bgi_multiomics_report.md',
         })
         self.assertEqual(result['status'], 'planned')
-        self.assertEqual(result['selected_domains'], ['omics', 'literature', 'knowledge', 'sequence'])
-        self.assertEqual(result['manifest']['completed_steps'], 10)
+        self.assertEqual(result['selected_domains'], ['omics', 'imaging', 'literature', 'knowledge', 'sequence'])
+        self.assertEqual(result['manifest']['completed_steps'], 11)
         self.assertEqual(result['manifest']['failed_steps'], 0)
         self.assertIn('knowledge_build_graph', {
+            step['tool'] for step in result['manifest']['steps']
+        })
+        self.assertIn('imaging_inspect_image', {
             step['tool'] for step in result['manifest']['steps']
         })
 

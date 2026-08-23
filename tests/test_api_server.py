@@ -26,7 +26,7 @@ class ApiServerTests(unittest.TestCase):
         status, payload = route_request('GET', '/plugins')
         self.assertEqual(status, 200)
         domains = {item['domain'] for item in payload['plugins']}
-        self.assertTrue({'cadd', 'omics', 'research', 'literature', 'knowledge'}.issubset(domains))
+        self.assertTrue({'cadd', 'omics', 'research', 'literature', 'knowledge', 'imaging'}.issubset(domains))
 
     def test_read_only_routes_do_not_initialize_legacy_job_manager(self):
         with patch.object(api_server, '_default_job_manager', side_effect=AssertionError('job manager should be lazy')):

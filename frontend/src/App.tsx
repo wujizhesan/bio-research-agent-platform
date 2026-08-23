@@ -136,6 +136,7 @@ const domainLabels: Record<string, string> = {
   sequence: 'mRNA / Sequence',
   literature: 'Literature',
   knowledge: 'Knowledge',
+  imaging: 'Imaging / Multimodal',
 }
 
 const terminalJobStatuses = new Set<Job['status']>(['completed', 'failed', 'cancelled'])
@@ -156,6 +157,7 @@ const domainIcons: Record<string, typeof Beaker> = {
   sequence: Dna,
   literature: FlaskConical,
   knowledge: Database,
+  imaging: FlaskConical,
   research: Workflow,
 }
 
@@ -828,6 +830,9 @@ function JobResultSummary({ job, onDownload }: { job: Job; onDownload: (path: st
   const genomicsStep = steps.find((step) => step.tool === 'omics_run_genomics_qc')
   const genomicsResult = genomicsStep?.result && typeof genomicsStep.result === 'object' && !Array.isArray(genomicsStep.result) ? genomicsStep.result as Record<string, unknown> : {}
   const genomicsMetrics = genomicsResult.metrics && typeof genomicsResult.metrics === 'object' && !Array.isArray(genomicsResult.metrics) ? genomicsResult.metrics as Record<string, unknown> : {}
+  const imageStep = steps.find((step) => step.tool === 'imaging_inspect_image')
+  const imageResult = imageStep?.result && typeof imageStep.result === 'object' && !Array.isArray(imageStep.result) ? imageStep.result as Record<string, unknown> : {}
+  const imageMetrics = imageResult.metrics && typeof imageResult.metrics === 'object' && !Array.isArray(imageResult.metrics) ? imageResult.metrics as Record<string, unknown> : {}
   const singleCellStep = steps.find((step) => step.tool === 'omics_run_single_cell_10x_qc')
   const singleCellResult = singleCellStep?.result && typeof singleCellStep.result === 'object' && !Array.isArray(singleCellStep.result) ? singleCellStep.result as Record<string, unknown> : {}
   const singleCellMetrics = singleCellResult.metrics && typeof singleCellResult.metrics === 'object' && !Array.isArray(singleCellResult.metrics) ? singleCellResult.metrics as Record<string, unknown> : {}
@@ -873,6 +878,10 @@ function JobResultSummary({ job, onDownload }: { job: Job; onDownload: (path: st
     fastq_reads: genomicsMetrics.reads,
     fastq_bases: genomicsMetrics.bases,
     fastq_manifest: genomicsResult.manifest_path,
+    image_format: imageMetrics.format,
+    image_dimensions: imageMetrics.width !== undefined && imageMetrics.height !== undefined ? `${imageMetrics.width}x${imageMetrics.height}` : undefined,
+    image_channels: imageMetrics.channels,
+    image_manifest: imageResult.manifest_path,
     single_cell_passed: singleCellMetrics.n_cells_passed,
     single_cell_metrics: singleCellOutputs.cell_metrics,
     metagenomics_taxa: metagenomicsMetrics.n_taxa_retained,
@@ -898,7 +907,7 @@ function JobResultSummary({ job, onDownload }: { job: Job; onDownload: (path: st
     cadd_report: caddResult.report,
   }
   const visible = Object.entries(summary).filter(([, value]) => value !== undefined && value !== null)
-  const artifactKeys = new Set(['output_csv', 'cadd_result_csv', 'manifest_path', 'report_path', 'cadd_report', 'fastq_manifest', 'single_cell_metrics', 'metagenomics_relative_abundance', 'metagenomics_sample_metrics', 'knowledge_index', 'knowledge_graph'])
+  const artifactKeys = new Set(['output_csv', 'cadd_result_csv', 'manifest_path', 'report_path', 'cadd_report', 'fastq_manifest', 'image_manifest', 'single_cell_metrics', 'metagenomics_relative_abundance', 'metagenomics_sample_metrics', 'knowledge_index', 'knowledge_graph'])
   const traceSteps = steps.map((step, index) => ({
     index: index + 1,
     id: typeof step.id === 'string' ? step.id : `step-${index + 1}`,

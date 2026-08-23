@@ -113,8 +113,8 @@ RESEARCH_PRESETS = {
     },
     'bgi_multiomics_demo': {
         'path': 'examples/workflows/bgi_multiomics_demo.yaml',
-        'domains': ['omics', 'literature', 'knowledge', 'sequence'],
-        'description': 'Reproducible BGI interview demo combining genomics QC, 10x single-cell QC, metagenomics abundance QC, evidence grounding and mRNA design.',
+        'domains': ['omics', 'imaging', 'literature', 'knowledge', 'sequence'],
+        'description': 'Reproducible BGI interview demo combining sequencing QC, microscopy image QC, evidence grounding, knowledge graph retrieval and mRNA design.',
     },
     'bgi_variant_demo': {
         'path': 'examples/workflows/bgi_variant_demo.yaml',

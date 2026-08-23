@@ -15,6 +15,13 @@ steps:
       features_tsv: examples/omics/tenx/features.tsv
       output_dir: output/bgi_multiomics_demo/single_cell_10x_qc
 
+  - id: image_qc
+    tool: imaging_inspect_image
+    args:
+      image_path: examples/omics/cell_microscopy.svg
+      output_dir: output/bgi_multiomics_demo/image_qc
+      modality: microscopy_demo
+
   - id: metagenomics_qc
     tool: omics_run_metagenomics_qc
     args:

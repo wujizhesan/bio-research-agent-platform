@@ -10,12 +10,14 @@ try:
     from . import research_agent as RESEARCH_PLUGIN
     from . import literature_plugin as LITERATURE_PLUGIN
     from . import knowledge_plugin as KNOWLEDGE_PLUGIN
+    from . import imaging_plugin as IMAGING_PLUGIN
 except ImportError:
     import agent as CADD_PLUGIN
     import omics_agent as OMICS_PLUGIN
     import research_agent as RESEARCH_PLUGIN
     import literature_plugin as LITERATURE_PLUGIN
     import knowledge_plugin as KNOWLEDGE_PLUGIN
+    import imaging_plugin as IMAGING_PLUGIN
 
 try:
     from .plugin_manifest import build_manifest
@@ -71,6 +73,7 @@ DOMAIN_TOOLS = {
     'research': validate_tool_map('research', RESEARCH_PLUGIN.TOOLS),
     'literature': validate_tool_map('literature', LITERATURE_PLUGIN.TOOLS),
     'knowledge': validate_tool_map('knowledge', KNOWLEDGE_PLUGIN.TOOLS),
+    'imaging': validate_tool_map('imaging', IMAGING_PLUGIN.TOOLS),
 }
 try:
     from . import sequence_plugin as SEQUENCE_PLUGIN
@@ -92,6 +95,7 @@ DOMAIN_SOURCES = {
     'research': RESEARCH_PLUGIN,
     'literature': LITERATURE_PLUGIN,
     'knowledge': KNOWLEDGE_PLUGIN,
+    'imaging': IMAGING_PLUGIN,
     'sequence': SEQUENCE_PLUGIN,
     **EXTERNAL_DOMAIN_SOURCES,
 }
@@ -130,6 +134,12 @@ DOMAIN_METADATA = {
     },
     'knowledge': {
         'name': 'Local scientific knowledge retrieval',
+        'kind': 'builtin_adapter',
+        'version': '0.1.0',
+        'status': 'available',
+    },
+    'imaging': {
+        'name': 'Microscopy and image QC',
         'kind': 'builtin_adapter',
         'version': '0.1.0',
         'status': 'available',
