@@ -15,7 +15,7 @@ import pandas as pd
 from scipy.stats import hypergeom, ttest_ind
 
 PLUGIN_NAME = 'RNA-seq and omics domain'
-PLUGIN_VERSION = '0.4.0'
+PLUGIN_VERSION = '0.5.0'
 PLUGIN_API_VERSION = 1
 PLUGIN_CAPABILITIES = (
     'omics.end_to_end',
@@ -26,13 +26,14 @@ PLUGIN_CAPABILITIES = (
     'omics.variant_annotation',
     'omics.variant_calling',
     'omics.variant_normalization',
+    'omics.gtf_annotation',
     'omics.toolchain',
     'omics.genomics_qc',
     'omics.single_cell_qc',
     'omics.metagenomics_qc',
 )
 STATISTICS_BACKENDS = ('auto', 'scipy', 'deseq2')
-VARIANT_ANNOTATION_BACKENDS = ('auto', 'local', 'vcf_ann')
+VARIANT_ANNOTATION_BACKENDS = ('auto', 'local', 'vcf_ann', 'gencode_gtf')
 TOOLCHAIN_EXECUTABLES = {
     'gatk': 'gatk',
     'samtools': 'samtools',
@@ -1221,6 +1222,70 @@ def _load_variant_annotations(annotation_csv):
     return annotation
 
 
+def _parse_gtf_attributes(text):
+    attributes = {}
+    for item in str(text or '').strip().strip(';').split(';'):
+        item = item.strip()
+        if not item:
+            continue
+        if '=' in item and ' ' not in item.split('=', 1)[0]:
+            key, value = item.split('=', 1)
+        else:
+            parts = item.split(None, 1)
+            if len(parts) != 2:
+                continue
+            key, value = parts
+        attributes[key.strip()] = value.strip().strip('"')
+    return attributes
+
+
+def _load_gencode_annotations(annotation_gtf):
+    annotation_gtf = Path(annotation_gtf)
+    if not annotation_gtf.is_file():
+        raise ValueError(f'GTF annotation does not exist: {annotation_gtf}')
+    opener = gzip.open if annotation_gtf.suffix.lower() == '.gz' else open
+    gene_rows = []
+    transcript_rows = []
+    with opener(annotation_gtf, 'rt', encoding='utf-8', errors='replace') as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.rstrip('\n\r')
+            if not line or line.startswith('#'):
+                continue
+            fields = line.split('\t')
+            if len(fields) != 9:
+                raise ValueError(f'GTF row {line_number} must contain 9 columns')
+            feature = fields[2].lower()
+            if feature not in {'gene', 'transcript'}:
+                continue
+            try:
+                start = int(fields[3])
+                end = int(fields[4])
+            except ValueError as exc:
+                raise ValueError(f'GTF row {line_number} has invalid coordinates') from exc
+            attributes = _parse_gtf_attributes(fields[8])
+            gene_id = attributes.get('gene_id') or attributes.get('gene') or attributes.get('ID')
+            if not gene_id:
+                continue
+            row = {
+                'chrom': fields[0],
+                'start': start,
+                'end': end,
+                'gene_id': gene_id,
+                'gene_name': attributes.get('gene_name') or attributes.get('Name', ''),
+                'gene_type': attributes.get('gene_type') or attributes.get('gene_biotype', ''),
+                'transcript_id': attributes.get('transcript_id') or attributes.get('transcript', ''),
+            }
+            (gene_rows if feature == 'gene' else transcript_rows).append(row)
+    rows = gene_rows or transcript_rows
+    if not rows:
+        raise ValueError('GTF annotation has no gene or transcript records with gene identifiers')
+    annotation = pd.DataFrame(rows)
+    annotation['chrom'] = annotation['chrom'].map(_normalize_chrom)
+    annotation['start'] = pd.to_numeric(annotation['start'], errors='raise').astype(int)
+    annotation['end'] = pd.to_numeric(annotation['end'], errors='raise').astype(int)
+    return annotation
+
+
 def _local_variant_matches(annotation, chrom, position):
     if annotation is None:
         return []
@@ -1233,11 +1298,20 @@ def _local_variant_matches(annotation, chrom, position):
 
 
 def annotate_variants(vcf_path, output_csv, annotation_csv=None,
-                      annotation_backend='auto'):
+                      annotation_backend='auto', annotation_gtf=None):
     requested = str(annotation_backend or 'auto').lower()
     if requested not in VARIANT_ANNOTATION_BACKENDS:
         raise ValueError(f'unknown variant annotation backend: {requested}')
-    annotation = _load_variant_annotations(annotation_csv)
+    if annotation_csv and annotation_gtf:
+        raise ValueError('provide only one of annotation_csv and annotation_gtf')
+    if annotation_gtf:
+        if requested == 'auto':
+            requested = 'gencode_gtf'
+        annotation = _load_gencode_annotations(annotation_gtf)
+    elif requested == 'gencode_gtf':
+        raise ValueError('gencode_gtf annotation requires annotation_gtf')
+    else:
+        annotation = _load_variant_annotations(annotation_csv)
     if requested == 'local' and annotation is None:
         raise ValueError('local variant annotation requires annotation_csv')
     rows = []
@@ -1294,6 +1368,8 @@ def annotate_variants(vcf_path, output_csv, annotation_csv=None,
                         'filter': record.get('FILTER', '.'),
                         'gene_id': ann['gene_id'],
                         'gene_name': ann['gene_name'],
+                        'transcript_id': '',
+                        'gene_type': '',
                         'effect': ann['effect'],
                         'impact': ann['impact'],
                         'annotation_source': 'vcf_ann',
@@ -1311,6 +1387,8 @@ def annotate_variants(vcf_path, output_csv, annotation_csv=None,
                         'filter': record.get('FILTER', '.'),
                         'gene_id': '',
                         'gene_name': '',
+                        'transcript_id': '',
+                        'gene_type': '',
                         'effect': '',
                         'impact': '',
                         'annotation_source': 'vcf_ann',
@@ -1318,7 +1396,8 @@ def annotate_variants(vcf_path, output_csv, annotation_csv=None,
                     })
                     continue
                 if matches:
-                    sources.add('local_interval')
+                    annotation_source = 'gencode_gtf' if requested == 'gencode_gtf' else 'local_interval'
+                    sources.add(annotation_source)
                     for match in matches:
                         rows.append({
                             'variant_id': variant_id,
@@ -1330,9 +1409,11 @@ def annotate_variants(vcf_path, output_csv, annotation_csv=None,
                             'filter': record.get('FILTER', '.'),
                             'gene_id': str(match['gene_id']),
                             'gene_name': str(match.get('gene_name', '')),
+                            'transcript_id': str(match.get('transcript_id', '')),
+                            'gene_type': str(match.get('gene_type', '')),
                             'effect': str(match.get('effect', '')),
                             'impact': str(match.get('impact', '')),
-                            'annotation_source': 'local_interval',
+                            'annotation_source': annotation_source,
                             'annotation_status': 'annotated',
                         })
                 else:
@@ -1346,6 +1427,8 @@ def annotate_variants(vcf_path, output_csv, annotation_csv=None,
                         'filter': record.get('FILTER', '.'),
                         'gene_id': '',
                         'gene_name': '',
+                        'transcript_id': '',
+                        'gene_type': '',
                         'effect': '',
                         'impact': '',
                         'annotation_source': 'none',
@@ -1355,7 +1438,7 @@ def annotate_variants(vcf_path, output_csv, annotation_csv=None,
         raise ValueError('VCF header is missing')
     result = pd.DataFrame(rows, columns=[
         'variant_id', 'chrom', 'pos', 'ref', 'alt', 'qual', 'filter',
-        'gene_id', 'gene_name', 'effect', 'impact', 'annotation_source',
+        'gene_id', 'gene_name', 'transcript_id', 'gene_type', 'effect', 'impact', 'annotation_source',
         'annotation_status',
     ])
     output_csv = Path(output_csv)
@@ -1559,11 +1642,12 @@ TOOLS = {
         'function': run_pathway_enrichment,
     },
     'annotate_variants': {
-        'description': 'Annotate VCF variants with VCF ANN records or a local genomic interval table and return traceable gene mappings.',
+        'description': 'Annotate VCF variants with VCF ANN records, a local interval table or GENCODE GTF gene coordinates and return traceable gene mappings.',
         'parameters': _parameters({
             'vcf_path': {'type': 'string'},
             'output_csv': {'type': 'string'},
             'annotation_csv': {'type': 'string'},
+            'annotation_gtf': {'type': 'string'},
             'annotation_backend': {'type': 'string', 'enum': list(VARIANT_ANNOTATION_BACKENDS)},
         }, required=('vcf_path', 'output_csv')),
         'function': annotate_variants,

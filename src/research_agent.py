@@ -204,12 +204,12 @@ def _is_variant_normalization_task(task, inputs=None):
 
 def _is_variant_annotation_task(task, inputs=None):
     inputs = inputs or {}
-    if inputs.get('annotation_csv') or inputs.get('annotation_backend'):
+    if inputs.get('annotation_csv') or inputs.get('annotation_gtf') or inputs.get('gencode_gtf') or inputs.get('annotation_backend'):
         return True
     text = str(task or '').lower()
     return any(keyword in text for keyword in (
         'variant annotation', 'annotate variant', 'variant interpretation',
-        'variant interpretation', '基因注释', '变异解读',
+        '基因注释', '变异解读',
     ))
 
 
@@ -264,8 +264,12 @@ def _required_inputs(domains, task=None, inputs=None):
                 {'name': 'vcf_path', 'description': 'input VCF/BCF variant file'},
                 {'name': 'reference_fasta', 'description': 'reference genome FASTA matching VCF alleles'},
             ])
-            if _is_variant_annotation_task(task, inputs) and (inputs or {}).get('annotation_backend', 'auto') != 'vcf_ann':
-                required.append({'name': 'annotation_csv', 'description': 'genomic interval annotation table'})
+            annotation_backend = (inputs or {}).get('annotation_backend', 'auto')
+            if _is_variant_annotation_task(task, inputs) and annotation_backend != 'vcf_ann':
+                if annotation_backend == 'gencode_gtf' or (inputs or {}).get('annotation_gtf'):
+                    required.append({'name': 'annotation_gtf', 'description': 'GENCODE GTF gene annotation file'})
+                else:
+                    required.append({'name': 'annotation_csv', 'description': 'genomic interval annotation table'})
         elif _is_variant_calling_task(task, inputs):
             required.extend([
                 {'name': 'bam_path', 'description': 'aligned BAM/CRAM file for variant calling'},
@@ -275,8 +279,12 @@ def _required_inputs(domains, task=None, inputs=None):
             required.append({'name': 'input_path', 'description': 'FASTQ, BAM/CRAM or VCF/BCF input file'})
         elif _is_variant_task(task, inputs):
             required.append({'name': 'vcf_path', 'description': 'VCF variant file'})
-            if (inputs or {}).get('annotation_backend', 'auto') != 'vcf_ann':
-                required.append({'name': 'annotation_csv', 'description': 'genomic interval annotation table'})
+            annotation_backend = (inputs or {}).get('annotation_backend', 'auto')
+            if annotation_backend != 'vcf_ann':
+                if annotation_backend == 'gencode_gtf' or (inputs or {}).get('annotation_gtf'):
+                    required.append({'name': 'annotation_gtf', 'description': 'GENCODE GTF gene annotation file'})
+                else:
+                    required.append({'name': 'annotation_csv', 'description': 'genomic interval annotation table'})
         else:
             required.extend([
                 {'name': 'expression_csv', 'description': 'gene-by-sample expression matrix'},
@@ -323,7 +331,7 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
     rationale = []
     omics_ready = False
     variant_ready = False
-    if evidence_provider == 'gencode' and not inputs.get('gencode_gtf'):
+    if evidence_provider == 'gencode' and not (inputs.get('gencode_gtf') or inputs.get('annotation_gtf')):
         missing.append('gencode_gtf')
 
     variant_task = _is_variant_task(task, inputs)
@@ -420,9 +428,12 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
             if _is_variant_annotation_task(task, inputs):
                 annotation_backend = str(inputs.get('annotation_backend', 'auto'))
                 annotation_csv = inputs.get('annotation_csv')
-                if annotation_backend != 'vcf_ann' and not annotation_csv:
+                annotation_gtf = inputs.get('annotation_gtf') or inputs.get('gencode_gtf')
+                if annotation_backend == 'gencode_gtf' and not annotation_gtf:
+                    missing.append('annotation_gtf')
+                elif annotation_backend not in {'vcf_ann', 'gencode_gtf'} and not annotation_csv and not annotation_gtf:
                     missing.append('annotation_csv')
-                if annotation_backend == 'vcf_ann' or annotation_csv:
+                if annotation_backend == 'vcf_ann' or annotation_csv or annotation_gtf:
                     annotation_args = {
                         'vcf_path': '${variant_normalization.output_vcf}',
                         'output_csv': str(inputs.get(
@@ -432,6 +443,8 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
                     }
                     if annotation_csv:
                         annotation_args['annotation_csv'] = str(annotation_csv)
+                    if annotation_gtf:
+                        annotation_args['annotation_gtf'] = str(annotation_gtf)
                     steps.append({
                         'id': 'variant_annotation',
                         'tool': 'omics_annotate_variants',
@@ -439,7 +452,7 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
                         'args': annotation_args,
                     })
                     variant_ready = True
-                    rationale.append('normalized variants are forwarded to the existing ANN or local genomic interval annotator')
+            rationale.append('normalized variants are forwarded to the existing ANN, GENCODE GTF or local genomic interval annotator')
     elif 'omics' in domains and variant_calling_task:
         bam_path = inputs.get('bam_path') or inputs.get('input_bam') or inputs.get('cram_path')
         reference_fasta = inputs.get('reference_fasta') or inputs.get('reference_path') or inputs.get('reference_genome')
@@ -495,11 +508,14 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
         vcf_path = inputs.get('vcf_path') or inputs.get('vcf') or inputs.get('variants_vcf')
         annotation_backend = str(inputs.get('annotation_backend', 'auto'))
         annotation_csv = inputs.get('annotation_csv')
+        annotation_gtf = inputs.get('annotation_gtf') or inputs.get('gencode_gtf')
         if not vcf_path:
             missing.append('vcf_path')
-        if annotation_backend != 'vcf_ann' and not annotation_csv:
+        if annotation_backend == 'gencode_gtf' and not annotation_gtf:
+            missing.append('annotation_gtf')
+        elif annotation_backend not in {'vcf_ann', 'gencode_gtf'} and not annotation_csv and not annotation_gtf:
             missing.append('annotation_csv')
-        if vcf_path and (annotation_backend == 'vcf_ann' or annotation_csv):
+        if vcf_path and (annotation_backend == 'vcf_ann' or annotation_csv or annotation_gtf):
             args = {
                 'vcf_path': str(vcf_path),
                 'output_csv': str(inputs.get(
@@ -509,13 +525,15 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
             }
             if annotation_csv:
                 args['annotation_csv'] = str(annotation_csv)
+            if annotation_gtf:
+                args['annotation_gtf'] = str(annotation_gtf)
             steps.append({
                 'id': 'variant_annotation',
                 'tool': 'omics_annotate_variants',
                 'args': args,
             })
             variant_ready = True
-            rationale.append('variant annotation uses VCF ANN records or a local genomic interval table')
+            rationale.append('variant annotation uses VCF ANN records, GENCODE GTF coordinates or a local genomic interval table')
     elif 'omics' in domains:
         omics_required = ('expression_csv', 'metadata_csv', 'gene_sets_csv')
         missing.extend(key for key in omics_required if not inputs.get(key))
@@ -558,8 +576,8 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
             search_args['cache_dir'] = str(inputs['evidence_cache_dir'])
         if inputs.get('genome'):
             search_args['genome'] = str(inputs['genome'])
-        if inputs.get('gencode_gtf'):
-            search_args['gencode_gtf'] = str(inputs['gencode_gtf'])
+        if inputs.get('gencode_gtf') or inputs.get('annotation_gtf'):
+            search_args['gencode_gtf'] = str(inputs.get('gencode_gtf') or inputs['annotation_gtf'])
         steps.extend([
             {
                 'id': 'variant_evidence_search',
@@ -589,8 +607,8 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
                 search_args['cache_dir'] = str(inputs['evidence_cache_dir'])
             if inputs.get('genome'):
                 search_args['genome'] = str(inputs['genome'])
-            if inputs.get('gencode_gtf'):
-                search_args['gencode_gtf'] = str(inputs['gencode_gtf'])
+            if inputs.get('gencode_gtf') or inputs.get('annotation_gtf'):
+                search_args['gencode_gtf'] = str(inputs.get('gencode_gtf') or inputs['annotation_gtf'])
             steps.extend([
                 {
                     'id': 'literature_search',

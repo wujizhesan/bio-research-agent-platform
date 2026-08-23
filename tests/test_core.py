@@ -478,6 +478,30 @@ class CoreTests(unittest.TestCase):
             self.assertIn('gatk', toolchain_status())
             self.assertIn('annotate_variants', OMICS_TOOLS)
 
+    def test_variant_annotation_reads_gencode_gtf_coordinates(self):
+        with tempfile.TemporaryDirectory(prefix='cadd_gencode_variant_') as raw:
+            root = Path(raw)
+            gtf_path = root / 'genes.gtf'
+            output_csv = root / 'variant_annotation.csv'
+            gtf_path.write_text(
+                '##gff-version 3\n'
+                '1\tsource\tgene\t90\t150\t.\t+\t.\tgene_id "GeneA"; gene_name "Gene A"; gene_type "protein_coding";\n'
+                '1\tsource\tgene\t200\t300\t.\t-\t.\tgene_id "GeneB"; gene_name "Gene B"; gene_type "lncRNA";\n',
+                encoding='utf-8',
+            )
+            result = annotate_variants(
+                'examples/variants/variants.vcf',
+                output_csv,
+                annotation_backend='gencode_gtf',
+                annotation_gtf=gtf_path,
+            )
+            annotated = pd.read_csv(output_csv)
+        self.assertEqual(result['backend'], 'gencode_gtf')
+        self.assertEqual(result['n_annotated'], 2)
+        self.assertEqual(set(annotated['gene_id'].dropna()), {'GeneA', 'GeneB'})
+        self.assertEqual(annotated.loc[annotated['gene_id'] == 'GeneA', 'gene_type'].iloc[0], 'protein_coding')
+        self.assertIn('transcript_id', annotated.columns)
+
     def test_fastq_genomics_qc_is_reproducible(self):
         with tempfile.TemporaryDirectory(prefix='cadd_fastq_qc_') as raw:
             root = Path(raw)

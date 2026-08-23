@@ -183,6 +183,38 @@ class ResearchAgentTests(unittest.TestCase):
         )
         self.assertEqual(result['workflow']['steps'][1]['depends_on'], ['variant_normalization'])
 
+    def test_research_planner_supports_gencode_gtf_variant_annotation(self):
+        result = run_tool('research_build_workflow', {
+            'task': 'Annotate VCF variants with GENCODE gene coordinates',
+            'domains': ['omics'],
+            'inputs': {
+                'vcf_path': 'data/raw.vcf',
+                'annotation_backend': 'gencode_gtf',
+                'annotation_gtf': 'data/gencode.gtf.gz',
+            },
+        })
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['selected_tools'], ['omics_annotate_variants'])
+        self.assertEqual(
+            result['workflow']['steps'][0]['args']['annotation_gtf'],
+            'data/gencode.gtf.gz',
+        )
+
+        evidence_result = run_tool('research_build_workflow', {
+            'task': 'Annotate VCF variants with GENCODE and retrieve gene evidence',
+            'domains': ['omics', 'literature'],
+            'inputs': {
+                'vcf_path': 'data/raw.vcf',
+                'annotation_backend': 'gencode_gtf',
+                'annotation_gtf': 'data/gencode.gtf.gz',
+            },
+        })
+        self.assertTrue(evidence_result['ready'])
+        self.assertEqual(
+            evidence_result['workflow']['steps'][1]['args']['gencode_gtf'],
+            'data/gencode.gtf.gz',
+        )
+
     def test_research_planner_builds_single_cell_qc_workflow(self):
         result = run_tool('research_build_workflow', {
             'task': '分析单细胞 RNA-seq 表达矩阵并进行 QC',
