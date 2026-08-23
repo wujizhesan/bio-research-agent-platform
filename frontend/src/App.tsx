@@ -560,6 +560,21 @@ function App() {
     }
   }
 
+  async function submitBgiMultiomicsDemo() {
+    setResearchPlan(null)
+    await submitToolJob(
+      'research_run_preset',
+      {
+        preset: 'bgi_multiomics_demo',
+        dry_run: false,
+        output_path: 'output/frontend_bgi_multiomics_demo/workflow_manifest.json',
+        report_path: 'output/frontend_bgi_multiomics_demo/workflow_report.md',
+        continue_on_error: false,
+      },
+      'BGI multi-omics demo queued',
+    )
+  }
+
   async function cancelSelectedJob() {
     if (!selectedJob || !['queued', 'running'].includes(selectedJob.status) || selectedJob.cancel_requested) return
     setError('')
@@ -657,6 +672,7 @@ function App() {
                   <Metric label="LIVE RUNS" value={String(runningJobs).padStart(2, '0')} icon={<Radio size={14} />} />
                 </div>
               </section>
+              <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#3f527c] bg-[#111d32]/80 px-5 py-4"><div><div className="font-mono text-[10px] tracking-[0.16em] text-[#9cb9ff]">INTERVIEW DEMO / BGI MULTI-OMICS</div><div className="mt-1 text-sm text-[#b9c8e8]">Genomics QC → 10x single-cell → microbiome → evidence → mRNA</div></div><button aria-label="Run BGI multi-omics demo" onClick={() => void submitBgiMultiomicsDemo()} disabled={loading} className="rounded-lg bg-[#aebfff] px-3 py-2 text-xs font-semibold text-[#111a34] transition hover:bg-[#c4d0ff] disabled:cursor-not-allowed disabled:opacity-50">Run BGI Demo</button></div>
 
               <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#28524b] bg-[#102b2a]/70 px-5 py-4"><div><div className="font-mono text-[10px] tracking-[0.16em] text-[#8fe5c1]">INTERVIEW DEMO / RNA-SEQ AGENT</div><div className="mt-1 text-sm text-[#b4cdc6]">差异表达 → 通路富集 → 基因证据 → 可追溯报告</div></div><button onClick={() => void submitOmicsDemo()} disabled={loading} className="rounded-lg bg-[#8fe5c1] px-3 py-2 text-xs font-semibold text-[#092521] transition hover:bg-[#b8f4d8] disabled:cursor-not-allowed disabled:opacity-50">运行 RNA-seq Agent</button></div>
 
