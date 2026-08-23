@@ -4,10 +4,12 @@ import argparse
 import json
 import os
 import asyncio
+import secrets
 from pathlib import Path
-from time import monotonic
+from time import monotonic, time
 from typing import Any
 
+import jwt
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -164,6 +166,12 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
     app.state.file_storage = storage
     app.state.audit_log = audit
     app.state.auth_service = auth
+    stream_ticket_secret = auth.jwt_secret or secrets.token_urlsafe(32)
+    stream_ticket_issuer = f'{auth.issuer}:sse'
+    try:
+        stream_ticket_ttl = max(min(int(os.environ.get('SSE_TICKET_TTL_SECONDS', '60')), 300), 10)
+    except ValueError:
+        stream_ticket_ttl = 60
     origins = [item.strip() for item in os.environ.get(
         'CORS_ORIGINS',
         'http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174',
@@ -209,6 +217,45 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='insufficient permissions')
             return principal
         return dependency
+
+    def issue_stream_ticket(job_id, principal):
+        now = int(time())
+        payload = {
+            'sub': principal.subject,
+            'roles': list(principal.roles),
+            'job_id': job_id,
+            'purpose': 'job-events',
+            'iat': now,
+            'exp': now + stream_ticket_ttl,
+            'iss': stream_ticket_issuer,
+        }
+        return jwt.encode(payload, stream_ticket_secret, algorithm='HS256')
+
+    async def stream_principal(
+        job_id: str,
+        ticket: str | None = Query(default=None, min_length=1),
+        token: str | None = Depends(oauth2_scheme),
+    ):
+        if ticket:
+            try:
+                payload = jwt.decode(
+                    ticket,
+                    stream_ticket_secret,
+                    algorithms=['HS256'],
+                    issuer=stream_ticket_issuer,
+                    options={'require': ['exp', 'iat', 'iss', 'sub', 'job_id', 'purpose']},
+                )
+            except jwt.PyJWTError as exc:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='invalid stream ticket') from exc
+            roles = payload.get('roles', [])
+            if payload.get('purpose') != 'job-events' or payload.get('job_id') != job_id or not isinstance(roles, list):
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='invalid stream ticket')
+            principal = Principal(str(payload['sub']), tuple(roles), 'sse_ticket')
+        else:
+            principal = await current_principal(token)
+        if not auth.has_permission(principal, 'jobs:read'):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='insufficient permissions')
+        return principal
 
     @app.get('/health', tags=['system'])
     async def health():
@@ -363,6 +410,19 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
             raise HTTPException(status_code=404, detail=f'job not found: {job_id}')
         return {'status': 'ok', 'job': record}
 
+    @app.post('/api/v1/jobs/{job_id}/events/ticket', tags=['jobs'])
+    async def job_events_ticket(
+        job_id: str,
+        principal: Principal = Depends(require_permission('jobs:read')),
+    ):
+        if await read_job(job_id) is None:
+            raise HTTPException(status_code=404, detail=f'job not found: {job_id}')
+        return {
+            'status': 'ok',
+            'ticket': issue_stream_ticket(job_id, principal),
+            'expires_in': stream_ticket_ttl,
+        }
+
     @app.get('/api/v1/jobs/{job_id}/artifacts', tags=['jobs'])
     async def download_job_artifact(
         job_id: str,
@@ -382,11 +442,12 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         audit.record(principal, 'job.artifact_download', 'job', job_id, {'filename': target.name})
         return FileResponse(target, filename=target.name, headers={'X-Job-ID': job_id})
 
-    @app.get('/api/v1/jobs/{job_id}/events', dependencies=[Depends(require_permission('jobs:read'))], tags=['jobs'])
+    @app.get('/api/v1/jobs/{job_id}/events', tags=['jobs'])
     async def job_events(
         job_id: str,
         interval_seconds: float = Query(default=0.2, ge=0.05, le=5),
         timeout_seconds: float = Query(default=60, ge=1, le=300),
+        principal: Principal = Depends(stream_principal),
     ):
         if await read_job(job_id) is None:
             raise HTTPException(status_code=404, detail=f'job not found: {job_id}')

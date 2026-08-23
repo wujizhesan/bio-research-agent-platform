@@ -297,6 +297,35 @@ class FastApiAppTests(unittest.TestCase):
             finally:
                 self._close_app(app)
 
+    def test_job_events_ticket_authenticates_native_eventsource_stream(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_event_ticket_') as raw:
+            app = self._app(raw)
+            try:
+                with TestClient(app) as client:
+                    response = client.post('/api/v1/jobs', json={'tool': 'research_catalog', 'arguments': {}})
+                    job_id = response.json()['job']['job_id']
+                    ticket_response = client.post(f'/api/v1/jobs/{job_id}/events/ticket')
+                    self.assertEqual(ticket_response.status_code, 200)
+                    ticket_payload = ticket_response.json()
+                    self.assertEqual(ticket_payload['expires_in'], 60)
+                    with client.stream(
+                        'GET',
+                        f'/api/v1/jobs/{job_id}/events',
+                        params={'ticket': ticket_payload['ticket']},
+                    ) as events:
+                        body = ''.join(events.iter_text())
+                    self.assertEqual(events.status_code, 200)
+                    self.assertIn('event: job', body)
+                    self.assertEqual(
+                        client.get(
+                            f'/api/v1/jobs/{job_id}/events',
+                            params={'ticket': 'invalid-ticket'},
+                        ).status_code,
+                        401,
+                    )
+            finally:
+                self._close_app(app)
+
     def test_job_events_returns_not_found(self):
         with tempfile.TemporaryDirectory(prefix='fastapi_events_missing_') as raw:
             app = self._app(raw)

@@ -175,6 +175,8 @@ async function uploadFile(base: string, token: string, file: File): Promise<Uplo
 
 type JobEventPayload = { job?: Job; status?: string; error?: string }
 
+type EventTicketPayload = { ticket: string; expires_in: number }
+
 async function readJobStream(
   base: string,
   token: string,
@@ -182,29 +184,46 @@ async function readJobStream(
   onEvent: (type: string, payload: JobEventPayload) => void,
   signal?: AbortSignal,
 ) {
-  const response = await fetch(`${base}/api/v1/jobs/${jobId}/events?interval_seconds=0.15&timeout_seconds=300`, {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  const ticketPayload = await apiFetch<EventTicketPayload>(base, token, `/api/v1/jobs/${jobId}/events/ticket`, {
+    method: 'POST',
     signal,
   })
-  if (!response.ok || !response.body) {
-    throw new Error(`无法订阅任务流: ${response.status}`)
-  }
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-  while (true) {
-    const { value, done } = await reader.read()
-    buffer += decoder.decode(value || new Uint8Array(), { stream: !done })
-    const chunks = buffer.split('\n\n')
-    buffer = chunks.pop() || ''
-    for (const chunk of chunks) {
-      const lines = chunk.split('\n').map((line) => line.replace(/\r$/, ''))
-      const type = lines.find((line) => line.startsWith('event:'))?.slice(6).trim() || 'message'
-      const data = lines.filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n')
-      if (data) onEvent(type, JSON.parse(data))
+  await new Promise<void>((resolve, reject) => {
+    const source = new EventSource(`${base}/api/v1/jobs/${jobId}/events?ticket=${encodeURIComponent(ticketPayload.ticket)}&interval_seconds=0.15&timeout_seconds=300`)
+    let settled = false
+    const cleanup = () => {
+      source.close()
+      signal?.removeEventListener('abort', handleAbort)
     }
-    if (done) break
-  }
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      callback()
+    }
+    const handleAbort = () => {
+      const error = new Error('任务流已取消')
+      error.name = 'AbortError'
+      finish(() => reject(error))
+    }
+    const handleJob = (event: MessageEvent<string>) => {
+      try {
+        const payload = JSON.parse(event.data) as JobEventPayload
+        onEvent('job', payload)
+        if (payload.job && terminalJobStatuses.has(payload.job.status)) finish(resolve)
+      } catch {
+        finish(() => reject(new Error('任务流消息格式无效')))
+      }
+    }
+    const handleError = () => {
+      if (settled) return
+      const error = new Error('任务 SSE 连接断开')
+      finish(() => reject(error))
+    }
+    signal?.addEventListener('abort', handleAbort, { once: true })
+    source.addEventListener('job', handleJob)
+    source.onerror = handleError
+  })
 }
 
 async function followJob(
