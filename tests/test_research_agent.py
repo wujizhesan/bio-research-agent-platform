@@ -166,6 +166,23 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(result['selected_domains'], ['omics', 'literature'])
         self.assertEqual(result['manifest']['completed_steps'], 3)
 
+    def test_cadd_planner_preserves_demo_runtime_controls(self):
+        result = run_tool('research_plan', {
+            'task': 'Run a reproducible CADD virtual screening workflow',
+            'domains': ['cadd'],
+            'inputs': {
+                'receptor': 'src/agent.py',
+                'ligand_library': 'examples/rnaseq/expression.csv',
+                'max_ligands': 3,
+                'exhaustiveness': 4,
+            },
+        })
+        self.assertTrue(result['execution']['ready'])
+        step = result['execution']['workflow']['steps'][0]
+        self.assertEqual(step['tool'], 'cadd_run_screening')
+        self.assertEqual(step['args']['max_ligands'], 3)
+        self.assertEqual(step['args']['exhaustiveness'], 4)
+
 
 if __name__ == '__main__':
     unittest.main()

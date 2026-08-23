@@ -75,7 +75,7 @@ type ResearchPlan = {
   execution: ResearchPlanExecution
 }
 
-type ResearchFileSlot = 'expression' | 'metadata' | 'gene_sets' | 'vcf' | 'annotation'
+type ResearchFileSlot = 'expression' | 'metadata' | 'gene_sets' | 'vcf' | 'annotation' | 'receptor' | 'ligand_library'
 
 type UploadedFile = {
   file_id: string
@@ -88,7 +88,7 @@ type UploadedFile = {
 }
 
 type View = 'workspace' | 'domains'
-type RunMode = 'research' | 'variant' | 'sequence'
+type RunMode = 'research' | 'variant' | 'sequence' | 'cadd'
 
 const runtimeApiBase = new URLSearchParams(window.location.search).get('api') || ''
 const defaultApiBase = runtimeApiBase || import.meta.env.VITE_API_BASE_URL || (
@@ -256,7 +256,9 @@ function App() {
   const [protein, setProtein] = useState('MKT')
   const [evidenceProvider, setEvidenceProvider] = useState('local')
   const [variantBackend, setVariantBackend] = useState('auto')
-  const [uploadedFiles, setUploadedFiles] = useState<Record<ResearchFileSlot, UploadedFile | null>>({ expression: null, metadata: null, gene_sets: null, vcf: null, annotation: null })
+  const [caddExhaustiveness, setCaddExhaustiveness] = useState('4')
+  const [caddMaxLigands, setCaddMaxLigands] = useState('3')
+  const [uploadedFiles, setUploadedFiles] = useState<Record<ResearchFileSlot, UploadedFile | null>>({ expression: null, metadata: null, gene_sets: null, vcf: null, annotation: null, receptor: null, ligand_library: null })
   const [uploadingFile, setUploadingFile] = useState<ResearchFileSlot | ''>('')
   const [researchPlan, setResearchPlan] = useState<ResearchPlan | null>(null)
   const [loading, setLoading] = useState(false)
@@ -324,6 +326,16 @@ function App() {
       evidence_csv: 'examples/rnaseq/evidence.csv',
       evidence_provider: 'local',
       output_dir: 'output/frontend_variant_research',
+    }
+  }
+
+  function buildCaddInputs() {
+    return {
+      receptor: uploadedFiles.receptor?.path || 'data/4hjo.pdb',
+      ligand_library: uploadedFiles.ligand_library?.path || 'output/bindingdb_egfr_10000.csv',
+      exhaustiveness: Number(caddExhaustiveness) || 4,
+      max_ligands: Number(caddMaxLigands) || 3,
+      output_dir: 'output/frontend_cadd_research',
     }
   }
 
@@ -439,6 +451,19 @@ function App() {
       )
       return
     }
+    if (mode === 'cadd') {
+      setResearchPlan(null)
+      await submitToolJob(
+        'research_plan',
+        {
+          task: 'Run a reproducible CADD virtual screening workflow and prioritize docking hits',
+          domains: ['cadd'],
+          inputs: buildCaddInputs(),
+        },
+        'CADD screening plan queued for review',
+        (job) => setResearchPlan(extractResearchPlan(job)),
+      )
+    }
   }
 
   async function executeResearchPlan() {
@@ -448,7 +473,9 @@ function App() {
       ? 'output/frontend_variant_research'
       : mode === 'sequence'
         ? 'output/frontend_sequence_research'
-        : 'output/frontend_auto_research'
+        : mode === 'cadd'
+          ? 'output/frontend_cadd_research'
+          : 'output/frontend_auto_research'
     await submitToolJob(
       'research_execute',
       {
@@ -591,7 +618,7 @@ function App() {
               <section className="grid gap-5 xl:grid-cols-[1.08fr_0.92fr]">
                 <div className="panel p-5 sm:p-6">
                   <div className="flex items-start justify-between gap-4"><div><div className="eyebrow">01 / START A RUN</div><h2 className="mt-2 text-xl font-semibold">启动一条研究路径</h2></div><div className="rounded-xl border border-[#21443f] bg-[#102b2a] p-2.5 text-[#8fe5c1]"><Play size={17} /></div></div>
-                  <div className="mt-7 grid grid-cols-3 gap-1 rounded-xl bg-[#071719] p-1"><button onClick={() => setMode('research')} className={`mode-tab ${mode === 'research' ? 'mode-tab-active' : ''}`}><Workflow size={14} />研究规划</button><button onClick={() => setMode('variant')} className={`mode-tab ${mode === 'variant' ? 'mode-tab-active' : ''}`}><GitBranch size={14} />VCF 变异</button><button onClick={() => setMode('sequence')} className={`mode-tab ${mode === 'sequence' ? 'mode-tab-active' : ''}`}><Dna size={14} />mRNA 设计</button></div>
+                  <div className="mt-7 grid grid-cols-2 gap-1 rounded-xl bg-[#071719] p-1 sm:grid-cols-4"><button onClick={() => setMode('research')} className={`mode-tab ${mode === 'research' ? 'mode-tab-active' : ''}`}><Workflow size={14} />研究规划</button><button onClick={() => setMode('variant')} className={`mode-tab ${mode === 'variant' ? 'mode-tab-active' : ''}`}><GitBranch size={14} />VCF 变异</button><button onClick={() => setMode('sequence')} className={`mode-tab ${mode === 'sequence' ? 'mode-tab-active' : ''}`}><Dna size={14} />mRNA 设计</button><button onClick={() => setMode('cadd')} className={`mode-tab ${mode === 'cadd' ? 'mode-tab-active' : ''}`}><Beaker size={14} />CADD 对接</button></div>
                   {mode === 'research' ? <>
                     <label className="mt-6 block"><span className="field-label">科学问题</span><textarea value={task} onChange={(event) => { setTask(event.target.value); setResearchPlan(null) }} rows={4} className="input-area" placeholder="描述你希望 Agent 协助完成的研究任务" /></label>
                     <div className="mt-5 grid gap-4 sm:grid-cols-[1fr_0.8fr]">
@@ -612,8 +639,13 @@ function App() {
                     </div>
                     <div className="mt-5"><label className="field-label" htmlFor="variant-backend">Annotation backend</label><select id="variant-backend" value={variantBackend} onChange={(event) => { setVariantBackend(event.target.value); setResearchPlan(null) }} className="input-control"><option value="auto">Auto: VCF ANN → local interval</option><option value="vcf_ann">VCF ANN only</option><option value="local">Local interval table</option></select></div>
                     <p className="mt-3 text-xs leading-5 text-[#688983]">The demo uses reproducible fixtures when no files are uploaded. Results retain annotation source and external tool availability.</p>
-                  </> : <label className="mt-6 block"><span className="field-label">Protein sequence</span><input value={protein} onChange={(event) => setProtein(event.target.value.toUpperCase())} className="input-control tracking-[0.18em] font-mono" placeholder="例如 MKT" /><span className="mt-2 block text-xs text-[#688983]">内置确定性后端将执行 optimize → score → verify。</span></label>}
-                  <div className="mt-6 flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2 font-mono text-[10px] text-[#66847e]"><CircleDot size={13} className="text-[#70e3ad]" />ASYNC / TRACEABLE / REPLAYABLE</div><button onClick={submitRun} disabled={loading || (mode === 'research' ? !task.trim() : mode === 'variant' ? !variantTask.trim() : !protein.trim())} className="group inline-flex items-center gap-2 rounded-xl bg-[#a8f0d2] px-4 py-2.5 text-sm font-semibold text-[#092521] transition hover:bg-[#c6f8e1] disabled:cursor-not-allowed disabled:opacity-50">{loading ? <RefreshCw size={15} className="animate-spin" /> : <Play size={15} />}{loading ? '执行中…' : '开始运行'}<ArrowUpRight size={14} className="transition group-hover:translate-x-0.5 group-hover:-translate-y-0.5" /></button></div>
+                  </> : mode === 'sequence' ? <label className="mt-6 block"><span className="field-label">Protein sequence</span><input value={protein} onChange={(event) => { setProtein(event.target.value.toUpperCase()); setResearchPlan(null) }} className="input-control tracking-[0.18em] font-mono" placeholder="例如 MKT" /><span className="mt-2 block text-xs text-[#688983]">内置确定性后端将执行 optimize → score → verify。</span></label> : <>
+                    <label className="mt-6 block"><span className="field-label">CADD screening task</span><textarea value="Run a reproducible CADD virtual screening workflow and prioritize docking hits" readOnly rows={3} className="input-area" /></label>
+                    <div className="mt-5 grid gap-3 sm:grid-cols-2"><ResearchFileField id="receptor-file" label="受体结构 PDB / PDBQT" accept=".pdb,.pdbqt,text/plain" file={uploadedFiles.receptor} uploading={uploadingFile === 'receptor'} onChange={(file) => void handleResearchFileUpload('receptor', file)} /><ResearchFileField id="ligand-library-file" label="外部分子数据集 CSV" accept=".csv,.tsv,text/csv,text/tab-separated-values" file={uploadedFiles.ligand_library} uploading={uploadingFile === 'ligand_library'} onChange={(file) => void handleResearchFileUpload('ligand_library', file)} /></div>
+                    <div className="mt-5 grid gap-4 sm:grid-cols-2"><div><label className="field-label" htmlFor="cadd-max-ligands">演示候选数</label><input id="cadd-max-ligands" type="number" min="1" max="17" value={caddMaxLigands} onChange={(event) => { setCaddMaxLigands(event.target.value); setResearchPlan(null) }} className="input-control font-mono" /><span className="mt-2 block text-xs text-[#688983]">完整筛选可调到 17，演示建议 3。</span></div><div><label className="field-label" htmlFor="cadd-exhaustiveness">Vina exhaustiveness</label><input id="cadd-exhaustiveness" type="number" min="1" max="32" value={caddExhaustiveness} onChange={(event) => { setCaddExhaustiveness(event.target.value); setResearchPlan(null) }} className="input-control font-mono" /><span className="mt-2 block text-xs text-[#688983]">数值越高越稳定，但运行时间更长。</span></div></div>
+                    <p className="mt-3 text-xs leading-5 text-[#688983]">CADD 入口会记录受体、数据集、Vina 参数与结果报告。Docker 优先读取本机挂载的 data/4hjo.pdb 和 output/bindingdb_egfr_10000.csv，也支持上传替换。</p>
+                  </>}
+                  <div className="mt-6 flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2 font-mono text-[10px] text-[#66847e]"><CircleDot size={13} className="text-[#70e3ad]" />ASYNC / TRACEABLE / REPLAYABLE</div><button onClick={submitRun} disabled={loading || (mode === 'research' ? !task.trim() : mode === 'variant' ? !variantTask.trim() : mode === 'sequence' ? !protein.trim() : false)} className="group inline-flex items-center gap-2 rounded-xl bg-[#a8f0d2] px-4 py-2.5 text-sm font-semibold text-[#092521] transition hover:bg-[#c6f8e1] disabled:cursor-not-allowed disabled:opacity-50">{loading ? <RefreshCw size={15} className="animate-spin" /> : <Play size={15} />}{loading ? '执行中…' : '开始运行'}<ArrowUpRight size={14} className="transition group-hover:translate-x-0.5 group-hover:-translate-y-0.5" /></button></div>
                 </div>
 
                 <div className="panel flex min-h-[326px] flex-col p-5 sm:p-6"><div className="flex items-start justify-between"><div><div className="eyebrow">02 / EXECUTION STREAM</div><h2 className="mt-2 text-xl font-semibold">实时执行轨迹</h2></div><div className="flex items-center gap-1.5 rounded-full border border-[#28524b] bg-[#102b2a] px-2.5 py-1 font-mono text-[10px] text-[#8fe5c1]"><span className="size-1.5 animate-pulse rounded-full bg-[#70e3ad]" />SSE</div></div>{selectedJob ? <div className="mt-7 flex flex-1 flex-col"><div className="flex items-center justify-between border-b border-white/10 pb-4"><div><div className="font-mono text-[11px] text-[#6f9189]">{formatJobId(selectedJob.job_id)}</div><div className="mt-1 text-sm font-medium">{selectedJob.tool}</div></div><StatusBadge status={selectedJob.status} /></div><div className="mt-5 space-y-3">{events.slice(-4).map((event, index) => <div key={`${event.at}-${index}`} className="flex items-start gap-3 text-xs"><div className="mt-1.5 size-1.5 rounded-full bg-[#83e3bc] shadow-[0_0_12px_#83e3bc]" /><div className="min-w-0 flex-1"><div className="text-[#b2cbc4]">{event.detail}</div><div className="mt-1 font-mono text-[10px] text-[#5f7c76]">{event.at} · {event.status}</div></div></div>)}</div><div className="mt-auto flex items-center gap-2 pt-5 font-mono text-[10px] text-[#64827b]"><Clock3 size={13} />{selectedJob.status === 'completed' ? `完成于 ${formatTime(selectedJob.finished_at)}` : '等待状态更新…'}</div></div> : <EmptyStream />}</div>
@@ -621,7 +653,7 @@ function App() {
 
               {selectedJob?.status === 'completed' && <JobResultSummary job={selectedJob} />}
 
-              {(mode === 'research' || mode === 'variant' || mode === 'sequence') && selectedJob?.tool !== 'research_execute' && <ResearchPlanCard plan={researchPlan} loading={loading && selectedJob?.tool === 'research_plan'} onExecute={() => void executeResearchPlan()} />}
+              {(mode === 'research' || mode === 'variant' || mode === 'sequence' || mode === 'cadd') && selectedJob?.tool !== 'research_execute' && <ResearchPlanCard plan={researchPlan} loading={loading && selectedJob?.tool === 'research_plan'} onExecute={() => void executeResearchPlan()} />}
 
               <section className="panel mt-5 overflow-hidden"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-5 py-5 sm:px-6"><div><div className="eyebrow">03 / RECENT RUNS</div><h2 className="mt-2 text-xl font-semibold">最近任务</h2></div><button onClick={() => void refresh()} className="inline-flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-xs text-[#9bb7b0] transition hover:border-[#4f8c7d] hover:text-[#d6eee7]"><RefreshCw size={13} />刷新</button></div>{jobs.length ? <div className="overflow-x-auto"><table className="w-full min-w-[680px] text-left text-sm"><thead className="bg-white/[0.025] font-mono text-[10px] tracking-[0.12em] text-[#63817b]"><tr><th className="px-5 py-3 font-normal sm:px-6">TASK ID</th><th className="px-5 py-3 font-normal">TOOL</th><th className="px-5 py-3 font-normal">STATUS</th><th className="px-5 py-3 font-normal">CREATED</th><th className="px-5 py-3 font-normal" /></tr></thead><tbody>{jobs.map((job) => <tr key={job.job_id} onClick={() => { setSelectedJob(job); setEvents([]) }} className="cursor-pointer border-t border-white/[0.06] transition hover:bg-white/[0.035]"><td className="px-5 py-4 font-mono text-xs text-[#81aaa1] sm:px-6">{formatJobId(job.job_id)}</td><td className="px-5 py-4 font-medium text-[#c7ddd7]">{job.tool}</td><td className="px-5 py-4"><StatusBadge status={job.status} /></td><td className="px-5 py-4 font-mono text-xs text-[#66837d]">{formatTime(job.created_at)}</td><td className="px-5 py-4 text-right text-[#6b8f87]"><ChevronRight size={15} /></td></tr>)}</tbody></table></div> : <div className="px-6 py-12 text-center text-sm text-[#66837d]">还没有运行记录，先启动一条研究路径。</div>}</section>
             </>
@@ -696,6 +728,8 @@ function JobResultSummary({ job }: { job: Job }) {
   const differential = omicsResult.differential_expression && typeof omicsResult.differential_expression === 'object' && !Array.isArray(omicsResult.differential_expression) ? omicsResult.differential_expression as Record<string, unknown> : {}
   const pathway = omicsResult.pathway_enrichment && typeof omicsResult.pathway_enrichment === 'object' && !Array.isArray(omicsResult.pathway_enrichment) ? omicsResult.pathway_enrichment as Record<string, unknown> : {}
   const omicsReport = omicsResult.report && typeof omicsResult.report === 'object' && !Array.isArray(omicsResult.report) ? omicsResult.report as Record<string, unknown> : {}
+  const caddStep = steps.find((step) => step.tool === 'cadd_run_screening')
+  const caddResult = caddStep?.result && typeof caddStep.result === 'object' && !Array.isArray(caddStep.result) ? caddStep.result as Record<string, unknown> : {}
   const sequenceStep = steps.find((step) => step.tool === 'sequence_pipeline')
   const sequenceEnvelope = sequenceStep?.result && typeof sequenceStep.result === 'object' && !Array.isArray(sequenceStep.result) ? sequenceStep.result as Record<string, unknown> : payload
   const sequenceResult = sequenceEnvelope.result && typeof sequenceEnvelope.result === 'object' && !Array.isArray(sequenceEnvelope.result) ? sequenceEnvelope.result as Record<string, unknown> : sequenceEnvelope
@@ -712,6 +746,11 @@ function JobResultSummary({ job }: { job: Job }) {
     n_significant_pathways: payload.n_significant_pathways ?? pathway.n_significant_pathways,
     statistics_backend: payload.statistics_backend ?? differential.backend,
     fallback_reason: payload.fallback_reason ?? differential.fallback_reason,
+    cadd_rows: payload.rows ?? caddResult.rows,
+    best_hit: payload.best_hit ?? caddResult.best_hit,
+    best_affinity: payload.best_affinity ?? caddResult.best_affinity,
+    cadd_exhaustiveness: payload.exhaustiveness ?? caddResult.exhaustiveness,
+    cadd_max_ligands: payload.max_ligands ?? caddResult.max_ligands,
     pipeline: payload.pipeline ?? sequenceResult.pipeline,
     mrna_len: payload.mrna_len ?? sequenceResult.mrna_len,
     verdict: payload.verdict ?? sequenceResult.verdict,
@@ -719,8 +758,10 @@ function JobResultSummary({ job }: { job: Job }) {
     completed_steps: manifest.completed_steps,
     failed_steps: manifest.failed_steps,
     output_csv: payload.output_csv ?? annotationResult.output_csv,
+    cadd_result_csv: payload.result_csv ?? caddResult.result_csv,
     manifest_path: manifest.manifest_path,
     report_path: payload.output_md ?? report.path,
+    cadd_report: caddResult.report,
   }
   const visible = Object.entries(summary).filter(([, value]) => value !== undefined && value !== null)
   const rawGeneIds = payload.gene_ids ?? annotationResult.gene_ids

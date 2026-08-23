@@ -15,6 +15,7 @@ data/pdbqt_*/
 
 # Vina exe(可从官方 release 重新下载,避免二进制入 git)
 tools/vina_*.exe
+tools/vina_1.2.7_linux_x86_64
 
 # 密钥
 config.local.yaml

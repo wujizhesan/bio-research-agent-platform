@@ -17,7 +17,14 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY . .
 
-RUN mkdir -p /app/output \
+ARG VINA_URL=https://github.com/ccsb-scripps/AutoDock-Vina/releases/download/v1.2.7/vina_1.2.7_linux_x86_64
+ARG VINA_SHA256=F31F774F723BBA7BBE6E9D1C47577020EEA9A8DA16424284C043D22593570644
+
+RUN if [ ! -f /app/tools/vina_1.2.7_linux_x86_64 ]; then \
+      python -c "import hashlib,urllib.request; p='/app/tools/vina_1.2.7_linux_x86_64'; urllib.request.urlretrieve('$VINA_URL', p); assert hashlib.sha256(open(p,'rb').read()).hexdigest().upper() == '$VINA_SHA256'"; \
+    fi \
+    && chmod +x /app/tools/vina_1.2.7_linux_x86_64 \
+    && mkdir -p /app/output \
     && chmod +x /app/docker-entrypoint.sh
 
 EXPOSE 8000

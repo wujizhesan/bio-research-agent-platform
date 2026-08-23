@@ -93,13 +93,13 @@ npm run dev
 
 | 组件 | 用途 | License |
 |---|---|---|
-| **AutoDock Vina v1.2.7** | 分子对接引擎（官方 Windows exe） | Apache-2.0 |
+| **AutoDock Vina v1.2.7** | 分子对接引擎（Windows/Linux 官方二进制） | Apache-2.0 |
 | **RDKit** | 分子处理（SMILES→3D构象→指纹） | BSD-3-Clause |
 | **Meeko** | SMILES/SDF → 配体 PDBQT | Apache-2.0 |
 | scikit-learn / pandas | 结果分析与活性预测（可选） | BSD |
 
-> 说明：AutoDock Vina 在 PyPI 仅提供 Linux wheel，Windows 上使用官方编译的 `vina_*.exe`（`tools/`），
-> 通过子进程调用（`src/dock_vina.py`）。这是该项目在 Windows 能真实跑通的关键。
+> 说明：Windows 使用 `tools/vina_1.2.7_win.exe`，Linux/Docker 自动选择
+> `tools/vina_1.2.7_linux_x86_64`，均通过子进程调用（`src/dock_vina.py`）。Docker 构建时若缺少 Linux 二进制，会从固定版本的官方 release 下载并校验 SHA-256。
 
 ## 架构
 

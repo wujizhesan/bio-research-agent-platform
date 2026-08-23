@@ -142,6 +142,16 @@ def _load_runtime_dependencies():
         ) from exc
     return prepare, build_library, dock_batch
 
+
+def _resolve_vina_path(configured):
+    override = os.environ.get('CADD_VINA_EXE')
+    path = resolve_path(override or configured)
+    if os.name != 'nt' and path.suffix.lower() == '.exe':
+        linux_path = path.with_name('vina_1.2.7_linux_x86_64')
+        if linux_path.exists():
+            return linux_path
+    return path
+
 def _ligand_index(path):
     try:
         return int(Path(path).stem.rsplit('_', 1)[1])
@@ -190,7 +200,7 @@ def check_environment(config_path=None):
         receptor_cfg = cfg.get('receptor', {})
         vina_cfg = cfg.get('vina', {})
         receptor_path = resolve_path(receptor_cfg.get('pdb_path', 'data/4hjo.pdb'))
-        vina_path = resolve_path(vina_cfg.get('exe', 'tools/vina_1.2.7_win.exe'))
+        vina_path = _resolve_vina_path(vina_cfg.get('exe', 'tools/vina_1.2.7_win.exe'))
         library_path = resolve_path(cfg.get('library', {}).get('data_module', 'src/library_data.py'))
         skip_assets = os.environ.get('CADD_SKIP_ASSETS') == '1'
         checks = [
@@ -326,7 +336,8 @@ def run_ml(lib, out_dir, is_active_fn=None, test_fraction=0.25, external_dataset
         return None
 
 def run(receptor_pdb=None, out_dir=None, exhaustiveness=None, labels=None,
-        config_path=None, resume=None, external_dataset=None, run_id=None):
+        config_path=None, resume=None, external_dataset=None, run_id=None,
+        max_ligands=None):
     cfg = load_config(config_path)
     receptor_cfg = cfg.get('receptor', {})
     vina_cfg = cfg.get('vina', {})
@@ -361,7 +372,7 @@ def run(receptor_pdb=None, out_dir=None, exhaustiveness=None, labels=None,
     exhaustiveness = int(exhaustiveness if exhaustiveness is not None else vina_cfg.get('exhaustiveness', 8))
     seed_value = vina_cfg.get('seed', 42)
     seed = int(seed_value) if seed_value is not None else None
-    vina_exe = resolve_path(vina_cfg.get('exe', 'tools/vina_1.2.7_win.exe'))
+    vina_exe = _resolve_vina_path(vina_cfg.get('exe', 'tools/vina_1.2.7_win.exe'))
     box_center = receptor_cfg.get('box_center')
     box_center = tuple(float(v) for v in box_center) if box_center else None
     box_size = receptor_cfg.get('box_size')
@@ -378,6 +389,11 @@ def run(receptor_pdb=None, out_dir=None, exhaustiveness=None, labels=None,
     if not vina_exe.exists():
         raise FileNotFoundError(f'Vina 可执行文件不存在: {vina_exe}')
     lib = build_screening_library()
+    if max_ligands is not None:
+        max_ligands = int(max_ligands)
+        if max_ligands < 1:
+            raise ValueError('max_ligands must be greater than zero')
+        lib = dict(list(lib.items())[:max_ligands])
     names = list(lib.keys())
     smis = list(lib.values())
     run_fingerprint = _run_fingerprint(
@@ -501,7 +517,7 @@ def run(receptor_pdb=None, out_dir=None, exhaustiveness=None, labels=None,
 
     print('== 4/4 生成报告 ==')
     seq_to_name = _map_ligand_names(pdbqts, names)
-    final = df.copy()
+    final = df.copy() if not df.empty else pd.DataFrame(columns=['name', 'affinity'])
     def map_name(ligand_stem):
         try:
             idx = int(ligand_stem.split('_')[-1])

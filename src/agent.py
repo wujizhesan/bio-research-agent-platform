@@ -44,12 +44,25 @@ def _configured_output_path(key, override=None, output_dir=None):
     return directory / output_cfg.get(key, default_names[key])
 
 # ---- 工具实现 ----
-def tool_run_screening(receptor=None, out=None, external_dataset=None):
+def tool_run_screening(receptor=None, out=None, external_dataset=None,
+                       exhaustiveness=None, max_ligands=None):
     from pipeline import run
-    result = run(receptor, out, external_dataset=external_dataset)
+    result = run(
+        receptor,
+        out,
+        exhaustiveness=exhaustiveness,
+        external_dataset=external_dataset,
+        max_ligands=max_ligands,
+    )
+    ordered = result.sort_values('affinity') if not result.empty else result
+    best = ordered.iloc[0].to_dict() if not ordered.empty else {}
     return {
-        'status': 'completed',
+        'status': 'completed' if not result.empty else 'completed_with_failures',
         'rows': int(len(result)),
+        'best_hit': best.get('mol_name'),
+        'best_affinity': best.get('affinity'),
+        'exhaustiveness': exhaustiveness,
+        'max_ligands': max_ligands,
         'result_csv': str(_configured_output_path('csv', output_dir=out)),
         'report': str(_configured_output_path('report', output_dir=out)),
         'external_dataset': str(external_dataset) if external_dataset else None,
@@ -111,6 +124,8 @@ TOOLS = {
             'receptor': {'type': 'string'},
             'out': {'type': 'string'},
             'external_dataset': {'type': 'string'},
+            'exhaustiveness': {'type': 'integer', 'minimum': 1},
+            'max_ligands': {'type': 'integer', 'minimum': 1},
         }),
         'function': tool_run_screening,
     },

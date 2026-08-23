@@ -352,9 +352,13 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
         ligand_library = inputs.get('ligand_library') or inputs.get('external_dataset')
         if not inputs.get('receptor'):
             missing.append('receptor')
+        elif not Path(str(inputs['receptor'])).exists():
+            missing.append('receptor')
         if not ligand_library:
             missing.append('ligand_library')
-        if inputs.get('receptor') and ligand_library:
+        elif not Path(str(ligand_library)).exists():
+            missing.append('ligand_library')
+        if inputs.get('receptor') and ligand_library and not missing:
             steps.append({
                 'id': 'cadd_screening',
                 'tool': 'cadd_run_screening',
@@ -362,6 +366,8 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
                     'receptor': str(inputs['receptor']),
                     'out': str(Path(output_dir) / 'cadd'),
                     'external_dataset': str(ligand_library),
+                    'exhaustiveness': int(inputs.get('exhaustiveness', 4)),
+                    'max_ligands': int(inputs.get('max_ligands', 3)),
                 },
             })
             rationale.append('CADD screening is isolated as a reproducible execution step')

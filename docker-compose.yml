@@ -54,6 +54,7 @@ services:
       - "${API_PUBLISHED_PORT:-8000}:8000"
     volumes:
       - ./output:/app/output
+      - ./data:/app/data:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
       interval: 5s
@@ -93,6 +94,7 @@ services:
       MRNA_FORGE_ROOT: ${MRNA_FORGE_ROOT:-}
     volumes:
       - ./output:/app/output
+      - ./data:/app/data:ro
     ports:
       - "${WORKER_METRICS_PUBLISHED_PORT:-9000}:9000"
     command: ["python", "-m", "src.worker"]
