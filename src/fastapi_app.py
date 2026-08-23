@@ -44,6 +44,10 @@ API_NAME = 'bio-research-agent-api'
 API_VERSION = '0.2.0'
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_ROOT = PROJECT_ROOT / 'output'
+ARTIFACT_RESULT_KEYS = frozenset({
+    'output_csv', 'output_md', 'output_html', 'result_csv', 'report',
+    'manifest_path', 'report_path', 'variant_output_csv', 'sequence_report_path',
+})
 
 
 class JobCreate(BaseModel):
@@ -83,6 +87,33 @@ def _public_specs(domain=None):
         {key: value for key, value in spec.items() if key not in {'function'}}
         for spec in active_tool_specs(selected)
     ]
+
+
+def _iter_artifact_values(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in ARTIFACT_RESULT_KEYS and isinstance(item, str):
+                yield item
+            yield from _iter_artifact_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_artifact_values(item)
+
+
+def _resolve_artifact_path(raw_path, output_root):
+    raw = Path(raw_path)
+    candidates = [raw] if raw.is_absolute() else [PROJECT_ROOT / raw, output_root / raw]
+    root = output_root.resolve()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved == root or root not in resolved.parents:
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
 
 
 def create_app(job_manager=None, plugin_manager=None, database=None, file_storage=None, audit_log=None):
@@ -331,6 +362,25 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         if record is None:
             raise HTTPException(status_code=404, detail=f'job not found: {job_id}')
         return {'status': 'ok', 'job': record}
+
+    @app.get('/api/v1/jobs/{job_id}/artifacts', tags=['jobs'])
+    async def download_job_artifact(
+        job_id: str,
+        artifact_path: str = Query(min_length=1, alias='path'),
+        principal: Principal = Depends(require_permission('jobs:read')),
+    ):
+        record = await read_job(job_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f'job not found: {job_id}')
+        allowed_paths = {
+            _resolve_artifact_path(path, OUTPUT_ROOT)
+            for path in _iter_artifact_values(record.get('result'))
+        }
+        target = _resolve_artifact_path(artifact_path, OUTPUT_ROOT)
+        if target is None or target not in allowed_paths:
+            raise HTTPException(status_code=404, detail='artifact not found for job')
+        audit.record(principal, 'job.artifact_download', 'job', job_id, {'filename': target.name})
+        return FileResponse(target, filename=target.name, headers={'X-Job-ID': job_id})
 
     @app.get('/api/v1/jobs/{job_id}/events', dependencies=[Depends(require_permission('jobs:read'))], tags=['jobs'])
     async def job_events(

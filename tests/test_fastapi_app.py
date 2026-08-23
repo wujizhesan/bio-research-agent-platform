@@ -13,6 +13,7 @@ from src.audit_log import AuditLogger
 from src.database import Database
 from src.file_storage import LocalFileStorage
 from src.fastapi_app import create_app
+import src.fastapi_app as fastapi_module
 from src.job_manager import JobManager
 from src.plugin_manager import PluginManager
 
@@ -347,6 +348,42 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(list((Path(raw) / 'uploads').iterdir()), [])
             finally:
                 self._close_app(app)
+
+    def test_job_artifact_download_is_result_scoped(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_artifacts_') as raw:
+            output_root = Path(raw) / 'output'
+            output_root.mkdir()
+            artifact = output_root / 'report.md'
+            artifact.write_bytes(b'# report\n')
+            outside = Path(raw) / 'secret.txt'
+            outside.write_text('secret\n', encoding='utf-8')
+            with patch.object(fastapi_module, 'OUTPUT_ROOT', output_root):
+                app = self._app(raw)
+                try:
+                    manager = app.state.job_manager
+                    job = manager.submit('research_catalog', {})
+                    for _ in range(100):
+                        record = manager.get(job['job_id'])
+                        if record['status'] == 'completed':
+                            break
+                        time.sleep(0.05)
+                    manager._jobs[job['job_id']]['result'] = {'report_path': str(artifact)}
+                    manager._persist(manager._jobs[job['job_id']])
+                    with TestClient(app) as client:
+                        downloaded = client.get(
+                            f"/api/v1/jobs/{job['job_id']}/artifacts",
+                            params={'path': str(artifact)},
+                        )
+                        self.assertEqual(downloaded.status_code, 200)
+                        self.assertEqual(downloaded.text, '# report\n')
+                        self.assertEqual(downloaded.headers['x-job-id'], job['job_id'])
+                        forbidden = client.get(
+                            f"/api/v1/jobs/{job['job_id']}/artifacts",
+                            params={'path': str(outside)},
+                        )
+                        self.assertEqual(forbidden.status_code, 404)
+                finally:
+                    self._close_app(app)
 
 
 if __name__ == '__main__':
