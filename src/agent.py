@@ -47,6 +47,7 @@ def _configured_output_path(key, override=None, output_dir=None):
 def tool_run_screening(receptor=None, out=None, external_dataset=None,
                        exhaustiveness=None, max_ligands=None):
     from pipeline import run
+    from config_loader import latest_run_dir, load_config, resolve_path
     result = run(
         receptor,
         out,
@@ -56,15 +57,28 @@ def tool_run_screening(receptor=None, out=None, external_dataset=None,
     )
     ordered = result.sort_values('affinity') if not result.empty else result
     best = ordered.iloc[0].to_dict() if not ordered.empty else {}
+    output_cfg = load_config().get('output', {})
+    run_dir = latest_run_dir(resolve_path(out or output_cfg.get('dir', 'output')))
+    hits = [
+        {
+            'mol_name': str(row.get('mol_name', '')),
+            'tag': str(row.get('tag', 'inactive')),
+            'affinity': float(row.get('affinity')),
+        }
+        for row in ordered.head(10).to_dict('records')
+    ]
     return {
         'status': 'completed' if not result.empty else 'completed_with_failures',
         'rows': int(len(result)),
         'best_hit': best.get('mol_name'),
         'best_affinity': best.get('affinity'),
+        'hits': hits,
         'exhaustiveness': exhaustiveness,
         'max_ligands': max_ligands,
         'result_csv': str(_configured_output_path('csv', output_dir=out)),
         'report': str(_configured_output_path('report', output_dir=out)),
+        'score_plot': str(run_dir / 'vs_plot.png') if (run_dir / 'vs_plot.png').exists() else None,
+        'top_molecule_image': str(run_dir / 'top_mol.png') if (run_dir / 'top_mol.png').exists() else None,
         'external_dataset': str(external_dataset) if external_dataset else None,
     }
 

@@ -3,6 +3,7 @@ import {
   Activity,
   ArrowUpRight,
   Ban,
+  BarChart3,
   Beaker,
   Boxes,
   Check,
@@ -70,6 +71,18 @@ type EventItem = {
   type: string
   status: string
   detail: string
+}
+
+type SequenceCheck = {
+  name: string
+  passed: boolean
+  detail?: string
+}
+
+type CaddHit = {
+  mol_name: string
+  tag: string
+  affinity: number
 }
 
 type ResearchPlanExecution = {
@@ -1012,6 +1025,88 @@ function EmptyStream() {
   return <div className="flex flex-1 flex-col items-center justify-center text-center"><div className="grid size-14 place-items-center rounded-2xl border border-[#21443f] bg-[#102b2a] text-[#78cdaa]"><Radio size={23} /></div><div className="mt-4 text-sm font-medium text-[#b1cbc4]">等待一条任务流</div><div className="mt-2 max-w-[220px] text-xs leading-5 text-[#64827b]">提交任务后，这里会实时显示执行状态和可追踪事件。</div></div>
 }
 
+function metricNumber(metrics: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const value = Number(metrics[key])
+    if (Number.isFinite(value)) return value
+  }
+  return undefined
+}
+
+function percentMetric(metrics: Record<string, unknown>, keys: string[]) {
+  const value = metricNumber(metrics, keys)
+  if (value === undefined) return undefined
+  return value <= 1 ? value * 100 : value
+}
+
+function normalizeSequenceChecks(raw: unknown): SequenceCheck[] {
+  if (!Array.isArray(raw)) return []
+  return raw.map((value) => {
+    if (Array.isArray(value)) {
+      return { name: String(value[0] || 'check'), passed: value[1] === 'pass' || value[1] === true, detail: value[2] ? String(value[2]) : undefined }
+    }
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const item = value as Record<string, unknown>
+      return { name: String(item.name || 'check'), passed: item.passed === true || item.status === 'pass', detail: item.detail ? String(item.detail) : undefined }
+    }
+    return { name: String(value || 'check'), passed: false }
+  })
+}
+
+function SequenceResultPanel({ result, onDownload }: { result: Record<string, unknown>; onDownload: (path: string) => void }) {
+  const metrics = result.metrics && typeof result.metrics === 'object' && !Array.isArray(result.metrics) ? result.metrics as Record<string, unknown> : {}
+  const mrna = typeof result.mrna === 'string' ? result.mrna.toUpperCase() : ''
+  const codons = mrna.match(/.{1,3}/g) || []
+  const checks = normalizeSequenceChecks(result.checks)
+  const gc = percentMetric(metrics, ['gc', 'GC%'])
+  const gc3 = percentMetric(metrics, ['gc3', 'GC3%'])
+  const cai = metricNumber(metrics, ['cai', 'CAI'])
+  const upA = metricNumber(metrics, ['up_a', 'UpA/kb'])
+  const upU = metricNumber(metrics, ['up_u', 'UpU/kb'])
+  const expression = metricNumber(metrics, ['expression_score'])
+  const passedChecks = checks.filter((check) => check.passed).length
+  const metricCards = [
+    { label: 'GC CONTENT', value: gc === undefined ? '--' : `${gc.toFixed(1)}%`, tone: 'text-[#8fe5c1]' },
+    { label: 'GC3', value: gc3 === undefined ? '--' : `${gc3.toFixed(1)}%`, tone: 'text-[#aebfff]' },
+    { label: 'CAI', value: cai === undefined ? '--' : cai.toFixed(3), tone: 'text-[#f0d38b]' },
+    { label: 'UPA / KB', value: upA === undefined ? '--' : upA.toFixed(2), tone: 'text-[#d1a8ff]' },
+    { label: 'UPU / KB', value: upU === undefined ? '--' : upU.toFixed(2), tone: 'text-[#f1a99a]' },
+  ]
+  return <section className="mt-5 rounded-2xl border border-[#28524b] bg-[linear-gradient(135deg,rgba(16,43,42,.96),rgba(8,25,29,.96))] p-5 sm:p-6">
+    <div className="flex flex-wrap items-start justify-between gap-3">
+      <div><div className="eyebrow">SEQUENCE DESIGN / QUALITY PROFILE</div><h3 className="mt-2 text-lg font-semibold text-[#e4f8ef]">mRNA 优化结果</h3><p className="mt-1 text-xs text-[#7fa99e]">优化、评分和翻译回译验证已完成</p></div>
+      <span className={`status-badge ${result.verify === true ? 'status-ok' : 'status-running'}`}><span className="size-1.5 rounded-full bg-current" />{result.verify === true ? 'TRANSLATION VERIFIED' : String(result.verdict || 'REVIEW')}</span>
+    </div>
+    <div className="mt-5 rounded-2xl border border-[#32665b] bg-[#061b1d]/80 p-4">
+      <div className="flex items-center justify-between gap-3"><div className="field-label mb-0">OPTIMIZED mRNA / {String(result.mrna_len || mrna.length)} NT</div><div className="font-mono text-[10px] text-[#6e9d91]">5&apos; → 3&apos;</div></div>
+      <div className="mt-3 flex flex-wrap gap-1.5">{codons.map((codon, index) => <span key={`${codon}-${index}`} className="rounded-md border border-[#2b6457] bg-[#123631] px-2.5 py-2 font-mono text-sm tracking-[0.16em] text-[#d0f7e5]">{codon}</span>)}</div>
+      {!mrna && <div className="mt-2 text-xs text-[#789791]">结果中没有返回序列文本，请下载完整 JSON 查看。</div>}
+    </div>
+    <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-5">{metricCards.map((card) => <div key={card.label} className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-3"><div className="font-mono text-[9px] tracking-[0.12em] text-[#63817b]">{card.label}</div><div className={`mt-2 font-mono text-xl ${card.tone}`}>{card.value}</div></div>)}</div>
+    {expression !== undefined && <div className="mt-4 rounded-xl border border-white/[0.08] bg-[#071719]/70 p-3"><div className="flex items-center justify-between text-[10px] text-[#86a59e]"><span className="font-mono tracking-[0.12em]">EXPRESSION SCORE</span><span className="font-mono text-[#d4f7e6]">{(expression * 100).toFixed(1)}%</span></div><div className="mt-2 h-2 overflow-hidden rounded-full bg-[#17312f]"><div className="h-full rounded-full bg-gradient-to-r from-[#4dba91] to-[#b3f4d4]" style={{ width: `${Math.min(100, Math.max(0, expression * 100))}%` }} /></div></div>}
+    {checks.length > 0 && <div className="mt-4 rounded-xl border border-white/[0.08] bg-[#071719]/70 p-4"><div className="flex items-center justify-between gap-3"><div className="field-label mb-0">RULE CHECKS</div><span className="font-mono text-[10px] text-[#83e3bc]">{passedChecks}/{checks.length} PASS</span></div><div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{checks.map((check, index) => <div key={`${check.name}-${index}`} className="flex items-start gap-2 rounded-lg border border-white/[0.06] px-3 py-2"><Check size={13} className={`mt-0.5 shrink-0 ${check.passed ? 'text-[#70e3ad]' : 'text-[#ec9b87]'}`} /><div className="min-w-0"><div className="truncate text-xs text-[#c5e1d7]">{check.name}</div>{check.detail && <div className="mt-1 truncate text-[10px] text-[#6f9189]">{check.detail}</div>}</div></div>)}</div></div>}
+  </section>
+}
+
+function CaddResultPanel({ result, onDownload }: { result: Record<string, unknown>; onDownload: (path: string) => void }) {
+  const rawHits = result.hits ?? result.top_hits
+  const hits: CaddHit[] = Array.isArray(rawHits) ? rawHits.flatMap((value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return []
+    const item = value as Record<string, unknown>
+    const affinity = Number(item.affinity)
+    return Number.isFinite(affinity) ? [{ mol_name: String(item.mol_name || item.name || 'unknown'), tag: String(item.tag || 'inactive'), affinity }] : []
+  }) : []
+  const maxAbsAffinity = Math.max(...hits.map((hit) => Math.abs(hit.affinity)), 1)
+  const scorePlot = typeof result.score_plot === 'string' ? result.score_plot : ''
+  const topMoleculeImage = typeof result.top_molecule_image === 'string' ? result.top_molecule_image : ''
+  return <section className="mt-5 rounded-2xl border border-[#3d5a8c] bg-[linear-gradient(135deg,rgba(17,29,50,.96),rgba(11,21,38,.96))] p-5 sm:p-6">
+    <div className="flex flex-wrap items-start justify-between gap-3"><div><div className="eyebrow text-[#8298d9]">CADD / VIRTUAL SCREENING</div><h3 className="mt-2 text-lg font-semibold text-[#eef1ff]">命中排序与结合能</h3><p className="mt-1 text-xs text-[#93a5d4]">数值越负，表示对接受体的预测结合越强</p></div><div className="grid size-10 place-items-center rounded-xl border border-[#405b96] bg-[#152442] text-[#aebfff]"><BarChart3 size={19} /></div></div>
+    <div className="mt-5 grid gap-2 sm:grid-cols-3"><div className="rounded-xl border border-white/[0.08] bg-[#0b182d]/80 p-3"><div className="font-mono text-[9px] tracking-[0.12em] text-[#8298c7]">BEST HIT</div><div className="mt-2 truncate text-lg font-semibold text-[#dbe2ff]">{String(result.best_hit || hits[0]?.mol_name || '--')}</div></div><div className="rounded-xl border border-white/[0.08] bg-[#0b182d]/80 p-3"><div className="font-mono text-[9px] tracking-[0.12em] text-[#8298c7]">BEST AFFINITY</div><div className="mt-2 font-mono text-lg text-[#aebfff]">{result.best_affinity !== undefined ? `${Number(result.best_affinity).toFixed(3)} kcal/mol` : hits[0] ? `${hits[0].affinity.toFixed(3)} kcal/mol` : '--'}</div></div><div className="rounded-xl border border-white/[0.08] bg-[#0b182d]/80 p-3"><div className="font-mono text-[9px] tracking-[0.12em] text-[#8298c7]">SUCCESSFUL DOCKS</div><div className="mt-2 font-mono text-lg text-[#8fe5c1]">{String(result.rows ?? hits.length)} / {String(result.max_ligands ?? (hits.length || '--'))}</div></div></div>
+    {hits.length > 0 ? <div className="mt-5 overflow-hidden rounded-xl border border-white/[0.08] bg-[#081426]/80"><div className="border-b border-white/[0.08] px-4 py-3"><div className="field-label mb-0">TOP HITS / AFFINITY PROFILE</div></div><div className="divide-y divide-white/[0.06]">{hits.map((hit, index) => <div key={`${hit.mol_name}-${index}`} className="grid gap-2 px-4 py-3 sm:grid-cols-[28px_1fr_120px_100px] sm:items-center"><div className="font-mono text-xs text-[#6f86bb]">{String(index + 1).padStart(2, '0')}</div><div className="min-w-0"><div className="flex items-center gap-2"><span className="truncate text-sm font-medium text-[#dce5ff]">{hit.mol_name}</span><span className={`status-badge ${hit.tag === 'active' ? 'status-ok' : 'status-queued'}`}>{hit.tag}</span></div><div className="mt-2 h-1.5 overflow-hidden rounded-full bg-[#20304b]"><div className="h-full rounded-full bg-gradient-to-r from-[#718cff] to-[#aebfff]" style={{ width: `${Math.max(12, Math.round((Math.abs(hit.affinity) / maxAbsAffinity) * 100))}%` }} /></div></div><div className="font-mono text-sm text-[#b9c7ff] sm:text-right">{hit.affinity.toFixed(3)}</div><div className="font-mono text-[10px] text-[#7085b4] sm:text-right">kcal/mol</div></div>)}</div></div> : <div className="mt-5 rounded-xl border border-[#705b35] bg-[#251f15] px-4 py-3 text-xs leading-5 text-[#d8c18a]">当前结果没有携带命中明细。后续运行会返回前 10 个配体，并在这里生成排序表。</div>}
+    {(scorePlot || topMoleculeImage) && <div className="mt-4 flex flex-wrap gap-2"><div className="field-label mb-0 mr-2 self-center">ARTIFACTS</div>{scorePlot && <button onClick={() => onDownload(scorePlot)} className="inline-flex items-center gap-2 rounded-lg border border-[#405b96] bg-[#152442] px-3 py-2 text-xs text-[#cbd4ff] transition hover:border-[#aebfff] hover:text-white"><Download size={13} />打分图</button>}{topMoleculeImage && <button onClick={() => onDownload(topMoleculeImage)} className="inline-flex items-center gap-2 rounded-lg border border-[#405b96] bg-[#152442] px-3 py-2 text-xs text-[#cbd4ff] transition hover:border-[#aebfff] hover:text-white"><Download size={13} />Top hit 结构图</button>}</div>}
+  </section>
+}
+
 function JobResultSummary({ job, onDownload }: { job: Job; onDownload: (path: string) => void }) {
   const payload = job.result && typeof job.result === 'object' ? job.result : {}
   const manifest = payload.manifest && typeof payload.manifest === 'object' && !Array.isArray(payload.manifest) ? payload.manifest as Record<string, unknown> : {}
@@ -1031,7 +1126,8 @@ function JobResultSummary({ job, onDownload }: { job: Job; onDownload: (path: st
   const featureCountsStep = steps.find((step) => step.tool === 'omics_run_feature_counts')
   const featureCountsResult = featureCountsStep?.result && typeof featureCountsStep.result === 'object' && !Array.isArray(featureCountsStep.result) ? featureCountsStep.result as Record<string, unknown> : {}
   const caddStep = steps.find((step) => step.tool === 'cadd_run_screening')
-  const caddResult = caddStep?.result && typeof caddStep.result === 'object' && !Array.isArray(caddStep.result) ? caddStep.result as Record<string, unknown> : {}
+  const caddEnvelope = caddStep?.result && typeof caddStep.result === 'object' && !Array.isArray(caddStep.result) ? caddStep.result as Record<string, unknown> : {}
+  const caddResult = caddEnvelope.result && typeof caddEnvelope.result === 'object' && !Array.isArray(caddEnvelope.result) ? caddEnvelope.result as Record<string, unknown> : caddEnvelope
   const fastqQcStep = steps.find((step) => step.tool === 'omics_run_fastq_qc')
   const fastqQcResult = fastqQcStep?.result && typeof fastqQcStep.result === 'object' && !Array.isArray(fastqQcStep.result) ? fastqQcStep.result as Record<string, unknown> : {}
   const fastqQcReports = Array.isArray(fastqQcResult.reports) ? fastqQcResult.reports.filter((value): value is string => typeof value === 'string') : []
@@ -1150,6 +1246,8 @@ function JobResultSummary({ job, onDownload }: { job: Job; onDownload: (path: st
   return <section className="panel mt-5 overflow-hidden" aria-live="polite">
     <div className="flex items-center justify-between border-b border-white/10 px-5 py-5 sm:px-6"><div><div className="eyebrow">RESULT / PROVENANCE</div><h2 className="mt-2 text-xl font-semibold">结构化结果</h2></div><Check size={18} className="text-[#83e3bc]" /></div>
     <div className="grid gap-3 px-5 py-5 sm:grid-cols-2 lg:grid-cols-4 sm:px-6">{visible.map(([key, value]) => <div key={key} className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-3"><div className="font-mono text-[9px] uppercase tracking-[0.12em] text-[#63817b]">{key}</div>{artifactKeys.has(key) && typeof value === 'string' ? <button onClick={() => onDownload(value)} title={value} aria-label={`下载 ${key}`} className="mt-2 inline-flex max-w-full items-center gap-2 rounded-lg border border-[#28524b] bg-[#102b2a] px-2.5 py-1.5 text-xs text-[#b9e6d5] transition hover:border-[#71cba7] hover:text-[#ecfff7]"><Download size={13} /><span className="truncate">下载产物</span></button> : <div className="mt-2 truncate text-sm text-[#c9e5dc]">{String(value)}</div>}</div>)}</div>
+    {Boolean(sequenceResult.mrna) && <SequenceResultPanel result={sequenceResult} onDownload={onDownload} />}
+    {(Boolean(caddResult.best_hit) || Array.isArray(caddResult.hits) || Array.isArray(caddResult.top_hits)) && <CaddResultPanel result={caddResult} onDownload={onDownload} />}
      {Boolean(fastqQcResult.status) && <div className="border-t border-white/[0.08] px-5 py-5 sm:px-6"><div className="flex flex-wrap items-center justify-between gap-3"><div><div className="field-label">FASTQ QUALITY CONTROL</div><div className="mt-1 text-sm text-[#b9e6d5]">FastQC {fastqQcSummaries.length ? `完成 ${fastqQcSummaries.length} 个报告` : '报告'} · MultiQC 汇总已生成</div></div>{fastqQcReport && <button onClick={() => onDownload(fastqQcReport)} className="inline-flex items-center gap-2 rounded-lg border border-[#3d5a8c] bg-[#111d32] px-3 py-2 text-xs font-medium text-[#cbd4ff] transition hover:border-[#aebfff] hover:text-white"><Download size={13} />下载 MultiQC 报告</button>}</div><div className="mt-4 grid grid-cols-3 gap-2 sm:max-w-md"><QcStatusMetric label="PASS" value={fastqQcCounts.pass} className="status-ok" /><QcStatusMetric label="WARN" value={fastqQcCounts.warn} className="status-running" /><QcStatusMetric label="FAIL" value={fastqQcCounts.fail} className="status-failed" /></div></div>}
      {(alignmentSamples.length > 0 || featureCountsResult.n_genes !== undefined || Boolean(differential.output_csv)) && <div className="border-t border-white/[0.08] px-5 py-5 sm:px-6"><div className="flex flex-wrap items-center justify-between gap-3"><div><div className="field-label">RNA-SEQ PIPELINE SUMMARY</div><div className="mt-1 text-sm text-[#b9e6d5]">比对、计数和差异分析结果已汇总，可直接用于面试演示。</div></div><span className="status-badge status-ok"><span className="size-1.5 rounded-full bg-current" />链路完成</span></div><div className="mt-4 grid grid-cols-2 gap-2 lg:grid-cols-4"><PipelineMetric label="SAMPLES" value={alignmentSamples.length || featureCountsResult.n_samples || '—'} /><PipelineMetric label="AVG ALIGNMENT" value={alignmentRate || '—'} /><PipelineMetric label="COUNTED GENES" value={featureCountsResult.n_genes ?? '—'} /><PipelineMetric label="SIGNIFICANT DEGS" value={differential.n_significant ?? '—'} /></div>{alignmentSamples.length > 0 && <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{alignmentSamples.map((sample, index) => <div key={`${String(sample.sample_id || 'sample')}-${index}`} className="flex items-center justify-between rounded-lg border border-white/[0.07] bg-[#071719]/70 px-3 py-2.5"><span className="font-mono text-[10px] text-[#a9cbc0]">{String(sample.sample_id || `sample-${index + 1}`)}</span><span className="font-mono text-[10px] text-[#8fe5c1]">{String(sample.overall_alignment_rate || '—')}</span></div>)}</div>}</div>}
      {traceSteps.length > 0 && <div className="border-t border-white/[0.08] px-5 py-4 sm:px-6"><div className="field-label">WORKFLOW TRACE / TOOLCHAIN</div><div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{traceSteps.map((step) => <div key={`${step.index}-${step.id}`} className="flex items-center gap-3 rounded-xl border border-white/[0.08] bg-[#071719]/70 px-3 py-3"><div className="grid size-7 shrink-0 place-items-center rounded-lg border border-[#28524b] bg-[#102b2a] font-mono text-[10px] text-[#8fe5c1]">{String(step.index).padStart(2, '0')}</div><div className="min-w-0 flex-1"><div className="truncate text-xs font-medium text-[#c9e5dc]">{step.id}</div><div className="mt-1 truncate font-mono text-[9px] text-[#66857e]">{step.tool}</div></div><span className={`status-badge ${step.status === 'completed' ? 'status-ok' : step.status === 'failed' ? 'status-failed' : 'status-running'}`}>{step.status}</span></div>)}</div></div>}
