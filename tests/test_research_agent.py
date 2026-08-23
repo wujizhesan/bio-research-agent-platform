@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from src import research_planner
 from src.domain_registry import available_domains, run_tool
-from src.workflow_runner import load_workflow
+from src.workflow_runner import load_workflow, run_workflow
 
 
 class ResearchAgentTests(unittest.TestCase):
@@ -206,6 +206,32 @@ class ResearchAgentTests(unittest.TestCase):
             '${rnaseq_feature_counts.output_csv}',
         )
         self.assertEqual(analysis_step['args']['statistics_backend'], 'scipy')
+
+    def test_workflow_executes_feature_counts_reference_into_analysis(self):
+        result = run_tool('research_build_workflow', {
+            'task': 'Quantify aligned RNA-seq reads and run differential expression and pathway enrichment',
+            'domains': ['omics'],
+            'inputs': {
+                'alignment_paths': ['data/control.bam', 'data/treated.bam'],
+                'annotation_gtf': 'data/gencode.gtf',
+                'metadata_csv': 'examples/rnaseq/metadata.csv',
+                'gene_sets_csv': 'examples/rnaseq/gene_sets.csv',
+            },
+        })
+        calls = []
+
+        def fake_run(tool, args):
+            calls.append((tool, args))
+            if tool == 'omics_run_feature_counts':
+                return {'status': 'completed', 'output_csv': 'output/expression_counts.csv'}
+            return {'status': 'completed', 'report': 'output/omics_report.md'}
+
+        with patch('src.workflow_runner.run_tool', side_effect=fake_run):
+            manifest = run_workflow(result['workflow'])
+        self.assertEqual(manifest['status'], 'completed')
+        self.assertEqual(manifest['completed_steps'], 2)
+        self.assertEqual(calls[1][0], 'omics_run_analysis')
+        self.assertEqual(calls[1][1]['expression_csv'], 'output/expression_counts.csv')
 
     def test_research_planner_chains_variant_normalization_and_annotation(self):
         result = run_tool('research_build_workflow', {
