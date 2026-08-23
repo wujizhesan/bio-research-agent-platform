@@ -26,6 +26,7 @@ PLUGIN_CAPABILITIES = (
     'omics.toolchain',
     'omics.genomics_qc',
     'omics.single_cell_qc',
+    'omics.metagenomics_qc',
 )
 STATISTICS_BACKENDS = ('auto', 'scipy', 'deseq2')
 VARIANT_ANNOTATION_BACKENDS = ('auto', 'local', 'vcf_ann')
@@ -771,6 +772,92 @@ def run_single_cell_10x_qc(matrix_mtx, barcodes_tsv, features_tsv, output_dir,
     return payload
 
 
+def run_metagenomics_qc(abundance_csv, output_dir, taxon_id_column='taxon_id',
+                        min_total_counts=0, min_prevalence=0):
+    abundance_csv = Path(abundance_csv)
+    if not abundance_csv.is_file():
+        raise ValueError(f'metagenomics abundance table does not exist: {abundance_csv}')
+    frame = pd.read_csv(abundance_csv)
+    if frame.empty:
+        raise ValueError('metagenomics abundance table is empty')
+    if taxon_id_column not in frame.columns:
+        raise ValueError(f'abundance table requires column: {taxon_id_column}')
+    sample_columns = [column for column in frame.columns if column != taxon_id_column]
+    if not sample_columns:
+        raise ValueError('metagenomics abundance table has no sample columns')
+    taxon_ids = frame[taxon_id_column]
+    if taxon_ids.isna().any():
+        raise ValueError('taxon identifiers must be non-empty and unique')
+    taxon_ids = taxon_ids.astype(str).str.strip()
+    if taxon_ids.eq('').any() or taxon_ids.duplicated().any():
+        raise ValueError('taxon identifiers must be non-empty and unique')
+    counts = frame[sample_columns].apply(pd.to_numeric, errors='raise')
+    values = counts.to_numpy(dtype=float)
+    if not np.isfinite(values).all() or (values < 0).any():
+        raise ValueError('metagenomics abundances must be finite and non-negative')
+    min_total_counts = max(0.0, float(min_total_counts))
+    min_prevalence = max(0, int(min_prevalence))
+    if min_prevalence > len(sample_columns):
+        raise ValueError('min_prevalence cannot exceed the number of samples')
+    taxon_totals = counts.sum(axis=1)
+    prevalence = (counts > 0).sum(axis=1)
+    keep = (taxon_totals >= min_total_counts) & (prevalence >= min_prevalence)
+    filtered = counts.loc[keep].copy()
+    sample_totals = filtered.sum(axis=0)
+    relative = filtered.divide(sample_totals.replace(0, np.nan), axis='columns').fillna(0.0)
+    relative.insert(0, taxon_id_column, taxon_ids.loc[keep].to_numpy())
+    sample_metrics = []
+    for sample in sample_columns:
+        sample_values = counts[sample].to_numpy(dtype=float)
+        total = float(sample_values.sum())
+        positive = sample_values[sample_values > 0]
+        probabilities = positive / total if total else np.array([], dtype=float)
+        shannon = float(-(probabilities * np.log(probabilities)).sum()) if len(probabilities) else 0.0
+        sample_metrics.append({
+            'sample_id': sample,
+            'total_counts': total,
+            'observed_taxa': int((sample_values > 0).sum()),
+            'shannon_index': round(shannon, 6),
+            'retained_taxa': int((relative[sample] > 0).sum()),
+        })
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    relative_path = output_dir / 'metagenomics_relative_abundance.csv'
+    sample_metrics_path = output_dir / 'metagenomics_sample_metrics.csv'
+    manifest_path = output_dir / 'metagenomics_qc.json'
+    relative.to_csv(relative_path, index=False)
+    pd.DataFrame(sample_metrics).to_csv(sample_metrics_path, index=False)
+    payload = {
+        'status': 'completed',
+        'input': str(abundance_csv),
+        'output_dir': str(output_dir),
+        'outputs': {
+            'relative_abundance': str(relative_path),
+            'sample_metrics': str(sample_metrics_path),
+        },
+        'metrics': {
+            'n_taxa_input': int(len(frame)),
+            'n_taxa_retained': int(keep.sum()),
+            'n_taxa_filtered': int((~keep).sum()),
+            'n_samples': len(sample_columns),
+        },
+        'thresholds': {
+            'min_total_counts': min_total_counts,
+            'min_prevalence': min_prevalence,
+        },
+        'provenance': {
+            'normalization': 'relative_abundance_after_filtering',
+            'alpha_diversity': ['observed_taxa', 'shannon_index'],
+        },
+        'manifest_path': str(manifest_path),
+    }
+    manifest_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
+        encoding='utf-8',
+    )
+    return payload
+
+
 def _open_vcf(path):
     path = Path(path)
     if path.suffix.lower() == '.gz':
@@ -1226,6 +1313,17 @@ TOOLS = {
             'mitochondrial_prefix': {'type': 'string'},
         }, required=('matrix_mtx', 'barcodes_tsv', 'features_tsv', 'output_dir')),
         'function': run_single_cell_10x_qc,
+    },
+    'run_metagenomics_qc': {
+        'description': 'Validate a taxon or feature abundance table, calculate relative abundance and sample alpha-diversity metrics.',
+        'parameters': _parameters({
+            'abundance_csv': {'type': 'string'},
+            'output_dir': {'type': 'string'},
+            'taxon_id_column': {'type': 'string'},
+            'min_total_counts': {'type': 'number', 'minimum': 0},
+            'min_prevalence': {'type': 'integer', 'minimum': 0},
+        }, required=('abundance_csv', 'output_dir')),
+        'function': run_metagenomics_qc,
     },
     'search_gene_evidence': {
         'description': 'Retrieve cited gene evidence from a structured evidence index.',

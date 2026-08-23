@@ -47,7 +47,8 @@ _DOMAIN_KEYWORDS = {
     'omics': (
         'omics', 'rna-seq', 'rnaseq', 'transcriptome', 'gene expression',
         'differential expression', 'pathway', 'gene', 'single-cell',
-        'metagenome', 'variant', 'vcf', 'mutation', 'gatk', 'samtools',
+        'metagenome', 'microbiome', '16s', 'taxonomy', '宏基因组', '微生物组', '物种丰度',
+        'variant', 'vcf', 'mutation', 'gatk', 'samtools',
         'fastq', 'bam', 'cram', 'quality control', 'quality-control', 'qc',
         'gene annotation', 'variant annotation', '变异', '突变',
     ),
@@ -91,6 +92,11 @@ _GENOMICS_QC_KEYWORDS = (
 
 _SINGLE_CELL_KEYWORDS = (
     'single-cell', 'single cell', 'scrna', '10x', '单细胞',
+)
+
+_METAGENOMICS_KEYWORDS = (
+    'metagenome', 'metagenomics', 'microbiome', '16s', 'amplicon',
+    'taxonomy', '宏基因组', '微生物组', '物种丰度',
 )
 
 
@@ -192,10 +198,20 @@ def _is_single_cell_10x_task(task, inputs=None):
     return any(keyword in text for keyword in ('10x', 'matrix.mtx', 'matrix market'))
 
 
+def _is_metagenomics_task(task, inputs=None):
+    inputs = inputs or {}
+    if any(key in inputs for key in ('abundance_csv', 'metagenomics_abundance')):
+        return True
+    text = str(task or '').lower()
+    return any(keyword in text for keyword in _METAGENOMICS_KEYWORDS)
+
+
 def _required_inputs(domains, task=None, inputs=None):
     required = []
     if 'omics' in domains:
-        if _is_single_cell_task(task, inputs):
+        if _is_metagenomics_task(task, inputs):
+            required.append({'name': 'abundance_csv', 'description': 'taxon or feature abundance table CSV'})
+        elif _is_single_cell_task(task, inputs):
             if _is_single_cell_10x_task(task, inputs):
                 required.extend([
                     {'name': 'matrix_mtx', 'description': '10x Matrix Market expression matrix'},
@@ -260,10 +276,29 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
         missing.append('gencode_gtf')
 
     variant_task = _is_variant_task(task, inputs)
+    metagenomics_task = _is_metagenomics_task(task, inputs)
     single_cell_task = _is_single_cell_task(task, inputs)
     single_cell_10x_task = _is_single_cell_10x_task(task, inputs)
     qc_task = _is_genomics_qc_task(task, inputs)
-    if 'omics' in domains and single_cell_task:
+    if 'omics' in domains and metagenomics_task:
+        abundance_csv = inputs.get('abundance_csv') or inputs.get('metagenomics_abundance')
+        if not abundance_csv:
+            missing.append('abundance_csv')
+        else:
+            metagenomics_args = {
+                'abundance_csv': str(abundance_csv),
+                'output_dir': output_dir,
+            }
+            for key in ('taxon_id_column', 'min_total_counts', 'min_prevalence'):
+                if inputs.get(key) is not None:
+                    metagenomics_args[key] = inputs[key]
+            steps.append({
+                'id': 'metagenomics_qc',
+                'tool': 'omics_run_metagenomics_qc',
+                'args': metagenomics_args,
+            })
+            rationale.append('metagenomics QC normalizes abundance and calculates observed taxa and Shannon diversity')
+    elif 'omics' in domains and single_cell_task:
         if single_cell_10x_task:
             ten_x_inputs = ('matrix_mtx', 'barcodes_tsv', 'features_tsv')
             missing.extend(key for key in ten_x_inputs if not inputs.get(key))
