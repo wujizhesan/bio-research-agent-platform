@@ -691,6 +691,11 @@ function JobResultSummary({ job }: { job: Job }) {
   const steps = Array.isArray(manifest.steps) ? manifest.steps.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === 'object' && !Array.isArray(value)) : []
   const annotationStep = steps.find((step) => step.tool === 'omics_annotate_variants')
   const annotationResult = annotationStep?.result && typeof annotationStep.result === 'object' && !Array.isArray(annotationStep.result) ? annotationStep.result as Record<string, unknown> : {}
+  const omicsStep = steps.find((step) => step.tool === 'omics_run_analysis')
+  const omicsResult = omicsStep?.result && typeof omicsStep.result === 'object' && !Array.isArray(omicsStep.result) ? omicsStep.result as Record<string, unknown> : {}
+  const differential = omicsResult.differential_expression && typeof omicsResult.differential_expression === 'object' && !Array.isArray(omicsResult.differential_expression) ? omicsResult.differential_expression as Record<string, unknown> : {}
+  const pathway = omicsResult.pathway_enrichment && typeof omicsResult.pathway_enrichment === 'object' && !Array.isArray(omicsResult.pathway_enrichment) ? omicsResult.pathway_enrichment as Record<string, unknown> : {}
+  const omicsReport = omicsResult.report && typeof omicsResult.report === 'object' && !Array.isArray(omicsResult.report) ? omicsResult.report as Record<string, unknown> : {}
   const sequenceStep = steps.find((step) => step.tool === 'sequence_pipeline')
   const sequenceEnvelope = sequenceStep?.result && typeof sequenceStep.result === 'object' && !Array.isArray(sequenceStep.result) ? sequenceStep.result as Record<string, unknown> : payload
   const sequenceResult = sequenceEnvelope.result && typeof sequenceEnvelope.result === 'object' && !Array.isArray(sequenceEnvelope.result) ? sequenceEnvelope.result as Record<string, unknown> : sequenceEnvelope
@@ -701,6 +706,12 @@ function JobResultSummary({ job }: { job: Job }) {
     n_annotated: payload.n_annotated ?? annotationResult.n_annotated,
     n_unmatched: payload.n_unmatched ?? annotationResult.n_unmatched,
     n_variants: payload.n_variants ?? annotationResult.n_variants,
+    n_genes: payload.n_genes ?? differential.n_genes ?? omicsReport.n_genes,
+    n_significant: payload.n_significant ?? differential.n_significant ?? omicsReport.n_significant_genes,
+    n_pathways: payload.n_pathways ?? pathway.n_pathways ?? omicsReport.n_pathways,
+    n_significant_pathways: payload.n_significant_pathways ?? pathway.n_significant_pathways,
+    statistics_backend: payload.statistics_backend ?? differential.backend,
+    fallback_reason: payload.fallback_reason ?? differential.fallback_reason,
     pipeline: payload.pipeline ?? sequenceResult.pipeline,
     mrna_len: payload.mrna_len ?? sequenceResult.mrna_len,
     verdict: payload.verdict ?? sequenceResult.verdict,
