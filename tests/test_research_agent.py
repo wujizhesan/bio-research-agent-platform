@@ -163,6 +163,26 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(result['workflow']['steps'][0]['args']['region'], 'chr1:1-1000')
         self.assertIn('bcftools mpileup/call', result['rationale'][0])
 
+    def test_research_planner_chains_variant_normalization_and_annotation(self):
+        result = run_tool('research_build_workflow', {
+            'task': 'Normalize variants and annotate them before interpretation',
+            'domains': ['omics'],
+            'inputs': {
+                'vcf_path': 'data/raw.vcf',
+                'reference_fasta': 'data/reference.fa',
+                'annotation_csv': 'examples/variants/gene_annotations.csv',
+            },
+        })
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['selected_tools'], [
+            'omics_normalize_variants', 'omics_annotate_variants',
+        ])
+        self.assertEqual(
+            result['workflow']['steps'][1]['args']['vcf_path'],
+            '${variant_normalization.output_vcf}',
+        )
+        self.assertEqual(result['workflow']['steps'][1]['depends_on'], ['variant_normalization'])
+
     def test_research_planner_builds_single_cell_qc_workflow(self):
         result = run_tool('research_build_workflow', {
             'task': '分析单细胞 RNA-seq 表达矩阵并进行 QC',

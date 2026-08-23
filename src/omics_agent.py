@@ -15,7 +15,7 @@ import pandas as pd
 from scipy.stats import hypergeom, ttest_ind
 
 PLUGIN_NAME = 'RNA-seq and omics domain'
-PLUGIN_VERSION = '0.3.0'
+PLUGIN_VERSION = '0.4.0'
 PLUGIN_API_VERSION = 1
 PLUGIN_CAPABILITIES = (
     'omics.end_to_end',
@@ -25,6 +25,7 @@ PLUGIN_CAPABILITIES = (
     'omics.report',
     'omics.variant_annotation',
     'omics.variant_calling',
+    'omics.variant_normalization',
     'omics.toolchain',
     'omics.genomics_qc',
     'omics.single_cell_qc',
@@ -510,6 +511,102 @@ def run_variant_calling(bam_path, reference_fasta, output_dir, output_vcf=None,
     })
 
 
+def normalize_variants(vcf_path, reference_fasta, output_dir, output_vcf=None,
+                       region=None, timeout=300):
+    vcf_path = Path(vcf_path)
+    reference_fasta = Path(reference_fasta)
+    if not vcf_path.is_file():
+        raise ValueError(f'VCF input does not exist: {vcf_path}')
+    if not reference_fasta.is_file():
+        raise ValueError(f'reference FASTA does not exist: {reference_fasta}')
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_vcf = Path(output_vcf) if output_vcf else output_dir / 'normalized.vcf'
+    output_vcf.parent.mkdir(parents=True, exist_ok=True)
+    stats_path = output_dir / 'normalized_bcftools_stats.txt'
+    timeout = max(1, min(int(timeout), 3600))
+    bcftools = shutil.which('bcftools')
+    samtools = shutil.which('samtools')
+    reference_index = Path(str(reference_fasta) + '.fai')
+    missing_tools = []
+    if not bcftools:
+        missing_tools.append('bcftools')
+    if not reference_index.is_file() and not samtools:
+        missing_tools.append('samtools')
+    provenance = {
+        'inputs': {
+            'vcf': {'path': str(vcf_path), 'sha256': _file_sha256(vcf_path)},
+            'reference_fasta': {'path': str(reference_fasta), 'sha256': _file_sha256(reference_fasta)},
+        },
+        'parameters': {'region': region, 'normalization': 'left-align-indels-and-split-multiallelic'},
+        'tools': {},
+    }
+    if missing_tools:
+        return _write_variant_manifest(output_dir, {
+            'status': 'unavailable',
+            'workflow': 'vcf_normalization',
+            'input_type': 'vcf',
+            'output_vcf': str(output_vcf),
+            'missing_tools': sorted(set(missing_tools)),
+            'reason': 'required native VCF normalization tools are not installed',
+            'provenance': provenance,
+        })
+    provenance['tools'] = {
+        'bcftools': {'path': bcftools, **_external_tool_version(bcftools)},
+    }
+    if samtools:
+        provenance['tools']['samtools'] = {
+            'path': samtools,
+            **_external_tool_version(samtools),
+        }
+    steps = []
+
+    def execute(step_id, command, stdout_path=None):
+        result = _run_variant_command(command, timeout, stdout_path)
+        steps.append({'id': step_id, 'command': command, **result})
+        return result
+
+    if not reference_index.is_file():
+        result = execute('reference_index', [samtools, 'faidx', str(reference_fasta)])
+        if result['status'] != 'completed':
+            return _write_variant_manifest(output_dir, {
+                'status': 'failed',
+                'workflow': 'vcf_normalization',
+                'output_vcf': str(output_vcf),
+                'steps': steps,
+                'provenance': provenance,
+            })
+    output_format = '-Ob' if output_vcf.suffix.lower() == '.bcf' else '-Oz' if output_vcf.suffix.lower() == '.gz' else '-Ov'
+    normalize_command = [
+        bcftools, 'norm', '-f', str(reference_fasta), '-m', '-any',
+        output_format, '-o', str(output_vcf),
+    ]
+    if region:
+        normalize_command.extend(['-r', str(region)])
+    normalize_command.append(str(vcf_path))
+    result = execute('normalize', normalize_command, output_dir / 'normalize.log')
+    if result['status'] != 'completed' or not output_vcf.is_file():
+        return _write_variant_manifest(output_dir, {
+            'status': 'failed',
+            'workflow': 'vcf_normalization',
+            'output_vcf': str(output_vcf),
+            'steps': steps,
+            'provenance': provenance,
+        })
+    stats = execute('stats', [bcftools, 'stats', str(output_vcf)], stats_path)
+    stats_text = stats_path.read_text(encoding='utf-8') if stats_path.is_file() else ''
+    return _write_variant_manifest(output_dir, {
+        'status': 'completed' if stats['status'] == 'completed' else 'failed',
+        'workflow': 'vcf_normalization',
+        'input_type': 'vcf',
+        'inputs': [str(vcf_path), str(reference_fasta)],
+        'output_vcf': str(output_vcf),
+        'number_of_records': _parse_stat_value(stats_text, 'number of records'),
+        'steps': steps,
+        'provenance': provenance,
+    })
+
+
 GENOMICS_QC_TYPES = ('auto', 'fastq', 'bam', 'vcf')
 
 
@@ -585,6 +682,16 @@ def _fastq_file_stats(path):
 
 def _write_qc_manifest(output_dir, payload):
     manifest_path = Path(output_dir) / 'genomics_qc.json'
+    payload['manifest_path'] = str(manifest_path)
+    manifest_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
+        encoding='utf-8',
+    )
+    return payload
+
+
+def _write_variant_manifest(output_dir, payload):
+    manifest_path = Path(output_dir) / 'variant_normalization.json'
     payload['manifest_path'] = str(manifest_path)
     manifest_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
@@ -1494,6 +1601,18 @@ TOOLS = {
             'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 3600},
         }, required=('bam_path', 'reference_fasta', 'output_dir')),
         'function': run_variant_calling,
+    },
+    'normalize_variants': {
+        'description': 'Normalize a VCF against a reference FASTA with bcftools, left-align indels, split multiallelic records and emit provenance.',
+        'parameters': _parameters({
+            'vcf_path': {'type': 'string'},
+            'reference_fasta': {'type': 'string'},
+            'output_dir': {'type': 'string'},
+            'output_vcf': {'type': 'string'},
+            'region': {'type': 'string'},
+            'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 3600},
+        }, required=('vcf_path', 'reference_fasta', 'output_dir')),
+        'function': normalize_variants,
     },
     'run_single_cell_qc': {
         'description': 'Calculate single-cell expression QC metrics and write a filtered cell matrix without requiring Scanpy.',

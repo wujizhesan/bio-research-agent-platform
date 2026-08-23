@@ -83,7 +83,8 @@ _EVIDENCE_PROVIDER_KEYWORDS += (
 _VARIANT_KEYWORDS = (
     'variant', 'vcf', 'mutation', 'gatk', 'samtools', 'gene annotation',
     'variant annotation', 'variant calling', 'variant caller', 'mpileup',
-    '变异', '突变', '基因注释', '变异解读', '变异检测',
+    'normalize variant', 'variant normalization', 'left normalize', 'bcftools norm',
+    '变异', '突变', '基因注释', '变异解读', '变异检测', '变异规范化',
 )
 
 _GENOMICS_QC_KEYWORDS = (
@@ -190,6 +191,28 @@ def _is_variant_calling_task(task, inputs=None):
     ))
 
 
+def _is_variant_normalization_task(task, inputs=None):
+    inputs = inputs or {}
+    if inputs.get('normalize_variants'):
+        return True
+    text = str(task or '').lower()
+    return any(keyword in text for keyword in (
+        'normalize variant', 'variant normalization', 'left normalize',
+        'bcftools norm', '变异规范化',
+    ))
+
+
+def _is_variant_annotation_task(task, inputs=None):
+    inputs = inputs or {}
+    if inputs.get('annotation_csv') or inputs.get('annotation_backend'):
+        return True
+    text = str(task or '').lower()
+    return any(keyword in text for keyword in (
+        'variant annotation', 'annotate variant', 'variant interpretation',
+        'variant interpretation', '基因注释', '变异解读',
+    ))
+
+
 def _is_genomics_qc_task(task, inputs=None):
     inputs = inputs or {}
     if any(key in inputs for key in ('input_path', 'fastq_path', 'bam_path', 'cram_path')):
@@ -236,6 +259,13 @@ def _required_inputs(domains, task=None, inputs=None):
                 ])
             else:
                 required.append({'name': 'matrix_csv', 'description': 'cell-by-gene count matrix CSV'})
+        elif _is_variant_normalization_task(task, inputs):
+            required.extend([
+                {'name': 'vcf_path', 'description': 'input VCF/BCF variant file'},
+                {'name': 'reference_fasta', 'description': 'reference genome FASTA matching VCF alleles'},
+            ])
+            if _is_variant_annotation_task(task, inputs) and (inputs or {}).get('annotation_backend', 'auto') != 'vcf_ann':
+                required.append({'name': 'annotation_csv', 'description': 'genomic interval annotation table'})
         elif _is_variant_calling_task(task, inputs):
             required.extend([
                 {'name': 'bam_path', 'description': 'aligned BAM/CRAM file for variant calling'},
@@ -300,6 +330,7 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
     metagenomics_task = _is_metagenomics_task(task, inputs)
     single_cell_task = _is_single_cell_task(task, inputs)
     single_cell_10x_task = _is_single_cell_10x_task(task, inputs)
+    variant_normalization_task = _is_variant_normalization_task(task, inputs)
     variant_calling_task = _is_variant_calling_task(task, inputs)
     qc_task = _is_genomics_qc_task(task, inputs)
     if 'omics' in domains and metagenomics_task:
@@ -362,6 +393,53 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
                     'args': single_cell_args,
                 })
                 rationale.append('single-cell QC calculates genes-per-cell, total counts and mitochondrial fraction')
+    elif 'omics' in domains and variant_normalization_task:
+        vcf_path = inputs.get('vcf_path') or inputs.get('vcf') or inputs.get('variants_vcf')
+        reference_fasta = inputs.get('reference_fasta') or inputs.get('reference_path') or inputs.get('reference_genome')
+        if not vcf_path:
+            missing.append('vcf_path')
+        if not reference_fasta:
+            missing.append('reference_fasta')
+        if vcf_path and reference_fasta:
+            normalized_vcf = str(inputs.get('normalized_vcf') or Path(output_dir) / 'normalized.vcf')
+            normalization_args = {
+                'vcf_path': str(vcf_path),
+                'reference_fasta': str(reference_fasta),
+                'output_dir': output_dir,
+                'output_vcf': normalized_vcf,
+            }
+            for key in ('region', 'timeout'):
+                if inputs.get(key) is not None:
+                    normalization_args[key] = inputs[key]
+            steps.append({
+                'id': 'variant_normalization',
+                'tool': 'omics_normalize_variants',
+                'args': normalization_args,
+            })
+            rationale.append('VCF normalization uses reference-aware bcftools norm to left-align indels and split multiallelic records')
+            if _is_variant_annotation_task(task, inputs):
+                annotation_backend = str(inputs.get('annotation_backend', 'auto'))
+                annotation_csv = inputs.get('annotation_csv')
+                if annotation_backend != 'vcf_ann' and not annotation_csv:
+                    missing.append('annotation_csv')
+                if annotation_backend == 'vcf_ann' or annotation_csv:
+                    annotation_args = {
+                        'vcf_path': '${variant_normalization.output_vcf}',
+                        'output_csv': str(inputs.get(
+                            'variant_output_csv', Path(output_dir) / 'variant_annotation.csv'
+                        )),
+                        'annotation_backend': annotation_backend,
+                    }
+                    if annotation_csv:
+                        annotation_args['annotation_csv'] = str(annotation_csv)
+                    steps.append({
+                        'id': 'variant_annotation',
+                        'tool': 'omics_annotate_variants',
+                        'depends_on': ['variant_normalization'],
+                        'args': annotation_args,
+                    })
+                    variant_ready = True
+                    rationale.append('normalized variants are forwarded to the existing ANN or local genomic interval annotator')
     elif 'omics' in domains and variant_calling_task:
         bam_path = inputs.get('bam_path') or inputs.get('input_bam') or inputs.get('cram_path')
         reference_fasta = inputs.get('reference_fasta') or inputs.get('reference_path') or inputs.get('reference_genome')
@@ -465,7 +543,7 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
 
     direct_literature = bool(inputs.get('gene_ids'))
     reuse_omics_evidence = omics_ready and evidence_provider != 'local' and not direct_literature
-    if variant_ready and evidence_provider == 'local' and not inputs.get('evidence_csv'):
+    if 'literature' in domains and variant_ready and evidence_provider == 'local' and not inputs.get('evidence_csv'):
         missing.append('evidence_csv')
     if direct_literature and evidence_provider == 'local' and not inputs.get('evidence_csv'):
         missing.append('evidence_csv')
