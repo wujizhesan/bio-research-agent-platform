@@ -414,7 +414,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
                     'protocol': f'A2A JSON-RPC {A2A_PROTOCOL_VERSION}',
                     'endpoint': '/a2a',
                     'agent_card': '/.well-known/agent-card.json',
-                    'methods': ['message/send', 'tasks/get', 'tasks/cancel'],
+                    'methods': ['message/send', 'message/stream', 'tasks/get', 'tasks/cancel'],
                 },
             },
         }
@@ -429,7 +429,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
             'preferredTransport': 'JSONRPC',
             'version': API_VERSION,
             'capabilities': {
-                'streaming': False,
+                'streaming': True,
                 'pushNotifications': False,
                 'stateTransitionHistory': False,
             },
@@ -495,6 +495,64 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
             return _a2a_response(
                 request_id,
                 result={'task': _a2a_task(record, f"bio-{record['job_id']}", [normalized_message])},
+            )
+
+        if method == 'message/stream':
+            if not auth.has_permission(principal, 'jobs:write'):
+                return _a2a_error(request_id, -32003, 'insufficient permissions')
+            sent = await a2a_rpc(
+                {'jsonrpc': '2.0', 'id': request_id, 'method': 'message/send', 'params': params},
+                principal=principal,
+            )
+            if 'error' in sent:
+                return sent
+            initial_task = sent['result']['task']
+            task_id = initial_task['id']
+            context_id = initial_task['contextId']
+
+            async def stream():
+                last_state = None
+                deadline = monotonic() + 300
+                terminal_states = {'completed', 'failed', 'canceled'}
+                while True:
+                    record = await read_job(task_id)
+                    if record is None:
+                        yield f"data: {json.dumps(_a2a_error(request_id, -32001, 'task not found'), ensure_ascii=False)}\n\n"
+                        return
+                    task_payload = _a2a_task(record, context_id)
+                    state = task_payload['status']['state']
+                    if state != last_state:
+                        if state == 'completed' and task_payload.get('artifacts'):
+                            for artifact in task_payload['artifacts']:
+                                artifact_event = {
+                                    'kind': 'artifact-update',
+                                    'taskId': task_id,
+                                    'contextId': context_id,
+                                    'artifact': artifact,
+                                    'lastChunk': True,
+                                }
+                                yield f"data: {json.dumps(_a2a_response(request_id, result=artifact_event), ensure_ascii=False, default=str)}\n\n"
+                        status_event = {
+                            'kind': 'status-update',
+                            'taskId': task_id,
+                            'contextId': context_id,
+                            'status': task_payload['status'],
+                            'final': state in terminal_states,
+                        }
+                        yield f"data: {json.dumps(_a2a_response(request_id, result=status_event), ensure_ascii=False, default=str)}\n\n"
+                        last_state = state
+                        if state in terminal_states:
+                            return
+                    if monotonic() >= deadline:
+                        yield f"data: {json.dumps(_a2a_error(request_id, -32002, 'A2A stream timed out'), ensure_ascii=False)}\n\n"
+                        return
+                    yield ': keep-alive\n\n'
+                    await asyncio.sleep(0.15)
+
+            return StreamingResponse(
+                stream(),
+                media_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
             )
 
         if method == 'tasks/get':

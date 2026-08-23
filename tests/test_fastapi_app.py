@@ -139,7 +139,7 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(card.status_code, 200)
                     self.assertEqual(card.json()['protocolVersion'], '0.3.0')
                     self.assertTrue(card.json()['url'].endswith('/a2a'))
-                    self.assertEqual(card.json()['capabilities']['streaming'], False)
+                    self.assertEqual(card.json()['capabilities']['streaming'], True)
 
                     sent = client.post('/a2a', json={
                         'jsonrpc': '2.0',
@@ -173,6 +173,26 @@ class FastApiAppTests(unittest.TestCase):
                         time.sleep(0.05)
                     self.assertEqual(final['status']['state'], 'completed')
                     self.assertIn('artifacts', final)
+
+                    with client.stream('POST', '/a2a', json={
+                        'jsonrpc': '2.0',
+                        'id': 'stream-1',
+                        'method': 'message/stream',
+                        'params': {
+                            'message': {
+                                'role': 'user',
+                                'messageId': 'a2a-stream-message-1',
+                                'parts': [{'kind': 'text', 'text': 'stream research capabilities'}],
+                                'metadata': {'tool': 'research_catalog', 'arguments': {}},
+                            },
+                        },
+                    }) as events:
+                        body = ''.join(events.iter_text())
+                        self.assertEqual(events.status_code, 200)
+                        self.assertEqual(events.headers['content-type'].split(';', 1)[0], 'text/event-stream')
+                    self.assertIn('"kind": "status-update"', body)
+                    self.assertIn('"final": true', body)
+                    self.assertIn('"kind": "artifact-update"', body)
 
                     unknown = client.post('/a2a', json={
                         'jsonrpc': '2.0',
