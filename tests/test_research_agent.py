@@ -242,6 +242,22 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(step['tool'], 'omics_run_rnaseq_alignment')
         self.assertEqual(step['args']['fastq_r2_paths'], ['data/A1_R2.fastq'])
 
+    def test_research_planner_infers_paired_feature_counts_from_r2_inputs(self):
+        result = run_tool('research_build_workflow', {
+            'task': 'Align paired-end RNA-seq reads and quantify genes',
+            'domains': ['omics'],
+            'inputs': {
+                'fastq_paths': ['data/A1_R1.fastq'],
+                'fastq_r2_paths': ['data/A1_R2.fastq'],
+                'reference_fasta': 'data/reference.fa',
+                'annotation_gtf': 'data/gencode.gtf',
+            },
+        })
+        self.assertTrue(result['ready'])
+        counting_step = result['workflow']['steps'][1]
+        self.assertEqual(counting_step['tool'], 'omics_run_feature_counts')
+        self.assertTrue(counting_step['args']['paired_end'])
+
     def test_research_planner_chains_feature_counts_into_rnaseq_analysis(self):
         result = run_tool('research_build_workflow', {
             'task': 'Quantify aligned RNA-seq reads and run differential expression and pathway enrichment',

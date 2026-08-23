@@ -11,7 +11,7 @@ from uuid import uuid4
 
 DEFAULT_ALLOWED_EXTENSIONS = frozenset({
     '.bed', '.csv', '.fa', '.fasta', '.fastq', '.fq', '.fna', '.gff', '.gff3',
-    '.gtf', '.html', '.htm', '.json', '.md', '.tsv', '.txt', '.yaml', '.yml',
+    '.gtf', '.html', '.htm', '.json', '.md', '.tsv', '.txt', '.vcf', '.yaml', '.yml',
 })
 FILE_ID_PATTERN = re.compile(r'^[a-f0-9]{32}$')
 CHUNK_SIZE = 1024 * 1024
@@ -62,8 +62,9 @@ class LocalFileStorage:
     async def save(self, upload: Any) -> StoredFile:
         filename = self._safe_filename(getattr(upload, 'filename', None))
         extension = Path(filename).suffix.lower()
-        if extension not in self.allowed_extensions:
-            allowed = ', '.join(sorted(self.allowed_extensions))
+        is_vcf_gzip = filename.lower().endswith('.vcf.gz')
+        if extension not in self.allowed_extensions and not is_vcf_gzip:
+            allowed = ', '.join(sorted(self.allowed_extensions | {'.vcf.gz'}))
             raise ValueError(f'unsupported file type: {extension or "none"}; allowed: {allowed}')
 
         file_id = uuid4().hex

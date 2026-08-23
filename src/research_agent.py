@@ -550,10 +550,15 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
                     'annotation_gtf': str(annotation_gtf),
                     'output_dir': output_dir,
                 }
+                paired_end = inputs.get('paired_end')
+                if paired_end is None and inputs.get('fastq_r2_paths') is not None:
+                    paired_end = True
+                if paired_end is not None:
+                    counting_args['paired_end'] = bool(paired_end)
                 if inputs.get('output_csv') or inputs.get('counts_csv'):
                     counting_args['output_csv'] = str(inputs.get('output_csv') or inputs['counts_csv'])
                 for key in (
-                    'feature_type', 'gene_id_attribute', 'strand', 'paired_end',
+                    'feature_type', 'gene_id_attribute', 'strand',
                     'threads', 'timeout',
                 ):
                     if inputs.get(key) is not None:

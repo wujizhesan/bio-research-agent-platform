@@ -497,6 +497,27 @@ class FastApiAppTests(unittest.TestCase):
             finally:
                 self._close_app(app)
 
+    def test_file_upload_accepts_vcf_and_vcf_gz_files(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_vcf_files_') as raw:
+            storage = LocalFileStorage(Path(raw) / 'uploads')
+            app = self._app(raw, storage)
+            try:
+                with TestClient(app) as client:
+                    for filename, content in (
+                        ('variants.vcf', b'##fileformat=VCFv4.3\n'),
+                        ('variants.vcf.gz', b'compressed-vcf-fixture'),
+                    ):
+                        response = client.post(
+                            '/api/v1/files',
+                            files={'upload': (filename, content, 'application/octet-stream')},
+                        )
+                        self.assertEqual(response.status_code, 201)
+                        uploaded = response.json()['file']
+                        self.assertEqual(uploaded['filename'], filename)
+                        self.assertEqual(uploaded['size_bytes'], len(content))
+            finally:
+                self._close_app(app)
+
     def test_job_artifact_download_is_result_scoped(self):
         with tempfile.TemporaryDirectory(prefix='fastapi_artifacts_') as raw:
             output_root = Path(raw) / 'output'
