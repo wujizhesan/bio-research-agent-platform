@@ -1,0 +1,2 @@
+chr1	fixture	exon	101	150	.	+	.	gene_id "GeneA"; transcript_id "TxA";
+chr1	fixture	exon	301	350	.	+	.	gene_id "GeneB"; transcript_id "TxB";

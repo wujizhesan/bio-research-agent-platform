@@ -27,6 +27,7 @@ PLUGIN_CAPABILITIES = (
     'omics.variant_calling',
     'omics.variant_normalization',
     'omics.gtf_annotation',
+    'omics.rnaseq_alignment',
     'omics.rnaseq_quantification',
     'omics.toolchain',
     'omics.genomics_qc',
@@ -39,6 +40,8 @@ TOOLCHAIN_EXECUTABLES = {
     'gatk': 'gatk',
     'samtools': 'samtools',
     'bcftools': 'bcftools',
+    'hisat2': 'hisat2',
+    'hisat2-build': 'hisat2-build',
     'featureCounts': 'featureCounts',
     'vep': 'vep',
 }
@@ -335,6 +338,8 @@ def _external_tool_version(executable):
             version_command,
             capture_output=True,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             timeout=10,
             check=False,
         )
@@ -656,6 +661,222 @@ def _parse_feature_counts_output(counts_path, output_csv):
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output_csv, index=False)
     return result, sample_names
+
+
+def _normalize_fastq_paths(fastq_paths):
+    values = fastq_paths if isinstance(fastq_paths, (list, tuple)) else [fastq_paths]
+    if not values or any(value is None or not str(value).strip() for value in values):
+        raise ValueError('fastq_paths must contain at least one FASTQ path')
+    paths = [Path(str(value)) for value in values]
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise ValueError(f'FASTQ inputs do not exist: {missing}')
+    invalid = [str(path) for path in paths if not path.name.lower().endswith(('.fastq', '.fq', '.fastq.gz', '.fq.gz'))]
+    if invalid:
+        raise ValueError(f'RNA-seq alignment requires FASTQ inputs: {invalid}')
+    return paths
+
+
+def _fastq_sample_name(path):
+    name = Path(path).name
+    for suffix in ('.fastq.gz', '.fq.gz', '.fastq', '.fq'):
+        if name.lower().endswith(suffix):
+            return name[:-len(suffix)]
+    return Path(path).stem
+
+
+def _parse_hisat2_alignment_rate(stderr):
+    for line in str(stderr or '').splitlines():
+        if 'overall alignment rate' in line.lower():
+            return line.strip().split()[0]
+    return None
+
+
+def _hisat2_index_complete(prefix):
+    prefix = str(prefix)
+    return any(Path(f'{prefix}.{suffix}').is_file() for suffix in ('1.ht2', '1.ht2l'))
+
+
+def run_rnaseq_alignment(fastq_paths, reference_fasta, output_dir,
+                         output_alignment_paths=None, threads=1, timeout=1800):
+    paths = _normalize_fastq_paths(fastq_paths)
+    reference_fasta = Path(reference_fasta)
+    if not reference_fasta.is_file():
+        raise ValueError(f'reference FASTA does not exist: {reference_fasta}')
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    threads = max(1, min(int(threads), 64))
+    timeout = max(1, min(int(timeout), 3600))
+    sample_names = [_fastq_sample_name(path) for path in paths]
+    if len(set(sample_names)) != len(sample_names):
+        raise ValueError('FASTQ sample names must be unique')
+    if output_alignment_paths is None:
+        alignment_paths = [output_dir / f'{sample_name}.bam' for sample_name in sample_names]
+    else:
+        values = output_alignment_paths if isinstance(output_alignment_paths, (list, tuple)) else [output_alignment_paths]
+        if len(values) != len(paths):
+            raise ValueError('output_alignment_paths must match the number of FASTQ inputs')
+        alignment_paths = [Path(str(value)) for value in values]
+    for path in alignment_paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    hisat2 = shutil.which('hisat2')
+    hisat2_build = shutil.which('hisat2-build')
+    samtools = shutil.which('samtools')
+    missing_tools = [
+        name for name, path in (
+            ('hisat2', hisat2),
+            ('hisat2-build', hisat2_build),
+            ('samtools', samtools),
+        ) if not path
+    ]
+    index_prefix = output_dir / 'hisat2_index'
+    index_metadata = output_dir / 'hisat2_index.json'
+    reference_sha256 = _file_sha256(reference_fasta)
+    provenance = {
+        'inputs': {
+            'fastq': [
+                {'path': str(path), 'sha256': _file_sha256(path)} for path in paths
+            ],
+            'reference_fasta': {
+                'path': str(reference_fasta),
+                'sha256': reference_sha256,
+            },
+        },
+        'parameters': {
+            'layout': 'single_end',
+            'threads': threads,
+        },
+        'tools': {},
+    }
+    if missing_tools:
+        return _write_omics_manifest(output_dir, 'rnaseq_alignment.json', {
+            'status': 'unavailable',
+            'workflow': 'rnaseq_alignment',
+            'alignment_paths': [str(path) for path in alignment_paths],
+            'missing_tools': missing_tools,
+            'reason': 'HISAT2 and SAMtools are required for RNA-seq alignment',
+            'provenance': provenance,
+        })
+    provenance['tools'] = {
+        'hisat2': {'path': hisat2, **_external_tool_version(hisat2)},
+        'hisat2-build': {'path': hisat2_build, **_external_tool_version(hisat2_build)},
+        'samtools': {'path': samtools, **_external_tool_version(samtools)},
+    }
+    steps = []
+
+    def execute(step_id, command, stdout_path=None):
+        result = _run_variant_command(command, timeout, stdout_path)
+        steps.append({'id': step_id, 'command': command, **result})
+        return result
+
+    index_reusable = False
+    if _hisat2_index_complete(index_prefix) and index_metadata.is_file():
+        try:
+            metadata = json.loads(index_metadata.read_text(encoding='utf-8'))
+            index_reusable = metadata.get('reference_sha256') == reference_sha256
+        except (OSError, ValueError, TypeError):
+            index_reusable = False
+    if not index_reusable:
+        index_result = execute(
+            'hisat2_index',
+            [hisat2_build, '-p', str(threads), str(reference_fasta), str(index_prefix)],
+            output_dir / 'hisat2_build.log',
+        )
+        if index_result['status'] != 'completed' or not _hisat2_index_complete(index_prefix):
+            return _write_omics_manifest(output_dir, 'rnaseq_alignment.json', {
+                'status': 'failed',
+                'workflow': 'rnaseq_alignment',
+                'alignment_paths': [str(path) for path in alignment_paths],
+                'steps': steps,
+                'provenance': provenance,
+            })
+        index_metadata.write_text(
+            json.dumps({
+                'reference_fasta': str(reference_fasta),
+                'reference_sha256': reference_sha256,
+                'index_prefix': str(index_prefix),
+            }, ensure_ascii=False, indent=2) + '\n',
+            encoding='utf-8',
+        )
+    sample_results = []
+    for fastq_path, sample_name, alignment_path in zip(paths, sample_names, alignment_paths):
+        sam_path = output_dir / f'{sample_name}.hisat2.sam'
+        raw_bam = output_dir / f'{sample_name}.hisat2.raw.bam'
+        hisat2_result = execute(
+            f'hisat2_{sample_name}',
+            [
+                hisat2, '-p', str(threads), '--dta',
+                '-x', str(index_prefix), '-U', str(fastq_path),
+                '-S', str(sam_path),
+            ],
+            output_dir / f'{sample_name}.hisat2.log',
+        )
+        if hisat2_result['status'] != 'completed' or not sam_path.is_file():
+            return _write_omics_manifest(output_dir, 'rnaseq_alignment.json', {
+                'status': 'failed',
+                'workflow': 'rnaseq_alignment',
+                'alignment_paths': [str(path) for path in alignment_paths],
+                'steps': steps,
+                'provenance': provenance,
+            })
+        view_result = execute(
+            f'samtools_view_{sample_name}',
+            [samtools, 'view', '-b', '-o', str(raw_bam), str(sam_path)],
+            output_dir / f'{sample_name}.view.log',
+        )
+        if view_result['status'] != 'completed':
+            return _write_omics_manifest(output_dir, 'rnaseq_alignment.json', {
+                'status': 'failed',
+                'workflow': 'rnaseq_alignment',
+                'alignment_paths': [str(path) for path in alignment_paths],
+                'steps': steps,
+                'provenance': provenance,
+            })
+        sort_result = execute(
+            f'samtools_sort_{sample_name}',
+            [samtools, 'sort', '-o', str(alignment_path), str(raw_bam)],
+            output_dir / f'{sample_name}.sort.log',
+        )
+        if sort_result['status'] != 'completed' or not alignment_path.is_file():
+            return _write_omics_manifest(output_dir, 'rnaseq_alignment.json', {
+                'status': 'failed',
+                'workflow': 'rnaseq_alignment',
+                'alignment_paths': [str(path) for path in alignment_paths],
+                'steps': steps,
+                'provenance': provenance,
+            })
+        index_result = execute(
+            f'samtools_index_{sample_name}',
+            [samtools, 'index', str(alignment_path)],
+            output_dir / f'{sample_name}.index.log',
+        )
+        if index_result['status'] != 'completed':
+            return _write_omics_manifest(output_dir, 'rnaseq_alignment.json', {
+                'status': 'failed',
+                'workflow': 'rnaseq_alignment',
+                'alignment_paths': [str(path) for path in alignment_paths],
+                'steps': steps,
+                'provenance': provenance,
+            })
+        sam_path.unlink(missing_ok=True)
+        raw_bam.unlink(missing_ok=True)
+        sample_results.append({
+            'sample_id': sample_name,
+            'fastq_path': str(fastq_path),
+            'bam_path': str(alignment_path),
+            'bai_path': str(Path(str(alignment_path) + '.bai')),
+            'overall_alignment_rate': _parse_hisat2_alignment_rate(hisat2_result.get('stderr')),
+        })
+    return _write_omics_manifest(output_dir, 'rnaseq_alignment.json', {
+        'status': 'completed',
+        'workflow': 'rnaseq_alignment',
+        'reference_fasta': str(reference_fasta),
+        'index_prefix': str(index_prefix),
+        'alignment_paths': [str(path) for path in alignment_paths],
+        'samples': sample_results,
+        'steps': steps,
+        'provenance': provenance,
+    })
 
 
 def run_feature_counts(alignment_paths, annotation_gtf, output_dir, output_csv=None,
@@ -1805,7 +2026,7 @@ TOOLS = {
         'function': annotate_variants,
     },
     'inspect_toolchain': {
-        'description': 'Report whether GATK, SAMtools, bcftools, featureCounts and VEP are available in the execution environment.',
+        'description': 'Report whether HISAT2, SAMtools, bcftools, featureCounts, GATK and VEP are available in the execution environment.',
         'parameters': _parameters({}),
         'function': toolchain_status,
     },
@@ -1849,6 +2070,28 @@ TOOLS = {
             'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 3600},
         }, required=('vcf_path', 'reference_fasta', 'output_dir')),
         'function': normalize_variants,
+    },
+    'run_rnaseq_alignment': {
+        'description': 'Align single-end RNA-seq FASTQ files to a reference FASTA with HISAT2 and emit sorted indexed BAM files with alignment provenance.',
+        'parameters': _parameters({
+            'fastq_paths': {
+                'oneOf': [
+                    {'type': 'string'},
+                    {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1},
+                ],
+            },
+            'reference_fasta': {'type': 'string'},
+            'output_dir': {'type': 'string'},
+            'output_alignment_paths': {
+                'oneOf': [
+                    {'type': 'string'},
+                    {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1},
+                ],
+            },
+            'threads': {'type': 'integer', 'minimum': 1, 'maximum': 64},
+            'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 3600},
+        }, required=('fastq_paths', 'reference_fasta', 'output_dir')),
+        'function': run_rnaseq_alignment,
     },
     'run_feature_counts': {
         'description': 'Generate a gene-by-sample RNA-seq count matrix from BAM/CRAM alignments and a GTF annotation using featureCounts.',

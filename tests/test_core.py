@@ -19,7 +19,7 @@ from src.audit_external_overlap import audit_overlap, remove_structure_overlap
 from src.build_hard_decoy_benchmark import build_hard_decoy_benchmark, build_random_control_benchmark
 from src.compare_benchmarks import compare_benchmarks, compare_benchmark_replicates
 from src.run_benchmark_replicates import _normalize_id, _validate_control, _validate_hard_benchmark
-from src.omics_agent import TOOLS as OMICS_TOOLS, _external_tool_version, _resolve_statistics_backend, annotate_variants, normalize_variants, run_feature_counts, run_genomics_qc, run_metagenomics_qc, run_omics_analysis, run_single_cell_10x_qc, run_single_cell_qc, run_tool as run_omics_tool, run_variant_calling, search_gene_evidence, statistics_backend_status, toolchain_status
+from src.omics_agent import TOOLS as OMICS_TOOLS, _external_tool_version, _resolve_statistics_backend, annotate_variants, normalize_variants, run_feature_counts, run_genomics_qc, run_metagenomics_qc, run_omics_analysis, run_rnaseq_alignment, run_single_cell_10x_qc, run_single_cell_qc, run_tool as run_omics_tool, run_variant_calling, search_gene_evidence, statistics_backend_status, toolchain_status
 from src.domain_registry import run_tool as run_domain_tool, tool_specs, validate_tool_map
 from src.workflow_runner import run_workflow
 from src.resplit_external import joint_split_indices
@@ -710,6 +710,20 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(result['available'])
         self.assertEqual(result['version'], 'featureCounts v2.0.8')
         self.assertEqual(mocked_run.call_args.args[0], ['/usr/bin/featureCounts', '-v'])
+        self.assertEqual(mocked_run.call_args.kwargs['errors'], 'replace')
+
+    @patch('src.omics_agent.shutil.which', return_value=None)
+    def test_rnaseq_alignment_reports_missing_native_tools(self, mocked_which):
+        with tempfile.TemporaryDirectory(prefix='cadd_rnaseq_alignment_') as raw:
+            root = Path(raw)
+            fastq_path = root / 'A1.fastq'
+            reference_path = root / 'reference.fa'
+            fastq_path.write_text('@r1\nACGT\n+\nIIII\n', encoding='utf-8')
+            reference_path.write_text('>chr1\nACGT\n', encoding='utf-8')
+            result = run_rnaseq_alignment([fastq_path], reference_path, root / 'output')
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertEqual(result['missing_tools'], ['hisat2', 'hisat2-build', 'samtools'])
+        self.assertEqual(mocked_which.call_count, 3)
 
     def test_single_cell_qc_calculates_metrics_and_filters_cells(self):
         with tempfile.TemporaryDirectory(prefix='cadd_single_cell_qc_') as raw:

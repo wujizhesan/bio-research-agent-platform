@@ -183,6 +183,30 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(step['args']['strand'], 1)
         self.assertIn('featureCounts', result['rationale'][0])
 
+    def test_research_planner_chains_fastq_alignment_into_rnaseq_analysis(self):
+        result = run_tool('research_build_workflow', {
+            'task': 'Align FASTQ RNA-seq reads and run differential expression',
+            'domains': ['omics'],
+            'inputs': {
+                'fastq_paths': ['data/A1.fastq', 'data/B1.fastq'],
+                'reference_fasta': 'data/reference.fa',
+                'annotation_gtf': 'data/gencode.gtf',
+                'metadata_csv': 'examples/rnaseq/metadata.csv',
+                'gene_sets_csv': 'examples/rnaseq/gene_sets.csv',
+                'statistics_backend': 'scipy',
+            },
+        })
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['selected_tools'], [
+            'omics_run_rnaseq_alignment', 'omics_run_feature_counts', 'omics_run_analysis',
+        ])
+        alignment_step, counting_step, analysis_step = result['workflow']['steps']
+        self.assertEqual(alignment_step['id'], 'rnaseq_alignment')
+        self.assertEqual(counting_step['depends_on'], ['rnaseq_alignment'])
+        self.assertEqual(counting_step['args']['alignment_paths'], '${rnaseq_alignment.alignment_paths}')
+        self.assertEqual(analysis_step['depends_on'], ['rnaseq_feature_counts'])
+        self.assertEqual(analysis_step['args']['expression_csv'], '${rnaseq_feature_counts.output_csv}')
+
     def test_research_planner_chains_feature_counts_into_rnaseq_analysis(self):
         result = run_tool('research_build_workflow', {
             'task': 'Quantify aligned RNA-seq reads and run differential expression and pathway enrichment',
