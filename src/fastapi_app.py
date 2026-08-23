@@ -9,6 +9,7 @@ from importlib.util import find_spec
 from pathlib import Path
 from time import monotonic, time
 from typing import Any
+from uuid import uuid4
 
 import jwt
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
@@ -45,6 +46,7 @@ except ImportError:
 
 API_NAME = 'bio-research-agent-api'
 API_VERSION = '0.2.0'
+A2A_PROTOCOL_VERSION = '0.3.0'
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_ROOT = PROJECT_ROOT / 'output'
 ARTIFACT_RESULT_KEYS = frozenset({
@@ -117,6 +119,70 @@ def _resolve_artifact_path(raw_path, output_root):
         if resolved.is_file():
             return resolved
     return None
+
+
+def _a2a_response(request_id, result=None, error=None):
+    response = {'jsonrpc': '2.0', 'id': request_id}
+    if error is not None:
+        response['error'] = error
+    else:
+        response['result'] = result
+    return response
+
+
+def _a2a_error(request_id, code, message, data=None):
+    error = {'code': code, 'message': message}
+    if data is not None:
+        error['data'] = data
+    return _a2a_response(request_id, error=error)
+
+
+def _a2a_task(record, context_id, history=None):
+    state = {
+        'queued': 'submitted',
+        'running': 'working',
+        'completed': 'completed',
+        'failed': 'failed',
+        'cancelled': 'canceled',
+    }.get(record.get('status'), 'unknown')
+    status_payload = {
+        'state': state,
+        'timestamp': record.get('finished_at') or record.get('started_at') or record.get('created_at'),
+    }
+    if record.get('error'):
+        status_payload['message'] = {
+            'kind': 'message',
+            'role': 'agent',
+            'messageId': f"{record['job_id']}-error",
+            'parts': [{'kind': 'text', 'text': str(record['error'])}],
+        }
+    task = {
+        'kind': 'task',
+        'id': record['job_id'],
+        'contextId': context_id,
+        'status': status_payload,
+        'metadata': {
+            'bio.job_id': record['job_id'],
+            'bio.tool': record['tool'],
+        },
+    }
+    if history:
+        task['history'] = history
+    if record.get('status') == 'completed' and record.get('result') is not None:
+        task['artifacts'] = [{
+            'artifactId': f"{record['job_id']}-result",
+            'name': 'structured-result',
+            'parts': [{'kind': 'data', 'data': record['result']}],
+        }]
+    return task
+
+
+def _a2a_message_text(message):
+    texts = []
+    for part in message.get('parts', []) if isinstance(message.get('parts'), list) else []:
+        if isinstance(part, dict) and part.get('kind') == 'text' and isinstance(part.get('text'), str):
+            texts.append(part['text'])
+    return '\n'.join(texts).strip()
 
 
 def create_app(job_manager=None, plugin_manager=None, database=None, file_storage=None, audit_log=None):
@@ -343,8 +409,121 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
                     'protocol': 'Python call',
                     'entrypoint': 'src.domain_registry.run_tool',
                 },
+                'a2a': {
+                    'status': 'available',
+                    'protocol': f'A2A JSON-RPC {A2A_PROTOCOL_VERSION}',
+                    'endpoint': '/a2a',
+                    'agent_card': '/.well-known/agent-card.json',
+                    'methods': ['message/send', 'tasks/get', 'tasks/cancel'],
+                },
             },
         }
+
+    @app.get('/.well-known/agent-card.json', tags=['a2a'])
+    async def agent_card(request: Request):
+        card = {
+            'protocolVersion': A2A_PROTOCOL_VERSION,
+            'name': 'Bio Research Agent',
+            'description': 'Pluggable bioinformatics research agent for CADD, omics, imaging, evidence and sequence workflows.',
+            'url': f'{str(request.base_url).rstrip("/")}/a2a',
+            'preferredTransport': 'JSONRPC',
+            'version': API_VERSION,
+            'capabilities': {
+                'streaming': False,
+                'pushNotifications': False,
+                'stateTransitionHistory': False,
+            },
+            'defaultInputModes': ['text/plain', 'application/json'],
+            'defaultOutputModes': ['application/json'],
+            'skills': [{
+                'id': 'bioinformatics-research',
+                'name': 'Bioinformatics research workflows',
+                'description': 'Plan and execute traceable multi-domain research workflows.',
+                'tags': ['cadd', 'omics', 'imaging', 'literature', 'knowledge', 'sequence'],
+                'examples': ['Run an RNA-seq analysis and design an mRNA sequence.'],
+            }],
+        }
+        if auth.enabled:
+            card['securitySchemes'] = {'bearerAuth': {'type': 'http', 'scheme': 'bearer'}}
+            card['security'] = [{'bearerAuth': []}]
+        return card
+
+    @app.post('/a2a', tags=['a2a'])
+    async def a2a_rpc(payload: dict[str, Any], principal: Principal = Depends(current_principal)):
+        request_id = payload.get('id')
+        if payload.get('jsonrpc') != '2.0' or not isinstance(payload.get('method'), str):
+            return _a2a_error(request_id, -32600, 'invalid JSON-RPC request')
+        params = payload.get('params', {})
+        if not isinstance(params, dict):
+            return _a2a_error(request_id, -32602, 'params must be an object')
+        method = payload['method']
+
+        if method == 'message/send':
+            if not auth.has_permission(principal, 'jobs:write'):
+                return _a2a_error(request_id, -32003, 'insufficient permissions')
+            message = params.get('message')
+            if not isinstance(message, dict) or message.get('role', 'user') != 'user':
+                return _a2a_error(request_id, -32602, 'message with role=user is required')
+            if message.get('taskId'):
+                return _a2a_error(request_id, -32602, 'task continuation is not supported by this adapter')
+            normalized_message = dict(message)
+            normalized_message.setdefault('kind', 'message')
+            normalized_message.setdefault('messageId', uuid4().hex)
+            message_metadata = message.get('metadata') if isinstance(message.get('metadata'), dict) else {}
+            request_metadata = params.get('metadata') if isinstance(params.get('metadata'), dict) else {}
+            tool = message_metadata.get('tool') or request_metadata.get('tool')
+            arguments = message_metadata.get('arguments')
+            if arguments is None:
+                arguments = request_metadata.get('arguments')
+            text = _a2a_message_text(message)
+            if tool is None:
+                tool = 'research_plan'
+                arguments = {'task': text or 'Plan a bioinformatics research task.'}
+            if not isinstance(tool, str) or not tool:
+                return _a2a_error(request_id, -32602, 'metadata.tool must be a non-empty string')
+            if not isinstance(arguments, dict):
+                return _a2a_error(request_id, -32602, 'metadata.arguments must be an object')
+            try:
+                accepted = await submit_job(
+                    JobCreate(tool=tool, arguments=arguments),
+                    idempotency_key=normalized_message['messageId'],
+                    principal=principal,
+                )
+            except HTTPException as exc:
+                return _a2a_error(request_id, -32000, str(exc.detail))
+            record = accepted['job']
+            return _a2a_response(
+                request_id,
+                result={'task': _a2a_task(record, f"bio-{record['job_id']}", [normalized_message])},
+            )
+
+        if method == 'tasks/get':
+            if not auth.has_permission(principal, 'jobs:read'):
+                return _a2a_error(request_id, -32003, 'insufficient permissions')
+            task_id = params.get('id')
+            if not isinstance(task_id, str) or not task_id:
+                return _a2a_error(request_id, -32602, 'id is required')
+            record = await read_job(task_id)
+            if record is None:
+                return _a2a_error(request_id, -32001, 'task not found', {'taskId': task_id})
+            return _a2a_response(request_id, result={'task': _a2a_task(record, f'bio-{task_id}')})
+
+        if method == 'tasks/cancel':
+            if not auth.has_permission(principal, 'jobs:write'):
+                return _a2a_error(request_id, -32003, 'insufficient permissions')
+            task_id = params.get('id')
+            if not isinstance(task_id, str) or not task_id:
+                return _a2a_error(request_id, -32602, 'id is required')
+            try:
+                record = jobs.cancel(task_id)
+            except ValueError as exc:
+                return _a2a_error(request_id, -32001, str(exc))
+            await db.upsert_job(record)
+            JOB_STATUS.labels(record['tool'], record['status']).set(1)
+            audit.record(principal, 'job.cancel', 'job', task_id, {'status': record['status'], 'transport': 'a2a'})
+            return _a2a_response(request_id, result={'task': _a2a_task(record, f'bio-{task_id}')})
+
+        return _a2a_error(request_id, -32601, f'method not found: {method}')
 
     @app.get('/api/v1/runs', dependencies=[Depends(require_permission('runs:read'))], tags=['runs'])
     async def runs(limit: int = Query(default=20, ge=1, le=100)):

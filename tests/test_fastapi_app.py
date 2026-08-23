@@ -119,13 +119,68 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertGreater(payload['tool_count'], 0)
                     self.assertEqual(
                         set(payload['interfaces']),
-                        {'rest', 'sse', 'mcp', 'embedded'},
+                        {'rest', 'sse', 'mcp', 'embedded', 'a2a'},
                     )
                     self.assertEqual(payload['interfaces']['rest']['openapi'], '/openapi.json')
                     self.assertEqual(payload['interfaces']['sse']['status'], 'available')
                     self.assertIn(payload['interfaces']['mcp']['status'], {'available', 'dependency_missing'})
                     self.assertEqual(payload['interfaces']['embedded']['status'], 'available')
+                    self.assertEqual(payload['interfaces']['a2a']['endpoint'], '/a2a')
                     self.assertIn('/api/v1/capabilities', client.get('/openapi.json').json()['paths'])
+            finally:
+                self._close_app(app)
+
+    def test_a2a_agent_card_and_jsonrpc_task_lifecycle(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_a2a_') as raw:
+            app = self._app(raw)
+            try:
+                with TestClient(app) as client:
+                    card = client.get('/.well-known/agent-card.json')
+                    self.assertEqual(card.status_code, 200)
+                    self.assertEqual(card.json()['protocolVersion'], '0.3.0')
+                    self.assertTrue(card.json()['url'].endswith('/a2a'))
+                    self.assertEqual(card.json()['capabilities']['streaming'], False)
+
+                    sent = client.post('/a2a', json={
+                        'jsonrpc': '2.0',
+                        'id': 'send-1',
+                        'method': 'message/send',
+                        'params': {
+                            'message': {
+                                'role': 'user',
+                                'messageId': 'a2a-message-1',
+                                'parts': [{'kind': 'text', 'text': 'list available research capabilities'}],
+                                'metadata': {'tool': 'research_catalog', 'arguments': {}},
+                            },
+                        },
+                    })
+                    self.assertEqual(sent.status_code, 200)
+                    task = sent.json()['result']['task']
+                    self.assertEqual(task['kind'], 'task')
+                    self.assertEqual(task['id'], task['metadata']['bio.job_id'])
+
+                    final = task
+                    for _ in range(100):
+                        queried = client.post('/a2a', json={
+                            'jsonrpc': '2.0',
+                            'id': 'get-1',
+                            'method': 'tasks/get',
+                            'params': {'id': task['id']},
+                        })
+                        final = queried.json()['result']['task']
+                        if final['status']['state'] in {'completed', 'failed', 'canceled'}:
+                            break
+                        time.sleep(0.05)
+                    self.assertEqual(final['status']['state'], 'completed')
+                    self.assertIn('artifacts', final)
+
+                    unknown = client.post('/a2a', json={
+                        'jsonrpc': '2.0',
+                        'id': 'unknown-1',
+                        'method': 'unknown/method',
+                        'params': {},
+                    })
+                    self.assertEqual(unknown.json()['error']['code'], -32601)
             finally:
                 self._close_app(app)
 
