@@ -82,7 +82,8 @@ _EVIDENCE_PROVIDER_KEYWORDS += (
 
 _VARIANT_KEYWORDS = (
     'variant', 'vcf', 'mutation', 'gatk', 'samtools', 'gene annotation',
-    'variant annotation', '变异', '突变', '基因注释', '变异解读',
+    'variant annotation', 'variant calling', 'variant caller', 'mpileup',
+    '变异', '突变', '基因注释', '变异解读', '变异检测',
 )
 
 _GENOMICS_QC_KEYWORDS = (
@@ -179,6 +180,16 @@ def _is_variant_task(task, inputs=None):
     return any(keyword.lower() in text for keyword in _VARIANT_KEYWORDS)
 
 
+def _is_variant_calling_task(task, inputs=None):
+    inputs = inputs or {}
+    if any(key in inputs for key in ('reference_fasta', 'reference_path', 'reference_genome')):
+        return bool(inputs.get('bam_path') or inputs.get('input_bam') or inputs.get('cram_path'))
+    text = str(task or '').lower()
+    return any(keyword in text for keyword in (
+        'variant calling', 'variant caller', 'call variants', 'mpileup', '变异检测',
+    ))
+
+
 def _is_genomics_qc_task(task, inputs=None):
     inputs = inputs or {}
     if any(key in inputs for key in ('input_path', 'fastq_path', 'bam_path', 'cram_path')):
@@ -225,6 +236,11 @@ def _required_inputs(domains, task=None, inputs=None):
                 ])
             else:
                 required.append({'name': 'matrix_csv', 'description': 'cell-by-gene count matrix CSV'})
+        elif _is_variant_calling_task(task, inputs):
+            required.extend([
+                {'name': 'bam_path', 'description': 'aligned BAM/CRAM file for variant calling'},
+                {'name': 'reference_fasta', 'description': 'reference genome FASTA with matching contigs'},
+            ])
         elif _is_genomics_qc_task(task, inputs):
             required.append({'name': 'input_path', 'description': 'FASTQ, BAM/CRAM or VCF/BCF input file'})
         elif _is_variant_task(task, inputs):
@@ -284,6 +300,7 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
     metagenomics_task = _is_metagenomics_task(task, inputs)
     single_cell_task = _is_single_cell_task(task, inputs)
     single_cell_10x_task = _is_single_cell_10x_task(task, inputs)
+    variant_calling_task = _is_variant_calling_task(task, inputs)
     qc_task = _is_genomics_qc_task(task, inputs)
     if 'omics' in domains and metagenomics_task:
         abundance_csv = inputs.get('abundance_csv') or inputs.get('metagenomics_abundance')
@@ -345,6 +362,30 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
                     'args': single_cell_args,
                 })
                 rationale.append('single-cell QC calculates genes-per-cell, total counts and mitochondrial fraction')
+    elif 'omics' in domains and variant_calling_task:
+        bam_path = inputs.get('bam_path') or inputs.get('input_bam') or inputs.get('cram_path')
+        reference_fasta = inputs.get('reference_fasta') or inputs.get('reference_path') or inputs.get('reference_genome')
+        if not bam_path:
+            missing.append('bam_path')
+        if not reference_fasta:
+            missing.append('reference_fasta')
+        if bam_path and reference_fasta:
+            variant_calling_args = {
+                'bam_path': str(bam_path),
+                'reference_fasta': str(reference_fasta),
+                'output_dir': output_dir,
+            }
+            if inputs.get('output_vcf'):
+                variant_calling_args['output_vcf'] = str(inputs['output_vcf'])
+            for key in ('region', 'min_mapping_quality', 'min_base_quality', 'timeout'):
+                if inputs.get(key) is not None:
+                    variant_calling_args[key] = inputs[key]
+            steps.append({
+                'id': 'variant_calling',
+                'tool': 'omics_run_variant_calling',
+                'args': variant_calling_args,
+            })
+            rationale.append('variant calling uses indexed BAM/CRAM, reference FASTA and fixed bcftools mpileup/call commands with provenance')
     elif 'omics' in domains and qc_task:
         qc_input = (
             inputs.get('input_path')

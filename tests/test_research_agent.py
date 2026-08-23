@@ -147,6 +147,22 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(result['selected_tools'], ['omics_run_genomics_qc'])
         self.assertEqual(result['workflow']['steps'][0]['args']['input_type'], 'fastq')
 
+    def test_research_planner_builds_variant_calling_workflow(self):
+        result = run_tool('research_build_workflow', {
+            'task': 'Call variants from aligned BAM against a reference genome',
+            'domains': ['omics'],
+            'inputs': {
+                'bam_path': 'data/sample.bam',
+                'reference_fasta': 'data/reference.fa',
+                'region': 'chr1:1-1000',
+                'min_mapping_quality': 20,
+            },
+        })
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['selected_tools'], ['omics_run_variant_calling'])
+        self.assertEqual(result['workflow']['steps'][0]['args']['region'], 'chr1:1-1000')
+        self.assertIn('bcftools mpileup/call', result['rationale'][0])
+
     def test_research_planner_builds_single_cell_qc_workflow(self):
         result = run_tool('research_build_workflow', {
             'task': '分析单细胞 RNA-seq 表达矩阵并进行 QC',

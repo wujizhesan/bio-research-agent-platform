@@ -8,6 +8,10 @@ RUN python -m venv /opt/venv \
 
 FROM python:3.12-slim AS runtime
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends samtools bcftools \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

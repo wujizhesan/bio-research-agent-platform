@@ -1,6 +1,7 @@
 """RNA-seq domain adapter with structured tools and reproducible outputs."""
 import argparse
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -14,7 +15,7 @@ import pandas as pd
 from scipy.stats import hypergeom, ttest_ind
 
 PLUGIN_NAME = 'RNA-seq and omics domain'
-PLUGIN_VERSION = '0.2.0'
+PLUGIN_VERSION = '0.3.0'
 PLUGIN_API_VERSION = 1
 PLUGIN_CAPABILITIES = (
     'omics.end_to_end',
@@ -23,6 +24,7 @@ PLUGIN_CAPABILITIES = (
     'omics.evidence',
     'omics.report',
     'omics.variant_annotation',
+    'omics.variant_calling',
     'omics.toolchain',
     'omics.genomics_qc',
     'omics.single_cell_qc',
@@ -312,6 +314,200 @@ def toolchain_status():
             'reason': None if path else f'{executable} not found',
         }
     return status
+
+
+def _file_sha256(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _external_tool_version(executable):
+    try:
+        result = subprocess.run(
+            [executable, '--version'],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {'available': False, 'error': str(exc)}
+    output = (result.stdout or result.stderr or '').strip()
+    return {
+        'available': result.returncode == 0,
+        'version': output.splitlines()[0] if output else None,
+        'returncode': result.returncode,
+    }
+
+
+def _run_variant_command(command, timeout, stdout_path=None):
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stderr = str(exc.stderr or '')
+        if stdout_path:
+            Path(stdout_path).write_text(str(exc.stdout or ''), encoding='utf-8')
+        return {
+            'status': 'failed',
+            'returncode': None,
+            'error': f'command timed out after {timeout}s',
+            'stderr': stderr,
+        }
+    except OSError as exc:
+        return {
+            'status': 'failed',
+            'returncode': None,
+            'error': str(exc),
+            'stderr': '',
+        }
+    if stdout_path:
+        Path(stdout_path).write_text(completed.stdout or '', encoding='utf-8')
+    result = {
+        'status': 'completed' if completed.returncode == 0 else 'failed',
+        'returncode': completed.returncode,
+    }
+    if completed.returncode != 0:
+        result['error'] = (completed.stderr or completed.stdout or 'external command failed').strip()
+    if completed.stderr:
+        result['stderr'] = completed.stderr
+    return result
+
+
+def run_variant_calling(bam_path, reference_fasta, output_dir, output_vcf=None,
+                        region=None, min_mapping_quality=0, min_base_quality=13,
+                        timeout=600):
+    bam_path = Path(bam_path)
+    reference_fasta = Path(reference_fasta)
+    if not bam_path.is_file():
+        raise ValueError(f'BAM/CRAM input does not exist: {bam_path}')
+    if bam_path.suffix.lower() not in {'.bam', '.cram'}:
+        raise ValueError('variant calling requires a BAM or CRAM input')
+    if not reference_fasta.is_file():
+        raise ValueError(f'reference FASTA does not exist: {reference_fasta}')
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_vcf = Path(output_vcf) if output_vcf else output_dir / 'variants.vcf'
+    output_vcf.parent.mkdir(parents=True, exist_ok=True)
+    raw_bcf = output_dir / 'mpileup.bcf'
+    stats_path = output_dir / 'bcftools_stats.txt'
+    timeout = max(1, min(int(timeout), 3600))
+    min_mapping_quality = max(0, int(min_mapping_quality))
+    min_base_quality = max(0, int(min_base_quality))
+    samtools = shutil.which('samtools')
+    bcftools = shutil.which('bcftools')
+    missing_tools = [name for name, path in (('samtools', samtools), ('bcftools', bcftools)) if not path]
+    provenance = {
+        'inputs': {
+            'bam_or_cram': {'path': str(bam_path), 'sha256': _file_sha256(bam_path)},
+            'reference_fasta': {'path': str(reference_fasta), 'sha256': _file_sha256(reference_fasta)},
+        },
+        'parameters': {
+            'region': region,
+            'min_mapping_quality': min_mapping_quality,
+            'min_base_quality': min_base_quality,
+        },
+        'tools': {},
+    }
+    if missing_tools:
+        return _write_qc_manifest(output_dir, {
+            'status': 'unavailable',
+            'workflow': 'reference_based_variant_calling',
+            'input_type': 'bam' if bam_path.suffix.lower() == '.bam' else 'cram',
+            'output_vcf': str(output_vcf),
+            'missing_tools': missing_tools,
+            'reason': 'required native variant-calling tools are not installed',
+            'provenance': provenance,
+        })
+    provenance['tools'] = {
+        'samtools': {'path': samtools, **_external_tool_version(samtools)},
+        'bcftools': {'path': bcftools, **_external_tool_version(bcftools)},
+    }
+    steps = []
+
+    def execute(step_id, command, stdout_path=None):
+        result = _run_variant_command(command, timeout, stdout_path)
+        steps.append({
+            'id': step_id,
+            'command': command,
+            **result,
+        })
+        return result
+
+    reference_index = Path(str(reference_fasta) + '.fai')
+    if not reference_index.is_file():
+        result = execute('reference_index', [samtools, 'faidx', str(reference_fasta)])
+        if result['status'] != 'completed':
+            return _write_qc_manifest(output_dir, {
+                'status': 'failed',
+                'workflow': 'reference_based_variant_calling',
+                'output_vcf': str(output_vcf),
+                'steps': steps,
+                'provenance': provenance,
+            })
+    bam_index = Path(str(bam_path) + '.bai')
+    cram_index = Path(str(bam_path) + '.crai')
+    alternate_index = bam_path.with_suffix('.bai')
+    if not any(path.is_file() for path in (bam_index, cram_index, alternate_index)):
+        result = execute('alignment_index', [samtools, 'index', str(bam_path)])
+        if result['status'] != 'completed':
+            return _write_qc_manifest(output_dir, {
+                'status': 'failed',
+                'workflow': 'reference_based_variant_calling',
+                'output_vcf': str(output_vcf),
+                'steps': steps,
+                'provenance': provenance,
+            })
+    mpileup_command = [
+        bcftools, 'mpileup', '-Ou', '-f', str(reference_fasta),
+        '-q', str(min_mapping_quality), '-Q', str(min_base_quality),
+    ]
+    if region:
+        mpileup_command.extend(['-r', str(region)])
+    mpileup_command.extend(['-o', str(raw_bcf), str(bam_path)])
+    result = execute('mpileup', mpileup_command, output_dir / 'mpileup.log')
+    if result['status'] != 'completed':
+        return _write_qc_manifest(output_dir, {
+            'status': 'failed',
+            'workflow': 'reference_based_variant_calling',
+            'output_vcf': str(output_vcf),
+            'steps': steps,
+            'provenance': provenance,
+        })
+    result = execute(
+        'variant_call',
+        [bcftools, 'call', '-mv', '-Ov', '-o', str(output_vcf), str(raw_bcf)],
+        output_dir / 'variant_call.log',
+    )
+    if result['status'] != 'completed' or not output_vcf.is_file():
+        return _write_qc_manifest(output_dir, {
+            'status': 'failed',
+            'workflow': 'reference_based_variant_calling',
+            'output_vcf': str(output_vcf),
+            'steps': steps,
+            'provenance': provenance,
+        })
+    stats = execute('variant_stats', [bcftools, 'stats', str(output_vcf)], stats_path)
+    stats_text = stats_path.read_text(encoding='utf-8') if stats_path.is_file() else ''
+    return _write_qc_manifest(output_dir, {
+        'status': 'completed' if stats['status'] == 'completed' else 'failed',
+        'workflow': 'reference_based_variant_calling',
+        'input_type': 'bam' if bam_path.suffix.lower() == '.bam' else 'cram',
+        'inputs': [str(bam_path), str(reference_fasta)],
+        'output_vcf': str(output_vcf),
+        'raw_bcf': str(raw_bcf),
+        'number_of_records': _parse_stat_value(stats_text, 'number of records'),
+        'steps': steps,
+        'provenance': provenance,
+    })
 
 
 GENOMICS_QC_TYPES = ('auto', 'fastq', 'bam', 'vcf')
@@ -1284,6 +1480,20 @@ TOOLS = {
             'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 3600},
         }, required=('input_path', 'output_dir')),
         'function': run_genomics_qc,
+    },
+    'run_variant_calling': {
+        'description': 'Call small variants from an indexed BAM/CRAM against a reference FASTA with SAMtools and bcftools, producing a VCF and provenance manifest.',
+        'parameters': _parameters({
+            'bam_path': {'type': 'string'},
+            'reference_fasta': {'type': 'string'},
+            'output_dir': {'type': 'string'},
+            'output_vcf': {'type': 'string'},
+            'region': {'type': 'string'},
+            'min_mapping_quality': {'type': 'integer', 'minimum': 0},
+            'min_base_quality': {'type': 'integer', 'minimum': 0},
+            'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 3600},
+        }, required=('bam_path', 'reference_fasta', 'output_dir')),
+        'function': run_variant_calling,
     },
     'run_single_cell_qc': {
         'description': 'Calculate single-cell expression QC metrics and write a filtered cell matrix without requiring Scanpy.',

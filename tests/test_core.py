@@ -19,7 +19,7 @@ from src.audit_external_overlap import audit_overlap, remove_structure_overlap
 from src.build_hard_decoy_benchmark import build_hard_decoy_benchmark, build_random_control_benchmark
 from src.compare_benchmarks import compare_benchmarks, compare_benchmark_replicates
 from src.run_benchmark_replicates import _normalize_id, _validate_control, _validate_hard_benchmark
-from src.omics_agent import TOOLS as OMICS_TOOLS, _resolve_statistics_backend, annotate_variants, run_genomics_qc, run_metagenomics_qc, run_omics_analysis, run_single_cell_10x_qc, run_single_cell_qc, run_tool as run_omics_tool, search_gene_evidence, statistics_backend_status, toolchain_status
+from src.omics_agent import TOOLS as OMICS_TOOLS, _resolve_statistics_backend, annotate_variants, run_genomics_qc, run_metagenomics_qc, run_omics_analysis, run_single_cell_10x_qc, run_single_cell_qc, run_tool as run_omics_tool, run_variant_calling, search_gene_evidence, statistics_backend_status, toolchain_status
 from src.domain_registry import run_tool as run_domain_tool, tool_specs, validate_tool_map
 from src.workflow_runner import run_workflow
 from src.resplit_external import joint_split_indices
@@ -534,6 +534,56 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result['tool'], 'bcftools')
         self.assertEqual(result['number_of_records'], '4')
         self.assertEqual(mocked_run.call_args.args[0][1], 'stats')
+
+    @patch('src.omics_agent.shutil.which', return_value=None)
+    def test_variant_calling_reports_missing_native_tools(self, mocked_which):
+        with tempfile.TemporaryDirectory(prefix='cadd_variant_calling_') as raw:
+            root = Path(raw)
+            bam_path = root / 'aligned.bam'
+            reference_path = root / 'reference.fa'
+            bam_path.write_bytes(b'placeholder')
+            reference_path.write_text('>chr1\nACGT\n', encoding='utf-8')
+            result = run_variant_calling(bam_path, reference_path, root / 'calling')
+            manifest = json.loads((root / 'calling' / 'genomics_qc.json').read_text(encoding='utf-8'))
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertEqual(result['missing_tools'], ['samtools', 'bcftools'])
+        self.assertEqual(manifest['provenance']['inputs']['bam_or_cram']['sha256'], result['provenance']['inputs']['bam_or_cram']['sha256'])
+        mocked_which.assert_called()
+
+    @patch('src.omics_agent._external_tool_version', return_value={'available': True, 'version': 'test'})
+    @patch('src.omics_agent.shutil.which')
+    @patch('src.omics_agent.subprocess.run')
+    def test_variant_calling_runs_index_mpileup_call_and_stats(self, mocked_run, mocked_which, mocked_version):
+        mocked_which.side_effect = lambda name: f'/usr/bin/{name}'
+
+        def fake_run(command, **kwargs):
+            if command[1] == 'call':
+                output_vcf = Path(command[command.index('-o') + 1])
+                output_vcf.write_text('##fileformat=VCFv4.3\n', encoding='utf-8')
+            stdout = 'SN\t0\tnumber of records:\t2\n' if command[1] == 'stats' else ''
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr='')
+
+        mocked_run.side_effect = fake_run
+        with tempfile.TemporaryDirectory(prefix='cadd_variant_calling_') as raw:
+            root = Path(raw)
+            bam_path = root / 'aligned.bam'
+            reference_path = root / 'reference.fa'
+            bam_path.write_bytes(b'placeholder')
+            reference_path.write_text('>chr1\nACGT\n', encoding='utf-8')
+            result = run_variant_calling(
+                bam_path, reference_path, root / 'calling', region='chr1:1-4',
+                min_mapping_quality=20, min_base_quality=10,
+            )
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['number_of_records'], '2')
+        self.assertEqual([step['id'] for step in result['steps']], [
+            'reference_index', 'alignment_index', 'mpileup', 'variant_call', 'variant_stats',
+        ])
+        self.assertIn('bcftools', result['provenance']['tools'])
+        mpileup_command = result['steps'][2]['command']
+        self.assertIn('-r', mpileup_command)
+        self.assertIn('chr1:1-4', mpileup_command)
+        self.assertIn('run_variant_calling', OMICS_TOOLS)
 
     def test_single_cell_qc_calculates_metrics_and_filters_cells(self):
         with tempfile.TemporaryDirectory(prefix='cadd_single_cell_qc_') as raw:
