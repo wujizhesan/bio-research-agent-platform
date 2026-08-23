@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   ArrowUpRight,
@@ -160,14 +160,18 @@ async function uploadFile(base: string, token: string, file: File): Promise<Uplo
   return payload.file as UploadedFile
 }
 
-async function followJob(
+type JobEventPayload = { job?: Job; status?: string; error?: string }
+
+async function readJobStream(
   base: string,
   token: string,
   jobId: string,
-  onEvent: (type: string, payload: { job?: Job; status?: string; error?: string }) => void,
+  onEvent: (type: string, payload: JobEventPayload) => void,
+  signal?: AbortSignal,
 ) {
-  const response = await fetch(`${base}/api/v1/jobs/${jobId}/events?interval_seconds=0.15`, {
+  const response = await fetch(`${base}/api/v1/jobs/${jobId}/events?interval_seconds=0.15&timeout_seconds=300`, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
+    signal,
   })
   if (!response.ok || !response.body) {
     throw new Error(`无法订阅任务流: ${response.status}`)
@@ -181,12 +185,39 @@ async function followJob(
     const chunks = buffer.split('\n\n')
     buffer = chunks.pop() || ''
     for (const chunk of chunks) {
-      const lines = chunk.split('\n')
+      const lines = chunk.split('\n').map((line) => line.replace(/\r$/, ''))
       const type = lines.find((line) => line.startsWith('event:'))?.slice(6).trim() || 'message'
       const data = lines.filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n')
       if (data) onEvent(type, JSON.parse(data))
     }
     if (done) break
+  }
+}
+
+async function followJob(
+  base: string,
+  token: string,
+  jobId: string,
+  onEvent: (type: string, payload: JobEventPayload) => void,
+  signal?: AbortSignal,
+) {
+  let retries = 0
+  let lastEvent = ''
+  while (true) {
+    try {
+      await readJobStream(base, token, jobId, (type, payload) => {
+        const signature = `${type}:${JSON.stringify(payload)}`
+        if (signature === lastEvent) return
+        lastEvent = signature
+        retries = 0
+        onEvent(type, payload)
+      }, signal)
+      return
+    } catch (error) {
+      if (signal?.aborted || retries >= 2) throw error
+      retries += 1
+      await new Promise((resolve) => window.setTimeout(resolve, 500 * retries))
+    }
   }
 }
 
@@ -217,6 +248,18 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState('')
+  const streamController = useRef<AbortController | null>(null)
+
+  function beginJobStream() {
+    streamController.current?.abort()
+    const controller = new AbortController()
+    streamController.current = controller
+    return controller
+  }
+
+  function isCurrentStream(controller: AbortController) {
+    return streamController.current === controller
+  }
 
   const refresh = useCallback(async () => {
     setError('')
@@ -288,12 +331,14 @@ function App() {
     acceptedDetail: string,
     onCompleted?: (job: Job) => void,
   ) {
+    const controller = beginJobStream()
     setLoading(true)
     setError('')
     setEvents([])
     try {
       const response = await apiFetch<{ job: Job }>(apiBase, token, '/api/v1/jobs', {
         method: 'POST',
+        signal: controller.signal,
         headers: { 'Idempotency-Key': crypto.randomUUID() },
         body: JSON.stringify({ tool, arguments: arguments_ }),
       })
@@ -316,12 +361,16 @@ function App() {
             detail: type === 'timeout' ? 'SSE 订阅超时，任务仍可通过列表查询' : `状态更新为${statusLabels[currentJob.status] || currentJob.status}`,
           },
         ])
-      })
+      }, controller.signal)
     } catch (err) {
+      if (!isCurrentStream(controller) || (err instanceof Error && err.name === 'AbortError')) return
       setError(err instanceof Error ? err.message : '任务提交失败')
     } finally {
-      setLoading(false)
-      void refresh()
+      if (isCurrentStream(controller)) {
+        streamController.current = null
+        setLoading(false)
+        void refresh()
+      }
     }
   }
 
@@ -361,12 +410,14 @@ function App() {
   }
 
   async function submitOmicsDemo() {
+    const controller = beginJobStream()
     setLoading(true)
     setError('')
     setEvents([])
     try {
       const response = await apiFetch<{ job: Job }>(apiBase, token, '/api/v1/jobs', {
         method: 'POST',
+        signal: controller.signal,
         headers: { 'Idempotency-Key': crypto.randomUUID() },
         body: JSON.stringify({
           tool: 'omics_run_analysis',
@@ -394,12 +445,16 @@ function App() {
           status: data.job!.status,
           detail: type === 'timeout' ? 'SSE 订阅超时，任务仍可通过列表查询' : `状态更新为${statusLabels[data.job!.status] || data.job!.status}`,
         }])
-      })
+      }, controller.signal)
     } catch (err) {
+      if (!isCurrentStream(controller) || (err instanceof Error && err.name === 'AbortError')) return
       setError(err instanceof Error ? err.message : 'RNA-seq Agent 执行失败')
     } finally {
-      setLoading(false)
-      void refresh()
+      if (isCurrentStream(controller)) {
+        streamController.current = null
+        setLoading(false)
+        void refresh()
+      }
     }
   }
 
