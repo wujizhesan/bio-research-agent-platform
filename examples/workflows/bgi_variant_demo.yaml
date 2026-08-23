@@ -1,0 +1,28 @@
+name: bgi-variant-demo
+steps:
+  - id: variant_annotation
+    tool: omics_annotate_variants
+    args:
+      vcf_path: examples/variants/variants.vcf
+      annotation_csv: examples/variants/gene_annotations.csv
+      annotation_backend: auto
+      output_csv: output/bgi_variant_demo/variant_annotation.csv
+
+  - id: evidence_search
+    tool: literature_search
+    depends_on:
+      - variant_annotation
+    args:
+      gene_ids:
+        - GeneA
+        - GeneB
+        - GeneC
+      provider: local
+      evidence_csv: examples/rnaseq/evidence.csv
+
+  - id: evidence_summary
+    tool: literature_summarize
+    depends_on:
+      - evidence_search
+    args:
+      evidence: ${evidence_search.result}

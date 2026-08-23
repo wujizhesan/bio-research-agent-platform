@@ -39,7 +39,8 @@ _DOMAIN_KEYWORDS = {
     'omics': (
         'omics', 'rna-seq', 'rnaseq', 'transcriptome', 'gene expression',
         'differential expression', 'pathway', 'gene', 'single-cell',
-        'metagenome',
+        'metagenome', 'variant', 'vcf', 'mutation', 'gatk', 'samtools',
+        'gene annotation', 'variant annotation', '变异', '突变',
     ),
     'sequence': (
         'mrna', 'mRNA', 'sequence', 'codon', 'protein sequence',
@@ -63,6 +64,11 @@ _EVIDENCE_PROVIDER_KEYWORDS = (
     ('uniprot', ('uniprot', 'protein annotation', '蛋白注释')),
 )
 
+_VARIANT_KEYWORDS = (
+    'variant', 'vcf', 'mutation', 'gatk', 'samtools', 'gene annotation',
+    'variant annotation', '变异', '突变', '基因注释', '变异解读',
+)
+
 
 RESEARCH_PRESETS = {
     'bgi_research_demo': {
@@ -74,6 +80,11 @@ RESEARCH_PRESETS = {
         'path': 'examples/workflows/rnaseq_research_agent.yaml',
         'domains': ['omics'],
         'description': 'End-to-end RNA-seq analysis with differential expression, pathway enrichment, evidence retrieval and a traceable report.',
+    },
+    'bgi_variant_demo': {
+        'path': 'examples/workflows/bgi_variant_demo.yaml',
+        'domains': ['omics', 'literature'],
+        'description': 'VCF variant annotation, gene evidence retrieval and a traceable interpretation workflow.',
     },
 }
 
@@ -111,14 +122,27 @@ def _select_domains(task, requested):
     return selected or sorted(available)
 
 
-def _required_inputs(domains):
+def _is_variant_task(task, inputs=None):
+    inputs = inputs or {}
+    if any(key in inputs for key in ('vcf_path', 'vcf', 'variants_vcf')):
+        return True
+    text = str(task or '').lower()
+    return any(keyword.lower() in text for keyword in _VARIANT_KEYWORDS)
+
+
+def _required_inputs(domains, task=None, inputs=None):
     required = []
     if 'omics' in domains:
-        required.extend([
-            {'name': 'expression_csv', 'description': 'gene-by-sample expression matrix'},
-            {'name': 'metadata_csv', 'description': 'sample condition metadata'},
-            {'name': 'gene_sets_csv', 'description': 'pathway or gene-set table'},
-        ])
+        if _is_variant_task(task, inputs):
+            required.append({'name': 'vcf_path', 'description': 'VCF variant file'})
+            if (inputs or {}).get('annotation_backend', 'auto') != 'vcf_ann':
+                required.append({'name': 'annotation_csv', 'description': 'genomic interval annotation table'})
+        else:
+            required.extend([
+                {'name': 'expression_csv', 'description': 'gene-by-sample expression matrix'},
+                {'name': 'metadata_csv', 'description': 'sample condition metadata'},
+                {'name': 'gene_sets_csv', 'description': 'pathway or gene-set table'},
+            ])
     if 'sequence' in domains:
         required.append({'name': 'protein', 'description': 'protein sequence or FASTA'})
     if 'cadd' in domains:
@@ -156,8 +180,35 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
     missing = []
     rationale = []
     omics_ready = False
+    variant_ready = False
 
-    if 'omics' in domains:
+    variant_task = _is_variant_task(task, inputs)
+    if 'omics' in domains and variant_task:
+        vcf_path = inputs.get('vcf_path') or inputs.get('vcf') or inputs.get('variants_vcf')
+        annotation_backend = str(inputs.get('annotation_backend', 'auto'))
+        annotation_csv = inputs.get('annotation_csv')
+        if not vcf_path:
+            missing.append('vcf_path')
+        if annotation_backend != 'vcf_ann' and not annotation_csv:
+            missing.append('annotation_csv')
+        if vcf_path and (annotation_backend == 'vcf_ann' or annotation_csv):
+            args = {
+                'vcf_path': str(vcf_path),
+                'output_csv': str(inputs.get(
+                    'variant_output_csv', Path(output_dir) / 'variant_annotation.csv'
+                )),
+                'annotation_backend': annotation_backend,
+            }
+            if annotation_csv:
+                args['annotation_csv'] = str(annotation_csv)
+            steps.append({
+                'id': 'variant_annotation',
+                'tool': 'omics_annotate_variants',
+                'args': args,
+            })
+            variant_ready = True
+            rationale.append('variant annotation uses VCF ANN records or a local genomic interval table')
+    elif 'omics' in domains:
         omics_required = ('expression_csv', 'metadata_csv', 'gene_sets_csv')
         missing.extend(key for key in omics_required if not inputs.get(key))
         if not any(key in missing for key in omics_required):
@@ -181,9 +232,35 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
 
     direct_literature = bool(inputs.get('gene_ids'))
     reuse_omics_evidence = omics_ready and evidence_provider != 'local' and not direct_literature
+    if variant_ready and evidence_provider == 'local' and not inputs.get('evidence_csv'):
+        missing.append('evidence_csv')
     if direct_literature and evidence_provider == 'local' and not inputs.get('evidence_csv'):
         missing.append('evidence_csv')
-    if 'literature' in domains and not reuse_omics_evidence:
+    if 'literature' in domains and variant_ready and not direct_literature:
+        search_args = {
+            'gene_ids': '${variant_annotation.gene_ids}',
+            'provider': evidence_provider,
+        }
+        if inputs.get('evidence_csv'):
+            search_args['evidence_csv'] = str(inputs['evidence_csv'])
+        if inputs.get('evidence_cache_dir'):
+            search_args['cache_dir'] = str(inputs['evidence_cache_dir'])
+        steps.extend([
+            {
+                'id': 'variant_evidence_search',
+                'tool': 'literature_search',
+                'depends_on': ['variant_annotation'],
+                'args': search_args,
+            },
+            {
+                'id': 'variant_evidence_summary',
+                'tool': 'literature_summarize',
+                'depends_on': ['variant_evidence_search'],
+                'args': {'evidence': '${variant_evidence_search.result}'},
+            },
+        ])
+        rationale.append(f'variant genes are forwarded to {evidence_provider} evidence retrieval')
+    elif 'literature' in domains and not reuse_omics_evidence:
         if not direct_literature:
             missing.append('gene_ids')
         else:
@@ -366,7 +443,7 @@ def research_plan(task, domains=None, inputs=None, output_dir='output/research_a
             'id': 'input_validation',
             'type': 'application',
             'status': 'required',
-            'required_inputs': _required_inputs(selected),
+            'required_inputs': _required_inputs(selected, task, inputs),
         },
         {
             'id': 'validated_workflow',
@@ -389,7 +466,7 @@ def research_plan(task, domains=None, inputs=None, output_dir='output/research_a
         'task': task.strip(),
         'selected_domains': selected,
         'capabilities': capabilities,
-        'required_inputs': _required_inputs(selected),
+        'required_inputs': _required_inputs(selected, task, inputs),
         'execution': execution,
         'evidence_provider': execution['evidence_provider'],
         'steps': steps,

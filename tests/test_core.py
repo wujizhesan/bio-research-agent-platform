@@ -19,7 +19,7 @@ from src.audit_external_overlap import audit_overlap, remove_structure_overlap
 from src.build_hard_decoy_benchmark import build_hard_decoy_benchmark, build_random_control_benchmark
 from src.compare_benchmarks import compare_benchmarks, compare_benchmark_replicates
 from src.run_benchmark_replicates import _normalize_id, _validate_control, _validate_hard_benchmark
-from src.omics_agent import TOOLS as OMICS_TOOLS, _resolve_statistics_backend, run_omics_analysis, run_tool as run_omics_tool, search_gene_evidence, statistics_backend_status
+from src.omics_agent import TOOLS as OMICS_TOOLS, _resolve_statistics_backend, annotate_variants, run_omics_analysis, run_tool as run_omics_tool, search_gene_evidence, statistics_backend_status, toolchain_status
 from src.domain_registry import run_tool as run_domain_tool, tool_specs, validate_tool_map
 from src.workflow_runner import run_workflow
 from src.resplit_external import joint_split_indices
@@ -406,6 +406,24 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(resolved['fallback_reason'], 'test unavailable')
             with self.assertRaisesRegex(RuntimeError, 'test unavailable'):
                 _resolve_statistics_backend('deseq2')
+
+    def test_variant_annotation_maps_vcf_to_local_genes(self):
+        with tempfile.TemporaryDirectory(prefix='cadd_variant_') as raw:
+            output_csv = Path(raw) / 'variant_annotation.csv'
+            result = annotate_variants(
+                'examples/variants/variants.vcf',
+                output_csv,
+                'examples/variants/gene_annotations.csv',
+            )
+            annotated = pd.read_csv(output_csv)
+            self.assertEqual(result['status'], 'completed')
+            self.assertEqual(result['n_variants'], 3)
+            self.assertEqual(result['n_alleles'], 3)
+            self.assertEqual(result['n_annotated'], 3)
+            self.assertEqual(result['backend'], 'mixed')
+            self.assertEqual(set(annotated['gene_id'].dropna()), {'GeneA', 'GeneB', 'GeneC'})
+            self.assertIn('gatk', toolchain_status())
+            self.assertIn('annotate_variants', OMICS_TOOLS)
 
     def test_agent_uses_project_llm_config(self):
         base_url, model, _ = load_llm_config()

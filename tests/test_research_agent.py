@@ -126,6 +126,46 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(result['selected_domains'], ['omics'])
         self.assertEqual(result['manifest']['completed_steps'], 1)
 
+    def test_variant_planner_builds_annotation_and_evidence_workflow(self):
+        inputs = {
+            'vcf_path': 'examples/variants/variants.vcf',
+            'annotation_csv': 'examples/variants/gene_annotations.csv',
+            'evidence_csv': 'examples/rnaseq/evidence.csv',
+        }
+        result = run_tool('research_plan', {
+            'task': '对 VCF 做基因注释和变异解读',
+            'inputs': inputs,
+        })
+        self.assertEqual(result['selected_domains'], ['omics'])
+        self.assertTrue(result['execution']['ready'])
+        self.assertEqual(result['required_inputs'][0]['name'], 'vcf_path')
+        self.assertEqual(result['execution']['selected_tools'], [
+            'omics_annotate_variants',
+        ])
+
+        result = run_tool('research_build_workflow', {
+            'task': '对 VCF 做变异解读并检索文献',
+            'domains': ['omics', 'literature'],
+            'inputs': inputs,
+        })
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['selected_tools'], [
+            'omics_annotate_variants',
+            'literature_search',
+            'literature_summarize',
+        ])
+
+    def test_variant_preset_is_discoverable_and_dry_runnable(self):
+        result = run_tool('research_run_preset', {
+            'preset': 'bgi_variant_demo',
+            'dry_run': True,
+            'output_path': 'output/test_bgi_variant_manifest.json',
+            'report_path': 'output/test_bgi_variant_report.md',
+        })
+        self.assertEqual(result['status'], 'planned')
+        self.assertEqual(result['selected_domains'], ['omics', 'literature'])
+        self.assertEqual(result['manifest']['completed_steps'], 3)
+
 
 if __name__ == '__main__':
     unittest.main()

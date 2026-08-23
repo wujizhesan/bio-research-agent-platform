@@ -162,6 +162,9 @@ python -m venv .venv
 # End-to-end RNA-seq research Agent workflow
 .venv/Scripts/python -m src.workflow_runner --workflow examples/workflows/rnaseq_research_agent.yaml --out output/rnaseq_research_agent/workflow_manifest.json
 
+# VCF variant annotation and evidence workflow
+.venv/Scripts/python -m src.workflow_runner --workflow examples/workflows/bgi_variant_demo.yaml --out output/bgi_variant_demo/workflow_manifest.json
+
 # Inspect an automatically planned multi-domain workflow
 .venv/Scripts/python -c "from src.research_agent import research_plan; import json; print(json.dumps(research_plan('分析 RNA-seq 并使用 KEGG 解释通路和设计 mRNA', inputs={'expression_csv': 'examples/rnaseq/expression.csv', 'metadata_csv': 'examples/rnaseq/metadata.csv', 'gene_sets_csv': 'examples/rnaseq/gene_sets.csv', 'protein': 'MKT', 'output_dir': 'output/auto_research'}), ensure_ascii=False, indent=2))"
 

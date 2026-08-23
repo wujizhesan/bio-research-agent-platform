@@ -1,0 +1,6 @@
+##fileformat=VCFv4.2
+##source=bio-research-agent-fixture
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+1	101	.	A	G	60	PASS	.
+1	250	rs-demo-2	C	T	50	PASS	.
+1	500	.	G	A	40	PASS	ANN=A|missense_variant|MODERATE|GeneC|GeneC||||
