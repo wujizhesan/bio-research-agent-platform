@@ -75,7 +75,7 @@ type ResearchPlan = {
   execution: ResearchPlanExecution
 }
 
-type ResearchFileSlot = 'expression' | 'metadata' | 'gene_sets'
+type ResearchFileSlot = 'expression' | 'metadata' | 'gene_sets' | 'vcf' | 'annotation'
 
 type UploadedFile = {
   file_id: string
@@ -88,7 +88,7 @@ type UploadedFile = {
 }
 
 type View = 'workspace' | 'domains'
-type RunMode = 'research' | 'sequence'
+type RunMode = 'research' | 'variant' | 'sequence'
 
 const runtimeApiBase = new URLSearchParams(window.location.search).get('api') || ''
 const defaultApiBase = runtimeApiBase || import.meta.env.VITE_API_BASE_URL || (
@@ -240,9 +240,11 @@ function App() {
   const [selectedJob, setSelectedJob] = useState<Job | null>(null)
   const [events, setEvents] = useState<EventItem[]>([])
   const [task, setTask] = useState('分析 RNA-seq 差异表达并设计 mRNA 序列')
+  const [variantTask, setVariantTask] = useState('Annotate VCF variants and retrieve gene evidence')
   const [protein, setProtein] = useState('MKT')
   const [evidenceProvider, setEvidenceProvider] = useState('local')
-  const [uploadedFiles, setUploadedFiles] = useState<Record<ResearchFileSlot, UploadedFile | null>>({ expression: null, metadata: null, gene_sets: null })
+  const [variantBackend, setVariantBackend] = useState('auto')
+  const [uploadedFiles, setUploadedFiles] = useState<Record<ResearchFileSlot, UploadedFile | null>>({ expression: null, metadata: null, gene_sets: null, vcf: null, annotation: null })
   const [uploadingFile, setUploadingFile] = useState<ResearchFileSlot | ''>('')
   const [researchPlan, setResearchPlan] = useState<ResearchPlan | null>(null)
   const [loading, setLoading] = useState(false)
@@ -299,6 +301,17 @@ function App() {
       evidence_provider: evidenceProvider,
       protein,
       output_dir: 'output/frontend_auto_research',
+    }
+  }
+
+  function buildVariantInputs() {
+    return {
+      vcf_path: uploadedFiles.vcf?.path || 'examples/variants/variants.vcf',
+      annotation_csv: uploadedFiles.annotation?.path || 'examples/variants/gene_annotations.csv',
+      annotation_backend: variantBackend,
+      evidence_csv: 'examples/rnaseq/evidence.csv',
+      evidence_provider: 'local',
+      output_dir: 'output/frontend_variant_research',
     }
   }
 
@@ -381,6 +394,16 @@ function App() {
         'research_plan',
         { task, inputs: buildResearchInputs() },
         '研究计划已进入执行队列',
+        (job) => setResearchPlan(extractResearchPlan(job)),
+      )
+      return
+    }
+    if (mode === 'variant') {
+      setResearchPlan(null)
+      await submitToolJob(
+        'research_plan',
+        { task: variantTask, domains: ['omics', 'literature'], inputs: buildVariantInputs() },
+        'Variant annotation plan queued for review',
         (job) => setResearchPlan(extractResearchPlan(job)),
       )
       return
@@ -537,7 +560,7 @@ function App() {
               <section className="grid gap-5 xl:grid-cols-[1.08fr_0.92fr]">
                 <div className="panel p-5 sm:p-6">
                   <div className="flex items-start justify-between gap-4"><div><div className="eyebrow">01 / START A RUN</div><h2 className="mt-2 text-xl font-semibold">启动一条研究路径</h2></div><div className="rounded-xl border border-[#21443f] bg-[#102b2a] p-2.5 text-[#8fe5c1]"><Play size={17} /></div></div>
-                  <div className="mt-7 grid grid-cols-2 gap-1 rounded-xl bg-[#071719] p-1"><button onClick={() => setMode('research')} className={`mode-tab ${mode === 'research' ? 'mode-tab-active' : ''}`}><Workflow size={14} />研究规划</button><button onClick={() => setMode('sequence')} className={`mode-tab ${mode === 'sequence' ? 'mode-tab-active' : ''}`}><Dna size={14} />mRNA 设计</button></div>
+                  <div className="mt-7 grid grid-cols-3 gap-1 rounded-xl bg-[#071719] p-1"><button onClick={() => setMode('research')} className={`mode-tab ${mode === 'research' ? 'mode-tab-active' : ''}`}><Workflow size={14} />研究规划</button><button onClick={() => setMode('variant')} className={`mode-tab ${mode === 'variant' ? 'mode-tab-active' : ''}`}><GitBranch size={14} />VCF 变异</button><button onClick={() => setMode('sequence')} className={`mode-tab ${mode === 'sequence' ? 'mode-tab-active' : ''}`}><Dna size={14} />mRNA 设计</button></div>
                   {mode === 'research' ? <>
                     <label className="mt-6 block"><span className="field-label">科学问题</span><textarea value={task} onChange={(event) => { setTask(event.target.value); setResearchPlan(null) }} rows={4} className="input-area" placeholder="描述你希望 Agent 协助完成的研究任务" /></label>
                     <div className="mt-5 grid gap-4 sm:grid-cols-[1fr_0.8fr]">
@@ -550,12 +573,22 @@ function App() {
                       <ResearchFileField id="gene-sets-file" label="基因集 CSV" file={uploadedFiles.gene_sets} uploading={uploadingFile === 'gene_sets'} onChange={(file) => void handleResearchFileUpload('gene_sets', file)} />
                     </div>
                     <p className="mt-3 text-xs leading-5 text-[#688983]">上传文件会在服务端校验、计算 SHA-256 并保存到本次研究输入目录；未上传的字段使用仓库示例数据。</p>
-                  </> : <label className="mt-6 block"><span className="field-label">Protein sequence</span><input value={protein} onChange={(event) => setProtein(event.target.value.toUpperCase())} className="input-control font-mono tracking-[0.18em]" placeholder="例如 MKT" /><span className="mt-2 block text-xs text-[#688983]">内置确定性后端将执行 optimize → score → verify。</span></label>}
-                  <div className="mt-6 flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2 font-mono text-[10px] text-[#66847e]"><CircleDot size={13} className="text-[#70e3ad]" />ASYNC / TRACEABLE / REPLAYABLE</div><button onClick={submitRun} disabled={loading || (mode === 'research' ? !task.trim() : !protein.trim())} className="group inline-flex items-center gap-2 rounded-xl bg-[#a8f0d2] px-4 py-2.5 text-sm font-semibold text-[#092521] transition hover:bg-[#c6f8e1] disabled:cursor-not-allowed disabled:opacity-50">{loading ? <RefreshCw size={15} className="animate-spin" /> : <Play size={15} />}{loading ? '执行中…' : '开始运行'}<ArrowUpRight size={14} className="transition group-hover:translate-x-0.5 group-hover:-translate-y-0.5" /></button></div>
+                  </> : mode === 'variant' ? <>
+                    <label className="mt-6 block"><span className="field-label">Variant research task</span><textarea value={variantTask} onChange={(event) => { setVariantTask(event.target.value); setResearchPlan(null) }} rows={3} className="input-area" placeholder="Describe the VCF annotation and evidence task" /></label>
+                    <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                      <ResearchFileField id="vcf-file" label="VCF / VCF.GZ input" accept=".vcf,.gz,text/plain" file={uploadedFiles.vcf} uploading={uploadingFile === 'vcf'} onChange={(file) => void handleResearchFileUpload('vcf', file)} />
+                      <ResearchFileField id="annotation-file" label="Gene interval CSV" accept=".csv,.tsv,text/csv,text/tab-separated-values" file={uploadedFiles.annotation} uploading={uploadingFile === 'annotation'} onChange={(file) => void handleResearchFileUpload('annotation', file)} />
+                    </div>
+                    <div className="mt-5"><label className="field-label" htmlFor="variant-backend">Annotation backend</label><select id="variant-backend" value={variantBackend} onChange={(event) => { setVariantBackend(event.target.value); setResearchPlan(null) }} className="input-control"><option value="auto">Auto: VCF ANN → local interval</option><option value="vcf_ann">VCF ANN only</option><option value="local">Local interval table</option></select></div>
+                    <p className="mt-3 text-xs leading-5 text-[#688983]">The demo uses reproducible fixtures when no files are uploaded. Results retain annotation source and external tool availability.</p>
+                  </> : <label className="mt-6 block"><span className="field-label">Protein sequence</span><input value={protein} onChange={(event) => setProtein(event.target.value.toUpperCase())} className="input-control tracking-[0.18em] font-mono" placeholder="例如 MKT" /><span className="mt-2 block text-xs text-[#688983]">内置确定性后端将执行 optimize → score → verify。</span></label>}
+                  <div className="mt-6 flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2 font-mono text-[10px] text-[#66847e]"><CircleDot size={13} className="text-[#70e3ad]" />ASYNC / TRACEABLE / REPLAYABLE</div><button onClick={submitRun} disabled={loading || (mode === 'research' ? !task.trim() : mode === 'variant' ? !variantTask.trim() : !protein.trim())} className="group inline-flex items-center gap-2 rounded-xl bg-[#a8f0d2] px-4 py-2.5 text-sm font-semibold text-[#092521] transition hover:bg-[#c6f8e1] disabled:cursor-not-allowed disabled:opacity-50">{loading ? <RefreshCw size={15} className="animate-spin" /> : <Play size={15} />}{loading ? '执行中…' : '开始运行'}<ArrowUpRight size={14} className="transition group-hover:translate-x-0.5 group-hover:-translate-y-0.5" /></button></div>
                 </div>
 
                 <div className="panel flex min-h-[326px] flex-col p-5 sm:p-6"><div className="flex items-start justify-between"><div><div className="eyebrow">02 / EXECUTION STREAM</div><h2 className="mt-2 text-xl font-semibold">实时执行轨迹</h2></div><div className="flex items-center gap-1.5 rounded-full border border-[#28524b] bg-[#102b2a] px-2.5 py-1 font-mono text-[10px] text-[#8fe5c1]"><span className="size-1.5 animate-pulse rounded-full bg-[#70e3ad]" />SSE</div></div>{selectedJob ? <div className="mt-7 flex flex-1 flex-col"><div className="flex items-center justify-between border-b border-white/10 pb-4"><div><div className="font-mono text-[11px] text-[#6f9189]">{formatJobId(selectedJob.job_id)}</div><div className="mt-1 text-sm font-medium">{selectedJob.tool}</div></div><StatusBadge status={selectedJob.status} /></div><div className="mt-5 space-y-3">{events.slice(-4).map((event, index) => <div key={`${event.at}-${index}`} className="flex items-start gap-3 text-xs"><div className="mt-1.5 size-1.5 rounded-full bg-[#83e3bc] shadow-[0_0_12px_#83e3bc]" /><div className="min-w-0 flex-1"><div className="text-[#b2cbc4]">{event.detail}</div><div className="mt-1 font-mono text-[10px] text-[#5f7c76]">{event.at} · {event.status}</div></div></div>)}</div><div className="mt-auto flex items-center gap-2 pt-5 font-mono text-[10px] text-[#64827b]"><Clock3 size={13} />{selectedJob.status === 'completed' ? `完成于 ${formatTime(selectedJob.finished_at)}` : '等待状态更新…'}</div></div> : <EmptyStream />}</div>
               </section>
+
+              {selectedJob?.status === 'completed' && <JobResultSummary job={selectedJob} />}
 
               {mode === 'research' && <ResearchPlanCard plan={researchPlan} loading={loading && selectedJob?.tool === 'research_plan'} onExecute={() => void executeResearchPlan()} />}
 
@@ -577,12 +610,12 @@ function StatusBadge({ status }: { status: string }) {
   return <span className={`status-badge ${style}`}><span className="size-1.5 rounded-full bg-current" />{status === 'cancelled' ? '已取消' : statusLabels[status] || status}</span>
 }
 
-function ResearchFileField({ id, label, file, uploading, onChange }: { id: string; label: string; file: UploadedFile | null; uploading: boolean; onChange: (file?: File) => void }) {
+function ResearchFileField({ id, label, accept = '.csv,.tsv,text/csv,text/tab-separated-values', file, uploading, onChange }: { id: string; label: string; accept?: string; file: UploadedFile | null; uploading: boolean; onChange: (file?: File) => void }) {
   return <div>
     <div className="field-label">{label}</div>
     <label htmlFor={id} className="flex min-h-[76px] cursor-pointer items-center justify-between gap-3 rounded-xl border border-dashed border-[#315d55] bg-[#071719]/70 px-3 py-3 transition hover:border-[#71cba7] hover:bg-[#102b2a]">
-      <input id={id} type="file" accept=".csv,.tsv,text/csv,text/tab-separated-values" className="sr-only" onChange={(event) => { onChange(event.target.files?.[0]); event.currentTarget.value = '' }} />
-      <div className="min-w-0"><div className="truncate text-xs font-medium text-[#b8d8ce]">{uploading ? '上传中…' : file?.filename || '选择 CSV / TSV'}</div><div className="mt-1 truncate font-mono text-[9px] text-[#668983]">{file ? `${file.size_bytes} bytes · ${file.sha256.slice(0, 12)}` : '服务端安全存储'}</div></div>
+      <input id={id} type="file" accept={accept} className="sr-only" onChange={(event) => { onChange(event.target.files?.[0]); event.currentTarget.value = '' }} />
+      <div className="min-w-0"><div className="truncate text-xs font-medium text-[#b8d8ce]">{uploading ? '上传中…' : file?.filename || '选择输入文件'}</div><div className="mt-1 truncate font-mono text-[9px] text-[#668983]">{file ? `${file.size_bytes} bytes · ${file.sha256.slice(0, 12)}` : '服务端安全存储'}</div></div>
       {uploading ? <RefreshCw size={15} className="shrink-0 animate-spin text-[#8fe5c1]" /> : <Upload size={15} className="shrink-0 text-[#78cdaa]" />}
     </label>
   </div>
@@ -619,6 +652,19 @@ function ResearchPlanCard({ plan, loading, onExecute }: { plan: ResearchPlan | n
 
 function EmptyStream() {
   return <div className="flex flex-1 flex-col items-center justify-center text-center"><div className="grid size-14 place-items-center rounded-2xl border border-[#21443f] bg-[#102b2a] text-[#78cdaa]"><Radio size={23} /></div><div className="mt-4 text-sm font-medium text-[#b1cbc4]">等待一条任务流</div><div className="mt-2 max-w-[220px] text-xs leading-5 text-[#64827b]">提交任务后，这里会实时显示执行状态和可追踪事件。</div></div>
+}
+
+function JobResultSummary({ job }: { job: Job }) {
+  const payload = job.result && typeof job.result === 'object' ? job.result : {}
+  const keys = ['backend', 'n_annotated', 'n_unmatched', 'n_variants', 'n_genes', 'n_significant', 'output_csv', 'output_md']
+  const visible = keys.filter((key) => payload[key] !== undefined)
+  const geneIds = Array.isArray(payload.gene_ids) ? payload.gene_ids.filter((value): value is string => typeof value === 'string') : []
+  return <section className="panel mt-5 overflow-hidden" aria-live="polite">
+    <div className="flex items-center justify-between border-b border-white/10 px-5 py-5 sm:px-6"><div><div className="eyebrow">RESULT / PROVENANCE</div><h2 className="mt-2 text-xl font-semibold">结构化结果</h2></div><Check size={18} className="text-[#83e3bc]" /></div>
+    <div className="grid gap-3 px-5 py-5 sm:grid-cols-2 lg:grid-cols-4 sm:px-6">{visible.map((key) => <div key={key} className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-3"><div className="font-mono text-[9px] uppercase tracking-[0.12em] text-[#63817b]">{key}</div><div className="mt-2 truncate text-sm text-[#c9e5dc]">{String(payload[key])}</div></div>)}</div>
+    {geneIds.length > 0 && <div className="border-t border-white/[0.08] px-5 py-4 sm:px-6"><div className="field-label">ANNOTATED GENE IDS</div><div className="mt-2 flex flex-wrap gap-2">{geneIds.map((geneId) => <span key={geneId} className="rounded-md border border-[#28524b] bg-[#102b2a] px-2 py-1 font-mono text-[10px] text-[#b9e6d5]">{geneId}</span>)}</div></div>}
+    <details className="border-t border-white/[0.08] px-5 py-4 sm:px-6"><summary className="cursor-pointer text-xs text-[#8fb2a8]">查看完整结果 JSON</summary><pre className="mt-3 max-h-64 overflow-auto rounded-xl bg-[#061113] p-3 text-[10px] leading-5 text-[#91b8ac]">{JSON.stringify(payload, null, 2)}</pre></details>
+  </section>
 }
 
 function DomainsView({ plugins }: { plugins: Plugin[] }) {
