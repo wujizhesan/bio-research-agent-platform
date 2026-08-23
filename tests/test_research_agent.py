@@ -155,6 +155,20 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(result['selected_tools'], ['omics_run_single_cell_qc'])
         self.assertEqual(result['workflow']['steps'][0]['args']['min_genes'], 2)
 
+    def test_research_planner_builds_single_cell_10x_qc_workflow(self):
+        result = run_tool('research_build_workflow', {
+            'task': 'Run 10x single-cell quality control',
+            'domains': ['omics'],
+            'inputs': {
+                'matrix_mtx': 'examples/omics/tenx/matrix.mtx',
+                'barcodes_tsv': 'examples/omics/tenx/barcodes.tsv',
+                'features_tsv': 'examples/omics/tenx/features.tsv',
+            },
+        })
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['selected_tools'], ['omics_run_single_cell_10x_qc'])
+        self.assertEqual(result['workflow']['steps'][0]['args']['matrix_mtx'], 'examples/omics/tenx/matrix.mtx')
+
     def test_bgi_preset_is_discoverable_and_dry_runnable(self):
         presets = run_tool('research_presets', {})
         self.assertEqual(presets['status'], 'ok')

@@ -19,7 +19,7 @@ from src.audit_external_overlap import audit_overlap, remove_structure_overlap
 from src.build_hard_decoy_benchmark import build_hard_decoy_benchmark, build_random_control_benchmark
 from src.compare_benchmarks import compare_benchmarks, compare_benchmark_replicates
 from src.run_benchmark_replicates import _normalize_id, _validate_control, _validate_hard_benchmark
-from src.omics_agent import TOOLS as OMICS_TOOLS, _resolve_statistics_backend, annotate_variants, run_genomics_qc, run_omics_analysis, run_single_cell_qc, run_tool as run_omics_tool, search_gene_evidence, statistics_backend_status, toolchain_status
+from src.omics_agent import TOOLS as OMICS_TOOLS, _resolve_statistics_backend, annotate_variants, run_genomics_qc, run_omics_analysis, run_single_cell_10x_qc, run_single_cell_qc, run_tool as run_omics_tool, search_gene_evidence, statistics_backend_status, toolchain_status
 from src.domain_registry import run_tool as run_domain_tool, tool_specs, validate_tool_map
 from src.workflow_runner import run_workflow
 from src.resplit_external import joint_split_indices
@@ -553,6 +553,47 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(filtered['cell_id'].tolist(), ['cell-1'])
         self.assertAlmostEqual(float(metrics.loc[0, 'pct_counts_mito']), 11.111, places=3)
         self.assertIn('run_single_cell_qc', OMICS_TOOLS)
+
+    def test_single_cell_10x_qc_preserves_sparse_filtered_artifacts(self):
+        from scipy.io import mmread
+        result = run_single_cell_10x_qc(
+            'examples/omics/tenx/matrix.mtx',
+            'examples/omics/tenx/barcodes.tsv',
+            'examples/omics/tenx/features.tsv',
+            Path('output/test_single_cell_10x_qc'),
+            min_genes=2,
+            max_mito_percent=20,
+        )
+        filtered_matrix = mmread(result['outputs']['filtered_matrix'])
+        metrics = pd.read_csv(result['outputs']['cell_metrics'])
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['input_format'], '10x_matrix_market')
+        self.assertEqual(result['metrics']['n_cells_input'], 3)
+        self.assertEqual(result['metrics']['n_cells_passed'], 1)
+        self.assertEqual(filtered_matrix.shape, (3, 1))
+        self.assertEqual(metrics.loc[0, 'cell_id'], 'cell-1')
+        self.assertIn('run_single_cell_10x_qc', OMICS_TOOLS)
+
+    def test_single_cell_10x_qc_reads_gzip_inputs(self):
+        import gzip
+
+        with tempfile.TemporaryDirectory(prefix='cadd_single_cell_10x_gz_') as raw:
+            root = Path(raw)
+            compressed = []
+            for source_name in ('matrix.mtx', 'barcodes.tsv', 'features.tsv'):
+                source = Path('examples/omics/tenx') / source_name
+                target = root / f'{source_name}.gz'
+                with gzip.open(target, 'wb') as handle:
+                    handle.write(source.read_bytes())
+                compressed.append(target)
+            result = run_single_cell_10x_qc(
+                *compressed,
+                root / 'qc',
+                min_genes=2,
+                max_mito_percent=20,
+            )
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['metrics']['n_cells_passed'], 1)
 
     def test_agent_uses_project_llm_config(self):
         base_url, model, _ = load_llm_config()
