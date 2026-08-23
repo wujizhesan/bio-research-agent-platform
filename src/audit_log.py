@@ -6,6 +6,11 @@ from pathlib import Path
 from threading import Lock
 from uuid import uuid4
 
+try:
+    from .observability import REQUEST_ID
+except ImportError:
+    from observability import REQUEST_ID
+
 
 class AuditLogger:
     def __init__(self, path):
@@ -16,6 +21,7 @@ class AuditLogger:
         event = {
             'event_id': uuid4().hex,
             'at': datetime.now(timezone.utc).isoformat(),
+            'request_id': REQUEST_ID.get(),
             'actor': principal.subject if principal else 'anonymous',
             'roles': list(principal.roles) if principal else [],
             'action': action,

@@ -1,5 +1,18 @@
 """Prometheus metrics shared by the API service."""
+from contextvars import ContextVar
+import re
+from uuid import uuid4
+
 from prometheus_client import Counter, Gauge, Histogram
+
+
+REQUEST_ID = ContextVar('bio_agent_request_id', default=None)
+_REQUEST_ID_PATTERN = re.compile(r'^[A-Za-z0-9._:-]{1,128}$')
+
+
+def request_id(value=None):
+    candidate = value.strip() if isinstance(value, str) else ''
+    return candidate if _REQUEST_ID_PATTERN.fullmatch(candidate) else uuid4().hex
 
 
 HTTP_REQUESTS = Counter(

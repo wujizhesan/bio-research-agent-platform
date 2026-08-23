@@ -27,7 +27,7 @@ try:
     from .file_storage import LocalFileStorage
     from .job_manager import JobManager
     from .plugin_manager import PluginManager
-    from .observability import HTTP_LATENCY, HTTP_REQUESTS, JOB_STATUS, JOB_SUBMISSIONS
+    from .observability import HTTP_LATENCY, HTTP_REQUESTS, JOB_STATUS, JOB_SUBMISSIONS, REQUEST_ID, request_id
     from .redis_job_manager import RedisJobManager
 except ImportError:
     from api_server import list_run_manifests
@@ -38,7 +38,7 @@ except ImportError:
     from file_storage import LocalFileStorage
     from job_manager import JobManager
     from plugin_manager import PluginManager
-    from observability import HTTP_LATENCY, HTTP_REQUESTS, JOB_STATUS, JOB_SUBMISSIONS
+    from observability import HTTP_LATENCY, HTTP_REQUESTS, JOB_STATUS, JOB_SUBMISSIONS, REQUEST_ID, request_id
     from redis_job_manager import RedisJobManager
 
 
@@ -189,8 +189,12 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         from time import perf_counter
         started = perf_counter()
         response = None
+        current_request_id = request_id(request.headers.get('X-Request-ID'))
+        request.state.request_id = current_request_id
+        request_context = REQUEST_ID.set(current_request_id)
         try:
             response = await call_next(request)
+            response.headers['X-Request-ID'] = current_request_id
             return response
         finally:
             if request.url.path != '/metrics':
@@ -199,6 +203,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
                 status_code = str(response.status_code if response is not None else 500)
                 HTTP_REQUESTS.labels(request.method, path, status_code).inc()
                 HTTP_LATENCY.labels(request.method, path).observe(perf_counter() - started)
+            REQUEST_ID.reset(request_context)
 
     async def current_principal(token: str | None = Depends(oauth2_scheme)):
         authorization = f'Bearer {token}' if token else None

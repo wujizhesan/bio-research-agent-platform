@@ -99,9 +99,10 @@ class FastApiAppTests(unittest.TestCase):
             app = self._app(raw)
             try:
                 with TestClient(app) as client:
-                    health = client.get('/health')
+                    health = client.get('/health', headers={'X-Request-ID': 'interview-trace-001'})
                     self.assertEqual(health.status_code, 200)
                     self.assertEqual(health.json()['database'], 'ok')
+                    self.assertEqual(health.headers['x-request-id'], 'interview-trace-001')
                     self.assertIn('/api/v1/jobs', client.get('/openapi.json').json()['paths'])
                     self.assertIn('bio_agent_http_requests_total', client.get('/metrics').text)
             finally:
@@ -237,6 +238,7 @@ class FastApiAppTests(unittest.TestCase):
                         self.assertIn('auth.login', {event['action'] for event in events})
                         self.assertIn('plugin.state_change', {event['action'] for event in events})
                         self.assertIn('admin', {event['actor'] for event in events})
+                        self.assertTrue(all(event['request_id'] for event in events))
                 finally:
                     self._close_app(app)
 
