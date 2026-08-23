@@ -430,13 +430,14 @@ function App() {
   async function executeResearchPlan() {
     const execution = researchPlan?.execution
     if (!researchPlan || !execution?.ready || !execution.workflow) return
+    const outputDir = mode === 'variant' ? 'output/frontend_variant_research' : 'output/frontend_auto_research'
     await submitToolJob(
       'research_execute',
       {
         workflow: execution.workflow,
         domains: researchPlan.selected_domains,
-        output_path: 'output/frontend_auto_research_manifest.json',
-        report_path: 'output/frontend_auto_research_report.md',
+        output_path: `${outputDir}_manifest.json`,
+        report_path: `${outputDir}_report.md`,
         dry_run: false,
         continue_on_error: false,
       },
@@ -602,7 +603,7 @@ function App() {
 
               {selectedJob?.status === 'completed' && <JobResultSummary job={selectedJob} />}
 
-              {mode === 'research' && <ResearchPlanCard plan={researchPlan} loading={loading && selectedJob?.tool === 'research_plan'} onExecute={() => void executeResearchPlan()} />}
+              {(mode === 'research' || mode === 'variant') && selectedJob?.tool !== 'research_execute' && <ResearchPlanCard plan={researchPlan} loading={loading && selectedJob?.tool === 'research_plan'} onExecute={() => void executeResearchPlan()} />}
 
               <section className="panel mt-5 overflow-hidden"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-5 py-5 sm:px-6"><div><div className="eyebrow">03 / RECENT RUNS</div><h2 className="mt-2 text-xl font-semibold">最近任务</h2></div><button onClick={() => void refresh()} className="inline-flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-xs text-[#9bb7b0] transition hover:border-[#4f8c7d] hover:text-[#d6eee7]"><RefreshCw size={13} />刷新</button></div>{jobs.length ? <div className="overflow-x-auto"><table className="w-full min-w-[680px] text-left text-sm"><thead className="bg-white/[0.025] font-mono text-[10px] tracking-[0.12em] text-[#63817b]"><tr><th className="px-5 py-3 font-normal sm:px-6">TASK ID</th><th className="px-5 py-3 font-normal">TOOL</th><th className="px-5 py-3 font-normal">STATUS</th><th className="px-5 py-3 font-normal">CREATED</th><th className="px-5 py-3 font-normal" /></tr></thead><tbody>{jobs.map((job) => <tr key={job.job_id} onClick={() => { setSelectedJob(job); setEvents([]) }} className="cursor-pointer border-t border-white/[0.06] transition hover:bg-white/[0.035]"><td className="px-5 py-4 font-mono text-xs text-[#81aaa1] sm:px-6">{formatJobId(job.job_id)}</td><td className="px-5 py-4 font-medium text-[#c7ddd7]">{job.tool}</td><td className="px-5 py-4"><StatusBadge status={job.status} /></td><td className="px-5 py-4 font-mono text-xs text-[#66837d]">{formatTime(job.created_at)}</td><td className="px-5 py-4 text-right text-[#6b8f87]"><ChevronRight size={15} /></td></tr>)}</tbody></table></div> : <div className="px-6 py-12 text-center text-sm text-[#66837d]">还没有运行记录，先启动一条研究路径。</div>}</section>
             </>
@@ -668,12 +669,29 @@ function EmptyStream() {
 
 function JobResultSummary({ job }: { job: Job }) {
   const payload = job.result && typeof job.result === 'object' ? job.result : {}
-  const keys = ['backend', 'n_annotated', 'n_unmatched', 'n_variants', 'n_genes', 'n_significant', 'output_csv', 'output_md']
-  const visible = keys.filter((key) => payload[key] !== undefined)
-  const geneIds = Array.isArray(payload.gene_ids) ? payload.gene_ids.filter((value): value is string => typeof value === 'string') : []
+  const manifest = payload.manifest && typeof payload.manifest === 'object' && !Array.isArray(payload.manifest) ? payload.manifest as Record<string, unknown> : {}
+  const steps = Array.isArray(manifest.steps) ? manifest.steps.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === 'object' && !Array.isArray(value)) : []
+  const annotationStep = steps.find((step) => step.tool === 'omics_annotate_variants')
+  const annotationResult = annotationStep?.result && typeof annotationStep.result === 'object' && !Array.isArray(annotationStep.result) ? annotationStep.result as Record<string, unknown> : {}
+  const report = payload.report && typeof payload.report === 'object' && !Array.isArray(payload.report) ? payload.report as Record<string, unknown> : {}
+  const summary: Record<string, unknown> = {
+    status: payload.status,
+    backend: payload.backend ?? annotationResult.backend,
+    n_annotated: payload.n_annotated ?? annotationResult.n_annotated,
+    n_unmatched: payload.n_unmatched ?? annotationResult.n_unmatched,
+    n_variants: payload.n_variants ?? annotationResult.n_variants,
+    completed_steps: manifest.completed_steps,
+    failed_steps: manifest.failed_steps,
+    output_csv: payload.output_csv ?? annotationResult.output_csv,
+    manifest_path: manifest.manifest_path,
+    report_path: payload.output_md ?? report.path,
+  }
+  const visible = Object.entries(summary).filter(([, value]) => value !== undefined && value !== null)
+  const rawGeneIds = payload.gene_ids ?? annotationResult.gene_ids
+  const geneIds = Array.isArray(rawGeneIds) ? rawGeneIds.filter((value): value is string => typeof value === 'string') : []
   return <section className="panel mt-5 overflow-hidden" aria-live="polite">
     <div className="flex items-center justify-between border-b border-white/10 px-5 py-5 sm:px-6"><div><div className="eyebrow">RESULT / PROVENANCE</div><h2 className="mt-2 text-xl font-semibold">结构化结果</h2></div><Check size={18} className="text-[#83e3bc]" /></div>
-    <div className="grid gap-3 px-5 py-5 sm:grid-cols-2 lg:grid-cols-4 sm:px-6">{visible.map((key) => <div key={key} className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-3"><div className="font-mono text-[9px] uppercase tracking-[0.12em] text-[#63817b]">{key}</div><div className="mt-2 truncate text-sm text-[#c9e5dc]">{String(payload[key])}</div></div>)}</div>
+    <div className="grid gap-3 px-5 py-5 sm:grid-cols-2 lg:grid-cols-4 sm:px-6">{visible.map(([key, value]) => <div key={key} className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-3"><div className="font-mono text-[9px] uppercase tracking-[0.12em] text-[#63817b]">{key}</div><div className="mt-2 truncate text-sm text-[#c9e5dc]">{String(value)}</div></div>)}</div>
     {geneIds.length > 0 && <div className="border-t border-white/[0.08] px-5 py-4 sm:px-6"><div className="field-label">ANNOTATED GENE IDS</div><div className="mt-2 flex flex-wrap gap-2">{geneIds.map((geneId) => <span key={geneId} className="rounded-md border border-[#28524b] bg-[#102b2a] px-2 py-1 font-mono text-[10px] text-[#b9e6d5]">{geneId}</span>)}</div></div>}
     <details className="border-t border-white/[0.08] px-5 py-4 sm:px-6"><summary className="cursor-pointer text-xs text-[#8fb2a8]">查看完整结果 JSON</summary><pre className="mt-3 max-h-64 overflow-auto rounded-xl bg-[#061113] p-3 text-[10px] leading-5 text-[#91b8ac]">{JSON.stringify(payload, null, 2)}</pre></details>
   </section>
