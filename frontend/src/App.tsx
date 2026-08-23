@@ -598,6 +598,46 @@ function App() {
     )
   }
 
+  async function submitFastqRnaSeqDemo() {
+    setMode('research')
+    setResearchPlan(null)
+    await submitToolJob(
+      'research_plan',
+      {
+        task: 'Run FastQC, align paired-end RNA-seq reads, quantify, differential expression and pathway enrichment',
+        domains: ['omics'],
+        planner_mode: 'deterministic',
+        inputs: {
+          fastq_paths: [
+            'examples/omics/rnaseq_fastq_fixture/A1.fastq',
+            'examples/omics/rnaseq_fastq_fixture/A2.fastq',
+            'examples/omics/rnaseq_fastq_fixture/A3.fastq',
+            'examples/omics/rnaseq_fastq_fixture/B1.fastq',
+            'examples/omics/rnaseq_fastq_fixture/B2.fastq',
+            'examples/omics/rnaseq_fastq_fixture/B3.fastq',
+          ],
+          fastq_r2_paths: [
+            'examples/omics/rnaseq_paired_fixture/A1_R2.fastq',
+            'examples/omics/rnaseq_paired_fixture/A2_R2.fastq',
+            'examples/omics/rnaseq_paired_fixture/A3_R2.fastq',
+            'examples/omics/rnaseq_paired_fixture/B1_R2.fastq',
+            'examples/omics/rnaseq_paired_fixture/B2_R2.fastq',
+            'examples/omics/rnaseq_paired_fixture/B3_R2.fastq',
+          ],
+          reference_fasta: 'examples/omics/rnaseq_fastq_fixture/reference.fa',
+          annotation_gtf: 'examples/omics/rnaseq_fastq_fixture/genes.gtf',
+          metadata_csv: 'examples/omics/rnaseq_fastq_fixture/metadata.csv',
+          gene_sets_csv: 'examples/omics/rnaseq_fastq_fixture/gene_sets.csv',
+          statistics_backend: 'scipy',
+          paired_end: true,
+          output_dir: 'output/frontend_auto_research',
+        },
+      },
+      'RNA-seq FastQC 质控和 paired-end 分析计划已进入队列',
+      (job) => setResearchPlan(extractResearchPlan(job)),
+    )
+  }
+
   async function cancelSelectedJob() {
     if (!selectedJob || !['queued', 'running'].includes(selectedJob.status) || selectedJob.cancel_requested) return
     setError('')
@@ -735,6 +775,8 @@ function App() {
 
               <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#28524b] bg-[#102b2a]/70 px-5 py-4"><div><div className="font-mono text-[10px] tracking-[0.16em] text-[#8fe5c1]">INTERVIEW DEMO / RNA-SEQ AGENT</div><div className="mt-1 text-sm text-[#b4cdc6]">差异表达 → 通路富集 → 基因证据 → 可追溯报告</div></div><button onClick={() => void submitOmicsDemo()} disabled={loading} className="rounded-lg bg-[#8fe5c1] px-3 py-2 text-xs font-semibold text-[#092521] transition hover:bg-[#b8f4d8] disabled:cursor-not-allowed disabled:opacity-50">运行 RNA-seq Agent</button></div>
 
+              <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#3d5a8c] bg-[#111d32]/80 px-5 py-4"><div><div className="font-mono text-[10px] tracking-[0.16em] text-[#aebfff]">INTERVIEW DEMO / NATIVE RNA-SEQ</div><div className="mt-1 text-sm text-[#c3d1f4]">FastQC → MultiQC → HISAT2 → featureCounts → 差异分析</div></div><button aria-label="Run native RNA-seq demo" onClick={() => void submitFastqRnaSeqDemo()} disabled={loading} className="rounded-lg bg-[#aebfff] px-3 py-2 text-xs font-semibold text-[#111a34] transition hover:bg-[#cbd4ff] disabled:cursor-not-allowed disabled:opacity-50">运行真实 RNA-seq 流程</button></div>
+
               {selectedJob && ['queued', 'running'].includes(selectedJob.status) && <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#5c4930] bg-[#211d16] px-5 py-4"><div className="flex items-center gap-3"><Ban size={16} className="text-[#e6c875]" /><div><div className="text-sm font-medium text-[#f1dfaa]">任务控制</div><div className="mt-1 text-xs text-[#aa9767]">排队中的任务会立即取消，运行中的任务采用协作式取消。</div></div></div><button onClick={() => void cancelSelectedJob()} disabled={selectedJob.cancel_requested} className="rounded-lg border border-[#80643c] px-3 py-2 text-xs font-medium text-[#f1d889] transition hover:bg-[#392d1c] disabled:cursor-not-allowed disabled:opacity-50">{selectedJob.cancel_requested ? '取消请求已发送' : '取消任务'}</button></div>}
               {selectedJob && ['failed', 'cancelled'].includes(selectedJob.status) && <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#3f527c] bg-[#111d32] px-5 py-4"><div className="flex items-center gap-3"><RefreshCw size={16} className="text-[#aebfff]" /><div><div className="text-sm font-medium text-[#d7ddff]">任务恢复</div><div className="mt-1 text-xs text-[#99a6cf]">保留原任务记录，复制原始参数重新提交。</div></div></div><button aria-label="Retry selected task" onClick={() => void retryJob(selectedJob)} disabled={loading} className="rounded-lg bg-[#aebfff] px-3 py-2 text-xs font-semibold text-[#111a34] transition hover:bg-[#c4d0ff] disabled:cursor-not-allowed disabled:opacity-50">重试任务</button></div>}
 
@@ -804,6 +846,10 @@ function Metric({ label, value, icon }: { label: string; value: string; icon: Re
   return <div className="rounded-2xl border border-white/10 bg-white/[0.035] p-3 sm:p-4"><div className="flex items-center gap-2 text-[#6d9189]">{icon}<span className="font-mono text-[9px] tracking-[0.12em]">{label}</span></div><div className="mt-3 font-mono text-2xl text-[#d9f3eb]">{value}</div></div>
 }
 
+function QcStatusMetric({ label, value, className }: { label: string; value: unknown; className: string }) {
+  return <div className={`rounded-xl border border-white/[0.08] bg-[#071719]/70 px-3 py-2 ${className}`}><div className="font-mono text-[9px] tracking-[0.12em]">{label}</div><div className="mt-1 font-mono text-lg text-[#e4f1ed]">{typeof value === 'number' ? value : String(value ?? 0)}</div></div>
+}
+
 function StatusBadge({ status }: { status: string }) {
   const style = status === 'completed' ? 'status-ok' : status === 'failed' || status === 'cancelled' ? 'status-failed' : status === 'running' ? 'status-running' : 'status-queued'
   return <span className={`status-badge ${style}`}><span className="size-1.5 rounded-full bg-current" />{status === 'cancelled' ? '已取消' : statusLabels[status] || status}</span>
@@ -869,6 +915,12 @@ function JobResultSummary({ job, onDownload }: { job: Job; onDownload: (path: st
   const omicsReport = omicsResult.report && typeof omicsResult.report === 'object' && !Array.isArray(omicsResult.report) ? omicsResult.report as Record<string, unknown> : {}
   const caddStep = steps.find((step) => step.tool === 'cadd_run_screening')
   const caddResult = caddStep?.result && typeof caddStep.result === 'object' && !Array.isArray(caddStep.result) ? caddStep.result as Record<string, unknown> : {}
+  const fastqQcStep = steps.find((step) => step.tool === 'omics_run_fastq_qc')
+  const fastqQcResult = fastqQcStep?.result && typeof fastqQcStep.result === 'object' && !Array.isArray(fastqQcStep.result) ? fastqQcStep.result as Record<string, unknown> : {}
+  const fastqQcCounts = fastqQcResult.module_status_counts && typeof fastqQcResult.module_status_counts === 'object' && !Array.isArray(fastqQcResult.module_status_counts) ? fastqQcResult.module_status_counts as Record<string, unknown> : {}
+  const fastqQcReports = Array.isArray(fastqQcResult.reports) ? fastqQcResult.reports.filter((value): value is string => typeof value === 'string') : []
+  const fastqQcReport = fastqQcReports.find((value) => value.toLowerCase().includes('multiqc_report.html'))
+  const fastqQcSummaries = Array.isArray(fastqQcResult.fastqc_summaries) ? fastqQcResult.fastqc_summaries.length : undefined
   const genomicsStep = steps.find((step) => step.tool === 'omics_run_genomics_qc')
   const genomicsResult = genomicsStep?.result && typeof genomicsStep.result === 'object' && !Array.isArray(genomicsStep.result) ? genomicsStep.result as Record<string, unknown> : {}
   const genomicsMetrics = genomicsResult.metrics && typeof genomicsResult.metrics === 'object' && !Array.isArray(genomicsResult.metrics) ? genomicsResult.metrics as Record<string, unknown> : {}
@@ -920,6 +972,9 @@ function JobResultSummary({ job, onDownload }: { job: Job; onDownload: (path: st
     fastq_reads: genomicsMetrics.reads,
     fastq_bases: genomicsMetrics.bases,
     fastq_manifest: genomicsResult.manifest_path,
+    fastq_qc_samples: fastqQcSummaries,
+    fastq_qc_report: fastqQcReport,
+    fastq_qc_manifest: fastqQcResult.manifest_path,
     image_format: imageMetrics.format,
     image_dimensions: imageMetrics.width !== undefined && imageMetrics.height !== undefined ? `${imageMetrics.width}x${imageMetrics.height}` : undefined,
     image_channels: imageMetrics.channels,
@@ -949,7 +1004,7 @@ function JobResultSummary({ job, onDownload }: { job: Job; onDownload: (path: st
     cadd_report: caddResult.report,
   }
   const visible = Object.entries(summary).filter(([, value]) => value !== undefined && value !== null)
-  const artifactKeys = new Set(['output_csv', 'cadd_result_csv', 'manifest_path', 'report_path', 'cadd_report', 'fastq_manifest', 'image_manifest', 'single_cell_metrics', 'metagenomics_relative_abundance', 'metagenomics_sample_metrics', 'knowledge_index', 'knowledge_graph'])
+  const artifactKeys = new Set(['output_csv', 'cadd_result_csv', 'manifest_path', 'report_path', 'cadd_report', 'fastq_manifest', 'fastq_qc_report', 'fastq_qc_manifest', 'image_manifest', 'single_cell_metrics', 'metagenomics_relative_abundance', 'metagenomics_sample_metrics', 'knowledge_index', 'knowledge_graph'])
   const traceSteps = steps.map((step, index) => ({
     index: index + 1,
     id: typeof step.id === 'string' ? step.id : `step-${index + 1}`,
@@ -961,6 +1016,7 @@ function JobResultSummary({ job, onDownload }: { job: Job; onDownload: (path: st
   return <section className="panel mt-5 overflow-hidden" aria-live="polite">
     <div className="flex items-center justify-between border-b border-white/10 px-5 py-5 sm:px-6"><div><div className="eyebrow">RESULT / PROVENANCE</div><h2 className="mt-2 text-xl font-semibold">结构化结果</h2></div><Check size={18} className="text-[#83e3bc]" /></div>
     <div className="grid gap-3 px-5 py-5 sm:grid-cols-2 lg:grid-cols-4 sm:px-6">{visible.map(([key, value]) => <div key={key} className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-3"><div className="font-mono text-[9px] uppercase tracking-[0.12em] text-[#63817b]">{key}</div>{artifactKeys.has(key) && typeof value === 'string' ? <button onClick={() => onDownload(value)} title={value} aria-label={`下载 ${key}`} className="mt-2 inline-flex max-w-full items-center gap-2 rounded-lg border border-[#28524b] bg-[#102b2a] px-2.5 py-1.5 text-xs text-[#b9e6d5] transition hover:border-[#71cba7] hover:text-[#ecfff7]"><Download size={13} /><span className="truncate">下载产物</span></button> : <div className="mt-2 truncate text-sm text-[#c9e5dc]">{String(value)}</div>}</div>)}</div>
+    {Boolean(fastqQcResult.status) && <div className="border-t border-white/[0.08] px-5 py-5 sm:px-6"><div className="flex flex-wrap items-center justify-between gap-3"><div><div className="field-label">FASTQ QUALITY CONTROL</div><div className="mt-1 text-sm text-[#b9e6d5]">FastQC {fastqQcSummaries ? `完成 ${fastqQcSummaries} 个报告` : '报告'} · MultiQC 汇总已生成</div></div>{fastqQcReport && <button onClick={() => onDownload(fastqQcReport)} className="inline-flex items-center gap-2 rounded-lg border border-[#3d5a8c] bg-[#111d32] px-3 py-2 text-xs font-medium text-[#cbd4ff] transition hover:border-[#aebfff] hover:text-white"><Download size={13} />下载 MultiQC 报告</button>}</div><div className="mt-4 grid grid-cols-3 gap-2 sm:max-w-md"><QcStatusMetric label="PASS" value={fastqQcCounts.pass} className="status-ok" /><QcStatusMetric label="WARN" value={fastqQcCounts.warn} className="status-running" /><QcStatusMetric label="FAIL" value={fastqQcCounts.fail} className="status-failed" /></div></div>}
     {traceSteps.length > 0 && <div className="border-t border-white/[0.08] px-5 py-4 sm:px-6"><div className="field-label">WORKFLOW TRACE / TOOLCHAIN</div><div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{traceSteps.map((step) => <div key={`${step.index}-${step.id}`} className="flex items-center gap-3 rounded-xl border border-white/[0.08] bg-[#071719]/70 px-3 py-3"><div className="grid size-7 shrink-0 place-items-center rounded-lg border border-[#28524b] bg-[#102b2a] font-mono text-[10px] text-[#8fe5c1]">{String(step.index).padStart(2, '0')}</div><div className="min-w-0 flex-1"><div className="truncate text-xs font-medium text-[#c9e5dc]">{step.id}</div><div className="mt-1 truncate font-mono text-[9px] text-[#66857e]">{step.tool}</div></div><span className={`status-badge ${step.status === 'completed' ? 'status-ok' : step.status === 'failed' ? 'status-failed' : 'status-running'}`}>{step.status}</span></div>)}</div></div>}
     {geneIds.length > 0 && <div className="border-t border-white/[0.08] px-5 py-4 sm:px-6"><div className="field-label">ANNOTATED GENE IDS</div><div className="mt-2 flex flex-wrap gap-2">{geneIds.map((geneId) => <span key={geneId} className="rounded-md border border-[#28524b] bg-[#102b2a] px-2 py-1 font-mono text-[10px] text-[#b9e6d5]">{geneId}</span>)}</div></div>}
     <details className="border-t border-white/[0.08] px-5 py-4 sm:px-6"><summary className="cursor-pointer text-xs text-[#8fb2a8]">查看完整结果 JSON</summary><pre className="mt-3 max-h-64 overflow-auto rounded-xl bg-[#061113] p-3 text-[10px] leading-5 text-[#91b8ac]">{JSON.stringify(payload, null, 2)}</pre></details>
