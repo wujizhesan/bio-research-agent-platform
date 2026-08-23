@@ -19,7 +19,7 @@ from src.audit_external_overlap import audit_overlap, remove_structure_overlap
 from src.build_hard_decoy_benchmark import build_hard_decoy_benchmark, build_random_control_benchmark
 from src.compare_benchmarks import compare_benchmarks, compare_benchmark_replicates
 from src.run_benchmark_replicates import _normalize_id, _validate_control, _validate_hard_benchmark
-from src.omics_agent import TOOLS as OMICS_TOOLS, _resolve_statistics_backend, annotate_variants, run_omics_analysis, run_tool as run_omics_tool, search_gene_evidence, statistics_backend_status, toolchain_status
+from src.omics_agent import TOOLS as OMICS_TOOLS, _resolve_statistics_backend, annotate_variants, run_genomics_qc, run_omics_analysis, run_tool as run_omics_tool, search_gene_evidence, statistics_backend_status, toolchain_status
 from src.domain_registry import run_tool as run_domain_tool, tool_specs, validate_tool_map
 from src.workflow_runner import run_workflow
 from src.resplit_external import joint_split_indices
@@ -477,6 +477,63 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(set(annotated['gene_id'].dropna()), {'GeneA', 'GeneB', 'GeneC'})
             self.assertIn('gatk', toolchain_status())
             self.assertIn('annotate_variants', OMICS_TOOLS)
+
+    def test_fastq_genomics_qc_is_reproducible(self):
+        with tempfile.TemporaryDirectory(prefix='cadd_fastq_qc_') as raw:
+            root = Path(raw)
+            fastq_path = root / 'reads.fastq'
+            fastq_path.write_text(
+                '@read1\nACGT\n+\nIIII\n'
+                '@read2\nAC\n+\n!!\n',
+                encoding='utf-8',
+            )
+            result = run_genomics_qc(fastq_path, root / 'qc')
+            manifest = json.loads((root / 'qc' / 'genomics_qc.json').read_text(encoding='utf-8'))
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['tool'], 'python-fastq-parser')
+        self.assertEqual(result['metrics']['reads'], 2)
+        self.assertEqual(result['metrics']['bases'], 6)
+        self.assertAlmostEqual(result['metrics']['mean_quality'], 26.667, places=3)
+        self.assertEqual(manifest['manifest_path'], result['manifest_path'])
+        self.assertIn('run_genomics_qc', OMICS_TOOLS)
+
+    @patch('src.omics_agent.subprocess.run')
+    @patch('src.omics_agent.shutil.which')
+    def test_bam_genomics_qc_uses_samtools(self, mocked_which, mocked_run):
+        mocked_which.return_value = 'samtools'
+        mocked_run.side_effect = [
+            SimpleNamespace(returncode=0, stdout='', stderr=''),
+            SimpleNamespace(returncode=0, stdout='5 + 1 in total (QC-passed reads + QC-failed reads)\n', stderr=''),
+        ]
+        with tempfile.TemporaryDirectory(prefix='cadd_bam_qc_') as raw:
+            root = Path(raw)
+            bam_path = root / 'aligned.bam'
+            bam_path.write_bytes(b'placeholder')
+            result = run_genomics_qc(bam_path, root / 'qc', input_type='bam')
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['tool'], 'samtools')
+        self.assertEqual(result['total_reads'], 6)
+        self.assertEqual(mocked_run.call_args_list[0].args[0][1:3], ['quickcheck', '-v'])
+        self.assertEqual(mocked_run.call_args_list[1].args[0][1], 'flagstat')
+
+    @patch('src.omics_agent.subprocess.run')
+    @patch('src.omics_agent.shutil.which')
+    def test_vcf_genomics_qc_uses_bcftools(self, mocked_which, mocked_run):
+        mocked_which.return_value = 'bcftools'
+        mocked_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout='SN\t0\tnumber of records:\t4\n',
+            stderr='',
+        )
+        with tempfile.TemporaryDirectory(prefix='cadd_vcf_qc_') as raw:
+            root = Path(raw)
+            vcf_path = root / 'calls.vcf'
+            vcf_path.write_text('##fileformat=VCFv4.3\n', encoding='utf-8')
+            result = run_genomics_qc(vcf_path, root / 'qc', input_type='vcf')
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['tool'], 'bcftools')
+        self.assertEqual(result['number_of_records'], '4')
+        self.assertEqual(mocked_run.call_args.args[0][1], 'stats')
 
     def test_agent_uses_project_llm_config(self):
         base_url, model, _ = load_llm_config()

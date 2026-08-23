@@ -48,6 +48,7 @@ _DOMAIN_KEYWORDS = {
         'omics', 'rna-seq', 'rnaseq', 'transcriptome', 'gene expression',
         'differential expression', 'pathway', 'gene', 'single-cell',
         'metagenome', 'variant', 'vcf', 'mutation', 'gatk', 'samtools',
+        'fastq', 'bam', 'cram', 'quality control', 'quality-control', 'qc',
         'gene annotation', 'variant annotation', '变异', '突变',
     ),
     'sequence': (
@@ -81,6 +82,11 @@ _EVIDENCE_PROVIDER_KEYWORDS += (
 _VARIANT_KEYWORDS = (
     'variant', 'vcf', 'mutation', 'gatk', 'samtools', 'gene annotation',
     'variant annotation', '变异', '突变', '基因注释', '变异解读',
+)
+
+_GENOMICS_QC_KEYWORDS = (
+    'fastq', 'bam', 'cram', 'bcf', 'quality control', 'quality-control',
+    'sequencing qc', '测序质控', '质量控制',
 )
 
 
@@ -158,10 +164,20 @@ def _is_variant_task(task, inputs=None):
     return any(keyword.lower() in text for keyword in _VARIANT_KEYWORDS)
 
 
+def _is_genomics_qc_task(task, inputs=None):
+    inputs = inputs or {}
+    if any(key in inputs for key in ('input_path', 'fastq_path', 'bam_path', 'cram_path')):
+        return True
+    text = str(task or '').lower()
+    return any(keyword in text for keyword in _GENOMICS_QC_KEYWORDS)
+
+
 def _required_inputs(domains, task=None, inputs=None):
     required = []
     if 'omics' in domains:
-        if _is_variant_task(task, inputs):
+        if _is_genomics_qc_task(task, inputs):
+            required.append({'name': 'input_path', 'description': 'FASTQ, BAM/CRAM or VCF/BCF input file'})
+        elif _is_variant_task(task, inputs):
             required.append({'name': 'vcf_path', 'description': 'VCF variant file'})
             if (inputs or {}).get('annotation_backend', 'auto') != 'vcf_ann':
                 required.append({'name': 'annotation_csv', 'description': 'genomic interval annotation table'})
@@ -215,7 +231,35 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
         missing.append('gencode_gtf')
 
     variant_task = _is_variant_task(task, inputs)
-    if 'omics' in domains and variant_task:
+    qc_task = _is_genomics_qc_task(task, inputs)
+    if 'omics' in domains and qc_task:
+        qc_input = (
+            inputs.get('input_path')
+            or inputs.get('fastq_path')
+            or inputs.get('bam_path')
+            or inputs.get('cram_path')
+            or inputs.get('vcf_path')
+            or inputs.get('bcf_path')
+        )
+        if not qc_input:
+            missing.append('input_path')
+        else:
+            if isinstance(qc_input, (list, tuple)):
+                serialized_input = [str(path) for path in qc_input]
+            else:
+                serialized_input = str(qc_input)
+            steps.append({
+                'id': 'genomics_qc',
+                'tool': 'omics_run_genomics_qc',
+                'args': {
+                    'input_path': serialized_input,
+                    'output_dir': output_dir,
+                    'input_type': str(inputs.get('input_type', 'auto')),
+                    'timeout': int(inputs.get('qc_timeout', 300)),
+                },
+            })
+            rationale.append('genomics QC uses a reproducible FASTQ parser or fixed SAMtools/bcftools commands')
+    elif 'omics' in domains and variant_task:
         vcf_path = inputs.get('vcf_path') or inputs.get('vcf') or inputs.get('variants_vcf')
         annotation_backend = str(inputs.get('annotation_backend', 'auto'))
         annotation_csv = inputs.get('annotation_csv')

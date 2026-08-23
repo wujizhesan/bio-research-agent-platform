@@ -3,6 +3,7 @@ import argparse
 import gzip
 import json
 import os
+import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ PLUGIN_CAPABILITIES = (
     'omics.report',
     'omics.variant_annotation',
     'omics.toolchain',
+    'omics.genomics_qc',
 )
 STATISTICS_BACKENDS = ('auto', 'scipy', 'deseq2')
 VARIANT_ANNOTATION_BACKENDS = ('auto', 'local', 'vcf_ann')
@@ -308,6 +310,237 @@ def toolchain_status():
             'reason': None if path else f'{executable} not found',
         }
     return status
+
+
+GENOMICS_QC_TYPES = ('auto', 'fastq', 'bam', 'vcf')
+
+
+def _normalize_qc_paths(input_path):
+    values = input_path if isinstance(input_path, (list, tuple)) else [input_path]
+    if not values or any(value is None or not str(value).strip() for value in values):
+        raise ValueError('input_path must contain at least one file path')
+    paths = [Path(str(value)) for value in values]
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise ValueError(f'input files do not exist: {missing}')
+    return paths
+
+
+def _infer_qc_type(path):
+    name = path.name.lower()
+    if name.endswith(('.fastq', '.fq', '.fastq.gz', '.fq.gz')):
+        return 'fastq'
+    if name.endswith(('.bam', '.cram')):
+        return 'bam'
+    if name.endswith(('.vcf', '.vcf.gz', '.bcf')):
+        return 'vcf'
+    raise ValueError(f'cannot infer genomics QC input type from: {path}')
+
+
+def _resolve_qc_type(paths, requested):
+    requested = str(requested or 'auto').lower()
+    if requested not in GENOMICS_QC_TYPES:
+        raise ValueError(f'unknown genomics QC input type: {requested}')
+    if requested != 'auto':
+        return requested
+    detected = {_infer_qc_type(path) for path in paths}
+    if len(detected) != 1:
+        raise ValueError(f'input files must share one QC type: {sorted(detected)}')
+    return detected.pop()
+
+
+def _fastq_file_stats(path):
+    opener = gzip.open if path.name.lower().endswith('.gz') else open
+    reads = 0
+    bases = 0
+    quality_sum = 0
+    min_length = None
+    max_length = 0
+    with opener(path, 'rt', encoding='utf-8', errors='replace') as handle:
+        while True:
+            header = handle.readline()
+            if not header:
+                break
+            sequence = handle.readline().rstrip('\r\n')
+            separator = handle.readline().rstrip('\r\n')
+            quality = handle.readline().rstrip('\r\n')
+            if not sequence or not header.startswith('@') or not separator.startswith('+'):
+                raise ValueError(f'invalid FASTQ record in: {path}')
+            if len(sequence) != len(quality):
+                raise ValueError(f'FASTQ sequence/quality length mismatch in: {path}')
+            length = len(sequence)
+            reads += 1
+            bases += length
+            quality_sum += sum(max(0, ord(char) - 33) for char in quality)
+            min_length = length if min_length is None else min(min_length, length)
+            max_length = max(max_length, length)
+    return {
+        'path': str(path),
+        'reads': reads,
+        'bases': bases,
+        'min_read_length': min_length or 0,
+        'max_read_length': max_length,
+        'mean_read_length': round(bases / reads, 3) if reads else 0.0,
+        'mean_quality': round(quality_sum / bases, 3) if bases else 0.0,
+    }
+
+
+def _write_qc_manifest(output_dir, payload):
+    manifest_path = Path(output_dir) / 'genomics_qc.json'
+    payload['manifest_path'] = str(manifest_path)
+    manifest_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
+        encoding='utf-8',
+    )
+    return payload
+
+
+def _parse_stat_value(text, label):
+    for line in str(text or '').splitlines():
+        fields = line.split('\t')
+        if len(fields) >= 3 and fields[0] == 'SN' and label in fields[2]:
+            return fields[3] if len(fields) > 3 else None
+        if len(fields) >= 2 and fields[0] == 'SN' and label in fields[1]:
+            return fields[2] if len(fields) > 2 else None
+    return None
+
+
+def _run_external_qc(command, output_path, timeout):
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            'status': 'failed',
+            'error': f'command timed out after {timeout}s',
+            'stdout': str(exc.stdout or ''),
+            'stderr': str(exc.stderr or ''),
+        }
+    output_path.write_text(completed.stdout or '', encoding='utf-8')
+    if completed.returncode != 0:
+        return {
+            'status': 'failed',
+            'returncode': completed.returncode,
+            'error': (completed.stderr or completed.stdout or 'external QC command failed').strip(),
+            'stderr': completed.stderr or '',
+        }
+    return {
+        'status': 'completed',
+        'returncode': completed.returncode,
+        'output_path': str(output_path),
+        'stdout': completed.stdout or '',
+    }
+
+
+def run_genomics_qc(input_path, output_dir, input_type='auto', timeout=300):
+    paths = _normalize_qc_paths(input_path)
+    resolved_type = _resolve_qc_type(paths, input_type)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timeout = max(1, min(int(timeout), 3600))
+    if resolved_type == 'fastq':
+        file_metrics = [_fastq_file_stats(path) for path in paths]
+        totals = {
+            'files': len(file_metrics),
+            'reads': sum(item['reads'] for item in file_metrics),
+            'bases': sum(item['bases'] for item in file_metrics),
+        }
+        total_bases = totals['bases']
+        totals.update({
+            'min_read_length': min(
+                (item['min_read_length'] for item in file_metrics if item['reads']),
+                default=0,
+            ),
+            'max_read_length': max(
+                (item['max_read_length'] for item in file_metrics),
+                default=0,
+            ),
+            'mean_read_length': round(
+                totals['bases'] / totals['reads'], 3
+            ) if totals['reads'] else 0.0,
+            'mean_quality': round(
+                sum(item['mean_quality'] * item['bases'] for item in file_metrics) / total_bases,
+                3,
+            ) if total_bases else 0.0,
+        })
+        return _write_qc_manifest(output_dir, {
+            'status': 'completed',
+            'input_type': resolved_type,
+            'tool': 'python-fastq-parser',
+            'inputs': [str(path) for path in paths],
+            'metrics': totals,
+            'files': file_metrics,
+        })
+    if len(paths) != 1:
+        raise ValueError(f'{resolved_type} QC accepts exactly one input file')
+    input_file = paths[0]
+    tool_name = 'samtools' if resolved_type == 'bam' else 'bcftools'
+    executable = shutil.which(tool_name)
+    if not executable:
+        return _write_qc_manifest(output_dir, {
+            'status': 'unavailable',
+            'input_type': resolved_type,
+            'tool': tool_name,
+            'inputs': [str(input_file)],
+            'reason': f'{tool_name} not found in PATH',
+        })
+    if resolved_type == 'bam':
+        quickcheck = _run_external_qc(
+            [executable, 'quickcheck', '-v', str(input_file)],
+            output_dir / 'samtools_quickcheck.txt',
+            timeout,
+        )
+        if quickcheck['status'] != 'completed':
+            return _write_qc_manifest(output_dir, {
+                'status': 'failed',
+                'input_type': resolved_type,
+                'tool': tool_name,
+                'inputs': [str(input_file)],
+                'quickcheck': quickcheck,
+            })
+        flagstat = _run_external_qc(
+            [executable, 'flagstat', str(input_file)],
+            output_dir / 'samtools_flagstat.txt',
+            timeout,
+        )
+        return _write_qc_manifest(output_dir, {
+            'status': flagstat['status'],
+            'input_type': resolved_type,
+            'tool': tool_name,
+            'inputs': [str(input_file)],
+            'quickcheck': {'status': 'completed'},
+            'flagstat': {
+                key: value for key, value in flagstat.items() if key != 'stdout'
+            },
+            'total_reads': _parse_flagstat_total(flagstat.get('stdout', '')),
+        })
+    stats = _run_external_qc(
+        [executable, 'stats', str(input_file)],
+        output_dir / 'bcftools_stats.txt',
+        timeout,
+    )
+    return _write_qc_manifest(output_dir, {
+        'status': stats['status'],
+        'input_type': resolved_type,
+        'tool': tool_name,
+        'inputs': [str(input_file)],
+        'stats': {
+            key: value for key, value in stats.items() if key != 'stdout'
+        },
+        'number_of_records': _parse_stat_value(stats.get('stdout', ''), 'number of records'),
+    })
+
+
+def _parse_flagstat_total(text):
+    match = re.search(r'^(\d+)\s*\+\s*(\d+)\s+in total', str(text or ''), re.MULTILINE)
+    if not match:
+        return None
+    return int(match.group(1)) + int(match.group(2))
 
 
 def _open_vcf(path):
@@ -721,6 +954,21 @@ TOOLS = {
         'description': 'Report whether GATK, SAMtools, bcftools and VEP are available in the execution environment.',
         'parameters': _parameters({}),
         'function': toolchain_status,
+    },
+    'run_genomics_qc': {
+        'description': 'Run reproducible QC for FASTQ, BAM/CRAM or VCF/BCF using a local parser, SAMtools or bcftools.',
+        'parameters': _parameters({
+            'input_path': {
+                'oneOf': [
+                    {'type': 'string'},
+                    {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1},
+                ],
+            },
+            'output_dir': {'type': 'string'},
+            'input_type': {'type': 'string', 'enum': list(GENOMICS_QC_TYPES)},
+            'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 3600},
+        }, required=('input_path', 'output_dir')),
+        'function': run_genomics_qc,
     },
     'search_gene_evidence': {
         'description': 'Retrieve cited gene evidence from a structured evidence index.',
