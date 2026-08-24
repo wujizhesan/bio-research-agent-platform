@@ -388,6 +388,42 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(result['selected_tools'], ['omics_run_single_cell_10x_qc'])
         self.assertEqual(result['workflow']['steps'][0]['args']['matrix_mtx'], 'examples/omics/tenx/matrix.mtx')
 
+    def test_research_planner_builds_editable_multiomics_workflow(self):
+        result = run_tool('research_build_workflow', {
+            'task': '运行 BGI 多组学研究流程：基因组质控、10x 单细胞、显微成像、微生物组、证据检索和 mRNA 设计',
+            'domains': ['omics', 'imaging', 'literature', 'knowledge', 'sequence'],
+            'inputs': {
+                'multiomics': True,
+                'fastq_paths': 'examples/omics/reads.fastq',
+                'input_type': 'fastq',
+                'matrix_mtx': 'examples/omics/tenx/matrix.mtx',
+                'barcodes_tsv': 'examples/omics/tenx/barcodes.tsv',
+                'features_tsv': 'examples/omics/tenx/features.tsv',
+                'abundance_csv': 'examples/omics/metagenome_abundance.csv',
+                'image_path': 'examples/omics/cell_microscopy.svg',
+                'documents_dir': 'examples/knowledge',
+                'gene_ids': ['GeneA', 'GeneB'],
+                'protein': 'MKT',
+                'evidence_csv': 'examples/rnaseq/evidence.csv',
+            },
+        })
+        self.assertTrue(result['ready'])
+        self.assertEqual(
+            result['selected_tools'],
+            [
+                'omics_run_genomics_qc',
+                'omics_run_single_cell_10x_qc',
+                'omics_run_metagenomics_qc',
+                'literature_search',
+                'literature_summarize',
+                'imaging_inspect_image',
+                'knowledge_ingest_directory',
+                'knowledge_search',
+                'sequence_pipeline',
+                'sequence_report',
+            ],
+        )
+
     def test_research_planner_builds_metagenomics_qc_workflow(self):
         result = run_tool('research_build_workflow', {
             'task': '分析宏基因组物种丰度并计算 Shannon 多样性',

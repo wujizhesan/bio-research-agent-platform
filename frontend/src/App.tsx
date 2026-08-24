@@ -138,6 +138,7 @@ type RnaPreflightItem = {
 
 type View = 'workspace' | 'domains'
 type RunMode = 'research' | 'rnaseq' | 'variant' | 'sequence' | 'cadd'
+type ResearchPreset = 'custom' | 'bgi_multiomics' | 'online_evidence'
 type PlannerMode = 'auto' | 'deterministic' | 'llm'
 
 const runtimeApiBase = new URLSearchParams(window.location.search).get('api') || ''
@@ -329,6 +330,7 @@ function formatJobId(value: string) {
 function App() {
   const [view, setView] = useState<View>('workspace')
   const [mode, setMode] = useState<RunMode>('research')
+  const [researchPreset, setResearchPreset] = useState<ResearchPreset>('custom')
   const [plannerMode, setPlannerMode] = useState<PlannerMode>('auto')
   const [apiBase] = useState(defaultApiBase)
   const [token, setToken] = useState(() => localStorage.getItem('bio-agent-token') || import.meta.env.VITE_API_TOKEN || '')
@@ -432,8 +434,30 @@ function App() {
     if (normalized === token) void refresh(normalized)
   }
 
+  function applyResearchPreset(preset: ResearchPreset) {
+    setResearchPreset(preset)
+    setResearchPlan(null)
+    if (preset === 'bgi_multiomics') {
+      setTask('运行 BGI 多组学研究流程：基因组质控、10x 单细胞、显微成像、微生物组、证据检索和 mRNA 设计')
+      setGeneIds('GeneA, GeneB')
+      setProtein('MKT')
+      setEvidenceProvider('local')
+      setPlannerMode('deterministic')
+    } else if (preset === 'online_evidence') {
+      setTask('检索目标基因的在线证据并生成可追溯摘要')
+      setGeneIds('TP53, BRCA1')
+      setEvidenceProvider('uniprot')
+      setPlannerMode('deterministic')
+    } else {
+      setTask('分析 RNA-seq 差异表达并设计 mRNA 序列')
+      setGeneIds('')
+      setEvidenceProvider('local')
+      setPlannerMode('auto')
+    }
+  }
+
   function buildResearchInputs() {
-    return {
+    const inputs: Record<string, unknown> = {
       expression_csv: uploadedFiles.expression?.path || 'examples/rnaseq/expression.csv',
       metadata_csv: uploadedFiles.metadata?.path || 'examples/rnaseq/metadata.csv',
       gene_sets_csv: uploadedFiles.gene_sets?.path || 'examples/rnaseq/gene_sets.csv',
@@ -443,6 +467,29 @@ function App() {
       protein,
       output_dir: 'output/frontend_auto_research',
     }
+    if (researchPreset === 'bgi_multiomics') {
+      Object.assign(inputs, {
+        fastq_paths: 'examples/omics/reads.fastq',
+        input_type: 'fastq',
+        matrix_mtx: 'examples/omics/tenx/matrix.mtx',
+        barcodes_tsv: 'examples/omics/tenx/barcodes.tsv',
+        features_tsv: 'examples/omics/tenx/features.tsv',
+        abundance_csv: 'examples/omics/metagenome_abundance.csv',
+        image_path: 'examples/omics/cell_microscopy.svg',
+        image_modality: 'microscopy_demo',
+        documents_dir: 'examples/knowledge',
+        top_k: 3,
+        multiomics: true,
+        output_dir: 'output/frontend_bgi_multiomics',
+      })
+    }
+    return inputs
+  }
+
+  function researchDomains() {
+    if (researchPreset === 'bgi_multiomics') return ['omics', 'imaging', 'literature', 'knowledge', 'sequence']
+    if (researchPreset === 'online_evidence') return ['literature']
+    return undefined
   }
 
   function buildVariantInputs() {
@@ -573,7 +620,7 @@ function App() {
       setResearchPlan(null)
       await submitToolJob(
         'research_plan',
-        { task, inputs: buildResearchInputs(), planner_mode: plannerMode },
+        { task, domains: researchDomains(), inputs: buildResearchInputs(), planner_mode: plannerMode },
         '研究计划已进入执行队列',
         (job) => setResearchPlan(extractResearchPlan(job)),
       )
@@ -832,6 +879,7 @@ function App() {
                   <div className="flex items-start justify-between gap-4"><div><div className="eyebrow">01 / 启动任务</div><h2 className="mt-2 text-xl font-semibold">启动一条研究路径</h2></div><div className="rounded-xl border border-[#21443f] bg-[#102b2a] p-2.5 text-[#8fe5c1]"><Play size={17} /></div></div>
                   <div className="mt-7 grid grid-cols-2 gap-1 rounded-xl bg-[#071719] p-1 sm:grid-cols-5"><button onClick={() => setMode('research')} className={`mode-tab ${mode === 'research' ? 'mode-tab-active' : ''}`}><Workflow size={14} />研究规划</button><button onClick={() => setMode('rnaseq')} className={`mode-tab ${mode === 'rnaseq' ? 'mode-tab-active' : ''}`}><Activity size={14} />RNA-seq 上传</button><button onClick={() => setMode('variant')} className={`mode-tab ${mode === 'variant' ? 'mode-tab-active' : ''}`}><GitBranch size={14} />VCF 变异</button><button onClick={() => setMode('sequence')} className={`mode-tab ${mode === 'sequence' ? 'mode-tab-active' : ''}`}><Dna size={14} />mRNA 设计</button><button onClick={() => setMode('cadd')} className={`mode-tab ${mode === 'cadd' ? 'mode-tab-active' : ''}`}><Beaker size={14} />CADD 对接</button></div>
                   {mode === 'research' ? <>
+                    <div className="mt-6 rounded-xl border border-[#28524b] bg-[#102b2a]/60 p-4"><label className="field-label" htmlFor="research-preset">研究场景</label><select id="research-preset" value={researchPreset} onChange={(event) => applyResearchPreset(event.target.value as ResearchPreset)} className="input-control"><option value="custom">通用研究规划</option><option value="bgi_multiomics">BGI 多组学</option><option value="online_evidence">在线证据检索</option></select><p className="mt-2 text-xs leading-5 text-[#789791]">场景只负责填入默认任务和样例输入，后续内容仍可修改，并统一进入计划检查。</p></div>
                     <label className="mt-6 block"><span className="field-label">科学问题</span><textarea value={task} onChange={(event) => { setTask(event.target.value); setResearchPlan(null) }} rows={4} className="input-area" placeholder="描述你希望 Agent 协助完成的研究任务" /></label>
                     <div className="mt-5 grid gap-4 sm:grid-cols-[0.8fr_1.2fr]"><div><label className="field-label" htmlFor="planner-mode">规划器模式</label><select id="planner-mode" value={plannerMode} onChange={(event) => { setPlannerMode(event.target.value as PlannerMode); setResearchPlan(null) }} className="input-control"><option value="auto">自动：配置密钥时使用模型</option><option value="deterministic">确定性：规则规划</option><option value="llm">LLM：必须调用模型</option></select></div><div className="flex items-end pb-1 text-xs leading-5 text-[#688983]">自动模式会在配置模型密钥时调用 LLM；模型不可用时保留回退原因并使用确定性规划。</div></div>
                     <div className="mt-5 grid gap-4 sm:grid-cols-3">

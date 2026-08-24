@@ -443,7 +443,49 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
     variant_calling_task = _is_variant_calling_task(task, inputs)
     qc_task = _is_genomics_qc_task(task, inputs)
     fastq_qc_task = _is_fastq_qc_task(task, inputs)
-    if 'omics' in domains and metagenomics_task:
+    multiomics_task = bool(inputs.get('multiomics'))
+    if 'omics' in domains and multiomics_task:
+        fastq_path = inputs.get('fastq_path') or inputs.get('fastq_paths')
+        if not fastq_path:
+            missing.append('fastq_paths')
+        else:
+            steps.append({
+                'id': 'genomics_qc',
+                'tool': 'omics_run_genomics_qc',
+                'args': {
+                    'input_path': str(fastq_path[0] if isinstance(fastq_path, (list, tuple)) else fastq_path),
+                    'input_type': str(inputs.get('input_type', 'fastq')),
+                    'output_dir': str(Path(output_dir) / 'genomics_qc'),
+                },
+            })
+            rationale.append('genomics QC records sequencing read counts and quality metrics')
+        ten_x_inputs = ('matrix_mtx', 'barcodes_tsv', 'features_tsv')
+        missing.extend(key for key in ten_x_inputs if not inputs.get(key))
+        if not any(key in missing for key in ten_x_inputs):
+            steps.append({
+                'id': 'single_cell_10x_qc',
+                'tool': 'omics_run_single_cell_10x_qc',
+                'args': {
+                    **{key: str(inputs[key]) for key in ten_x_inputs},
+                    'output_dir': str(Path(output_dir) / 'single_cell_10x_qc'),
+                },
+            })
+            rationale.append('10x single-cell QC preserves sparse Matrix Market artifacts and filters cells by core QC metrics')
+        abundance_csv = inputs.get('abundance_csv') or inputs.get('metagenomics_abundance')
+        if not abundance_csv:
+            missing.append('abundance_csv')
+        else:
+            steps.append({
+                'id': 'metagenomics_qc',
+                'tool': 'omics_run_metagenomics_qc',
+                'args': {
+                    'abundance_csv': str(abundance_csv),
+                    'output_dir': str(Path(output_dir) / 'metagenomics_qc'),
+                    'min_prevalence': int(inputs.get('min_prevalence', 1)),
+                },
+            })
+            rationale.append('metagenomics QC normalizes abundance and calculates observed taxa and Shannon diversity')
+    elif 'omics' in domains and metagenomics_task:
         abundance_csv = inputs.get('abundance_csv') or inputs.get('metagenomics_abundance')
         if not abundance_csv:
             missing.append('abundance_csv')
