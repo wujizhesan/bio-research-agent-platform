@@ -321,6 +321,7 @@ function App() {
   const [plannerMode, setPlannerMode] = useState<PlannerMode>('auto')
   const [apiBase] = useState(defaultApiBase)
   const [token, setToken] = useState(() => localStorage.getItem('bio-agent-token') || import.meta.env.VITE_API_TOKEN || '')
+  const [tokenDraft, setTokenDraft] = useState(() => token)
   const [plugins, setPlugins] = useState<Plugin[]>([])
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null)
   const [jobs, setJobs] = useState<Job[]>([])
@@ -414,11 +415,12 @@ function App() {
   }, [rnaFiles, rnaseqTask])
 
   function saveToken() {
-    const normalized = token.trim()
+    const normalized = tokenDraft.trim()
     if (normalized) localStorage.setItem('bio-agent-token', normalized)
     else localStorage.removeItem('bio-agent-token')
+    setTokenDraft(normalized)
     setToken(normalized)
-    void refresh(normalized)
+    if (normalized === token) void refresh(normalized)
   }
 
   function buildResearchInputs() {
@@ -907,7 +909,7 @@ function App() {
             <div className="flex items-center gap-2 font-mono text-[11px] tracking-[0.16em] text-[#74918c]"><span className="text-[#a8f0d2]">PLATFORM</span><ChevronRight size={13} /><span>{view === 'workspace' ? 'WORKSPACE' : 'DOMAINS'}</span></div>
             <form onSubmit={(event) => { event.preventDefault(); saveToken() }} className="flex items-center gap-3">
               <div className="hidden items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 font-mono text-[10px] text-[#8aa9a2] sm:flex"><LockKeyhole size={12} />Bearer token</div>
-              <input aria-label="API Token" autoComplete="off" value={token} onChange={(event) => setToken(event.target.value)} type="password" className="w-32 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 font-mono text-[10px] text-[#c7ded8] outline-none transition focus:border-[#72dcb4] sm:w-48" placeholder="本地可留空，生产请输入 Token" />
+              <input aria-label="API Token" autoComplete="off" value={tokenDraft} onChange={(event) => setTokenDraft(event.target.value)} type="password" className="w-32 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 font-mono text-[10px] text-[#c7ded8] outline-none transition focus:border-[#72dcb4] sm:w-48" placeholder="本地可留空，生产请输入 Token" />
               <button type="submit" className="rounded-lg bg-[#a8f0d2] px-3 py-1.5 text-xs font-semibold text-[#092521] transition hover:bg-[#c6f8e1]">连接</button>
             </form>
           </header>
