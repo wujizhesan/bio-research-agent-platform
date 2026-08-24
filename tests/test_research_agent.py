@@ -401,6 +401,22 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(result['selected_tools'], ['omics_run_metagenomics_qc'])
         self.assertEqual(result['workflow']['steps'][0]['args']['min_prevalence'], 1)
 
+    def test_research_planner_infers_microscopy_image_qc_workflow(self):
+        result = run_tool('research_build_workflow', {
+            'task': 'Inspect microscopy image quality and record image provenance',
+            'inputs': {
+                'image_path': 'examples/omics/cell_microscopy.svg',
+                'image_modality': 'microscopy_demo',
+            },
+        })
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['selected_domains'], ['imaging'])
+        self.assertEqual(result['selected_tools'], ['imaging_inspect_image'])
+        self.assertEqual(
+            result['workflow']['steps'][0]['args']['image_path'],
+            'examples/omics/cell_microscopy.svg',
+        )
+
     def test_bgi_preset_is_discoverable_and_dry_runnable(self):
         presets = run_tool('research_presets', {})
         self.assertEqual(presets['status'], 'ok')
@@ -437,7 +453,7 @@ class ResearchAgentTests(unittest.TestCase):
         })
         self.assertEqual(result['status'], 'planned')
         self.assertEqual(result['selected_domains'], ['omics', 'imaging', 'literature', 'knowledge', 'sequence'])
-        self.assertEqual(result['manifest']['completed_steps'], 11)
+        self.assertEqual(result['manifest']['completed_steps'], 12)
         self.assertEqual(result['manifest']['failed_steps'], 0)
         self.assertIn('knowledge_build_graph', {
             step['tool'] for step in result['manifest']['steps']

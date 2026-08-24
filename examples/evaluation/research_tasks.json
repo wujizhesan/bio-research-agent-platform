@@ -1,0 +1,159 @@
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "fastq_qc",
+      "task": "Run FASTQ sequencing quality control",
+      "inputs": {
+        "input_path": "examples/omics/reads.fastq",
+        "input_type": "fastq"
+      },
+      "expected": {
+        "domains": ["omics"],
+        "tools": ["omics_run_fastq_qc"],
+        "ready": true,
+        "missing_inputs": []
+      }
+    },
+    {
+      "id": "rnaseq_analysis",
+      "task": "Run differential expression and pathway enrichment for RNA-seq",
+      "inputs": {
+        "expression_csv": "examples/rnaseq/expression.csv",
+        "metadata_csv": "examples/rnaseq/metadata.csv",
+        "gene_sets_csv": "examples/rnaseq/gene_sets.csv",
+        "evidence_csv": "examples/rnaseq/evidence.csv",
+        "evidence_provider": "local"
+      },
+      "expected": {
+        "domains": ["omics"],
+        "tools": ["omics_run_analysis"],
+        "ready": true,
+        "missing_inputs": []
+      }
+    },
+    {
+      "id": "rnaseq_missing_inputs",
+      "task": "Run differential expression and pathway enrichment for RNA-seq",
+      "inputs": {},
+      "expected": {
+        "domains": ["omics"],
+        "tools": [],
+        "ready": false,
+        "missing_inputs": ["expression_csv", "gene_sets_csv", "metadata_csv"]
+      }
+    },
+    {
+      "id": "single_cell_10x_qc",
+      "task": "Run 10x single-cell quality control",
+      "inputs": {
+        "matrix_mtx": "examples/omics/tenx/matrix.mtx",
+        "barcodes_tsv": "examples/omics/tenx/barcodes.tsv",
+        "features_tsv": "examples/omics/tenx/features.tsv"
+      },
+      "expected": {
+        "domains": ["omics"],
+        "tools": ["omics_run_single_cell_10x_qc"],
+        "ready": true,
+        "missing_inputs": []
+      }
+    },
+    {
+      "id": "metagenomics_qc",
+      "task": "Analyze metagenomics abundance and calculate Shannon diversity",
+      "inputs": {
+        "abundance_csv": "examples/omics/metagenome_abundance.csv",
+        "min_prevalence": 1
+      },
+      "expected": {
+        "domains": ["omics"],
+        "tools": ["omics_run_metagenomics_qc"],
+        "ready": true,
+        "missing_inputs": []
+      }
+    },
+    {
+      "id": "variant_normalization_annotation",
+      "task": "Normalize variants and annotate them before interpretation",
+      "inputs": {
+        "vcf_path": "examples/variants/variants.vcf",
+        "reference_fasta": "examples/omics/rnaseq_fastq_fixture/reference.fa",
+        "annotation_csv": "examples/variants/gene_annotations.csv"
+      },
+      "expected": {
+        "domains": ["omics"],
+        "tools": ["omics_normalize_variants", "omics_annotate_variants"],
+        "ready": true,
+        "missing_inputs": []
+      }
+    },
+    {
+      "id": "mrna_design_benchmark",
+      "task": "Design and benchmark an mRNA sequence for a target protein",
+      "inputs": {
+        "protein": "MKT",
+        "molecule": "linear",
+        "method": "greedy",
+        "include_benchmark": true
+      },
+      "expected": {
+        "domains": ["sequence"],
+        "tools": ["sequence_pipeline", "sequence_benchmark", "sequence_report"],
+        "ready": true,
+        "missing_inputs": []
+      }
+    },
+    {
+      "id": "pubmed_evidence",
+      "task": "Search PubMed literature evidence for TP53",
+      "inputs": {
+        "gene_ids": ["TP53"],
+        "evidence_provider": "pubmed"
+      },
+      "expected": {
+        "domains": ["literature"],
+        "tools": ["literature_search", "literature_summarize"],
+        "ready": true,
+        "missing_inputs": []
+      }
+    },
+    {
+      "id": "knowledge_retrieval",
+      "task": "Search local scientific documents and build a knowledge retrieval index",
+      "inputs": {
+        "documents_dir": "examples/knowledge"
+      },
+      "expected": {
+        "domains": ["knowledge"],
+        "tools": ["knowledge_ingest_directory", "knowledge_search"],
+        "ready": true,
+        "missing_inputs": []
+      }
+    },
+    {
+      "id": "microscopy_image_qc",
+      "task": "对显微图像进行图像质控并记录来源",
+      "inputs": {
+        "image_path": "examples/omics/cell_microscopy.svg",
+        "image_modality": "microscopy_demo"
+      },
+      "expected": {
+        "domains": ["imaging"],
+        "tools": ["imaging_inspect_image"],
+        "ready": true,
+        "missing_inputs": []
+      }
+    },
+    {
+      "id": "cadd_missing_inputs",
+      "task": "Plan CADD virtual screening for a receptor and ligand library",
+      "inputs": {},
+      "expected": {
+        "domains": ["cadd"],
+        "tools": [],
+        "ready": false,
+        "missing_inputs": ["ligand_library", "receptor"]
+      }
+    }
+  ]
+}

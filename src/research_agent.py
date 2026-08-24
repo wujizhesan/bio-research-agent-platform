@@ -59,6 +59,10 @@ _DOMAIN_KEYWORDS = {
         'mrna', 'mRNA', 'sequence', 'codon', 'protein sequence',
         'nucleotide', 'translation',
     ),
+    'imaging': (
+        'imaging', 'image qc', 'image quality', 'microscopy', 'microscope',
+        'scientific image', 'cell image', '显微图像', '图像质控',
+    ),
     'literature': (
         'ucsc', 'gencode', 'genome browser', 'gtf',
         'literature', 'pubmed', 'uniprot', 'ncbi', 'kegg', 'paper',
@@ -385,6 +389,8 @@ def _required_inputs(domains, task=None, inputs=None):
             ])
     if 'sequence' in domains:
         required.append({'name': 'protein', 'description': 'protein sequence or FASTA'})
+    if 'imaging' in domains:
+        required.append({'name': 'image_path', 'description': 'microscopy or scientific image file'})
     if 'cadd' in domains:
         required.extend([
             {'name': 'receptor', 'description': 'target receptor structure'},
@@ -916,6 +922,22 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
             rationale.append(f'literature search uses {evidence_provider} evidence')
     elif reuse_omics_evidence:
         rationale.append('significant genes from omics analysis are forwarded to the selected evidence provider')
+
+    if 'imaging' in domains:
+        image_path = inputs.get('image_path')
+        if not image_path:
+            missing.append('image_path')
+        else:
+            steps.append({
+                'id': 'image_qc',
+                'tool': 'imaging_inspect_image',
+                'args': {
+                    'image_path': str(image_path),
+                    'output_dir': str(inputs.get('image_output_dir') or Path(output_dir) / 'image_qc'),
+                    'modality': str(inputs.get('image_modality', 'microscopy')),
+                },
+            })
+            rationale.append('image QC records deterministic dimensions, channels and SHA-256 provenance')
 
     if 'knowledge' in domains:
         index_path = inputs.get('knowledge_index_path')
