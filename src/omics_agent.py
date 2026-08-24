@@ -2145,11 +2145,11 @@ def _run_specialist_workflow(workflow, output_dir, allowed_tools):
 
 def run_rnaseq_workbench(
     fastq_paths,
-    reference_fasta,
-    annotation_gtf,
-    metadata_csv,
-    gene_sets_csv,
     output_dir,
+    reference_fasta=None,
+    annotation_gtf=None,
+    metadata_csv=None,
+    gene_sets_csv=None,
     fastq_r2_paths=None,
     evidence_csv=None,
     evidence_provider='local',
@@ -2174,58 +2174,61 @@ def run_rnaseq_workbench(
     if fastq_r2_paths is not None:
         fastq_qc_args['fastq_r2_paths'] = fastq_r2_paths
         alignment_args['fastq_r2_paths'] = fastq_r2_paths
-    analysis_args = {
-        'expression_csv': '${feature_counts.output_csv}',
-        'metadata_csv': metadata_csv,
-        'gene_sets_csv': gene_sets_csv,
-        'evidence_provider': evidence_provider,
-        'statistics_backend': statistics_backend,
-        'output_dir': str(output_dir / 'analysis'),
-    }
-    if evidence_csv is not None:
-        analysis_args['evidence_csv'] = evidence_csv
+    steps = [
+        {
+            'id': 'fastq_qc',
+            'tool': 'omics_run_fastq_qc',
+            'args': fastq_qc_args,
+        },
+    ]
+    allowed_tools = ['omics_run_fastq_qc']
+    if reference_fasta:
+        steps.append({
+            'id': 'alignment',
+            'tool': 'omics_run_rnaseq_alignment',
+            'depends_on': ['fastq_qc'],
+            'args': alignment_args,
+        })
+        allowed_tools.append('omics_run_rnaseq_alignment')
+    if annotation_gtf and reference_fasta:
+        steps.append({
+            'id': 'feature_counts',
+            'tool': 'omics_run_feature_counts',
+            'depends_on': ['alignment'],
+            'args': {
+                'alignment_paths': '${alignment.alignment_paths}',
+                'annotation_gtf': annotation_gtf,
+                'output_dir': str(output_dir / 'feature_counts'),
+                'output_csv': str(output_dir / 'feature_counts' / 'expression_counts.csv'),
+                'paired_end': bool(fastq_r2_paths),
+                'threads': threads,
+                'timeout': timeout,
+            },
+        })
+        allowed_tools.append('omics_run_feature_counts')
+    if metadata_csv and gene_sets_csv and annotation_gtf and reference_fasta:
+        analysis_args = {
+            'expression_csv': '${feature_counts.output_csv}',
+            'metadata_csv': metadata_csv,
+            'gene_sets_csv': gene_sets_csv,
+            'evidence_provider': evidence_provider,
+            'statistics_backend': statistics_backend,
+            'output_dir': str(output_dir / 'analysis'),
+        }
+        if evidence_csv is not None:
+            analysis_args['evidence_csv'] = evidence_csv
+        steps.append({
+            'id': 'analysis',
+            'tool': 'omics_run_analysis',
+            'depends_on': ['feature_counts'],
+            'args': analysis_args,
+        })
+        allowed_tools.append('omics_run_analysis')
     workflow = {
         'name': 'rnaseq-specialist-workbench',
-        'steps': [
-            {
-                'id': 'fastq_qc',
-                'tool': 'omics_run_fastq_qc',
-                'args': fastq_qc_args,
-            },
-            {
-                'id': 'alignment',
-                'tool': 'omics_run_rnaseq_alignment',
-                'depends_on': ['fastq_qc'],
-                'args': alignment_args,
-            },
-            {
-                'id': 'feature_counts',
-                'tool': 'omics_run_feature_counts',
-                'depends_on': ['alignment'],
-                'args': {
-                    'alignment_paths': '${alignment.alignment_paths}',
-                    'annotation_gtf': annotation_gtf,
-                    'output_dir': str(output_dir / 'feature_counts'),
-                    'output_csv': str(output_dir / 'feature_counts' / 'expression_counts.csv'),
-                    'paired_end': bool(fastq_r2_paths),
-                    'threads': threads,
-                    'timeout': timeout,
-                },
-            },
-            {
-                'id': 'analysis',
-                'tool': 'omics_run_analysis',
-                'depends_on': ['feature_counts'],
-                'args': analysis_args,
-            },
-        ],
+        'steps': steps,
     }
-    return _run_specialist_workflow(workflow, output_dir, [
-        'omics_run_fastq_qc',
-        'omics_run_rnaseq_alignment',
-        'omics_run_feature_counts',
-        'omics_run_analysis',
-    ])
+    return _run_specialist_workflow(workflow, output_dir, allowed_tools)
 
 
 def run_variant_workbench(
@@ -2330,7 +2333,7 @@ TOOLS = {
             'statistics_backend': {'type': 'string', 'enum': list(STATISTICS_BACKENDS)},
             'threads': {'type': 'integer', 'minimum': 1, 'maximum': 64},
             'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 3600},
-        }, required=('fastq_paths', 'reference_fasta', 'annotation_gtf', 'metadata_csv', 'gene_sets_csv', 'output_dir')),
+        }, required=('fastq_paths', 'output_dir')),
         'function': run_rnaseq_workbench,
     },
     'run_variant_workbench': {
