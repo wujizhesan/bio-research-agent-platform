@@ -1257,14 +1257,15 @@ function SequenceInterpretationPanel({ result, checks, gc, cai, benchmarkRows, b
 }
 
 function SequenceStructurePanel({ structureId }: { structureId: string }) {
+  const [expanded, setExpanded] = useState(false)
   const pdbId = structureId.trim().toUpperCase()
   const valid = /^[0-9A-Z]{4}$/.test(pdbId)
   if (!valid) return <section className="mt-4 rounded-xl border border-[#70483f] bg-[#251a1a]/80 p-4 text-xs leading-5 text-[#e7ad9d]">PDB ID `{structureId}` 格式不正确。请输入四位结构编号，例如 `1LCI`。</section>
   const viewerUrl = `https://molstar.org/viewer/?pdb=${pdbId.toLowerCase()}`
+  const embedUrl = `${viewerUrl}&hide-controls=1`
   return <section id="sequence-structure" className="mt-4 scroll-mt-6 overflow-hidden rounded-xl border border-[#365c78] bg-[#0b1c2a]/90">
-    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.08] px-4 py-3"><div><div className="field-label mb-0 text-[#8faecb]">结构 / Mol*</div><h4 className="mt-1 text-sm font-semibold text-[#dcecff]">PDB {pdbId} 结构上下文</h4></div><a href={viewerUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 rounded-lg border border-[#405b96] bg-[#152442] px-3 py-2 text-xs text-[#cbd4ff] transition hover:border-[#aebfff] hover:text-white">打开 Mol* <ArrowUpRight size={13} /></a></div>
-    <div className="bg-[#06121b] p-2"><iframe title={`Molstar structure viewer ${pdbId}`} src={viewerUrl} loading="lazy" allow="xr-spatial-tracking" className="h-[360px] w-full rounded-lg border border-white/[0.08] bg-[#071719]" /></div>
-    <div className="px-4 pb-4 text-xs leading-5 text-[#88a9be]">结构由 Mol* 官方 viewer 加载。若当前浏览器禁用 WebGL 或网络不可用，可使用右上角链接打开官方页面；平台不会把结构映射自动当成序列验证结果。</div>
+    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.08] px-4 py-3"><div><div className="field-label mb-0 text-[#8faecb]">结构 / Mol*</div><h4 className="mt-1 text-sm font-semibold text-[#dcecff]">PDB {pdbId} 结构上下文</h4><p className="mt-1 text-[10px] text-[#7598ae]">交互式 3D 视图默认折叠，避免结果页被结构控制台打断。</p></div><div className="flex items-center gap-2"><button type="button" onClick={() => setExpanded((current) => !current)} className="inline-flex items-center gap-1.5 rounded-lg border border-[#365c78] bg-[#10263a] px-3 py-2 text-xs text-[#cbd4ff] transition hover:border-[#8fb8ff] hover:text-white">{expanded ? '收起 3D' : '查看 3D'}</button><a href={viewerUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 rounded-lg border border-[#405b96] bg-[#152442] px-3 py-2 text-xs text-[#cbd4ff] transition hover:border-[#aebfff] hover:text-white">打开 Mol* <ArrowUpRight size={13} /></a></div></div>
+    {expanded && <><div className="bg-[#06121b] p-2"><iframe title={`Molstar structure viewer ${pdbId}`} src={embedUrl} loading="lazy" allow="xr-spatial-tracking" className="h-[400px] w-full rounded-lg border border-white/[0.08] bg-[#071719]" /></div><div className="px-4 pb-4 text-xs leading-5 text-[#88a9be]">结构由 Mol* 官方 viewer 加载。若当前浏览器禁用 WebGL 或网络不可用，可使用右上角链接打开官方页面；平台不会把结构映射自动当成序列验证结果。</div></>}
   </section>
 }
 
