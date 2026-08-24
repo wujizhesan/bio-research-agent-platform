@@ -88,6 +88,8 @@ type SequenceBenchmarkRow = {
   verdict?: string
 }
 
+const luciferaseDemoProtein = 'MEDAKNIKKGPAPFYPLEDGTAGEQLHKAMKRYALVPGTIAFTDAHIEVNITYAEYFEMSVRLAEAMKRYGLNTNHRIVVCSENSLQFFMPVLGALFIGVAVAPANDIYNERELLNSMNISQPTVVFVSKKGLQKILNVQKKLPIIQKIIIMDSKTDYQGFQSMYTFVTSHLPPGFNEYDFVPESFDRDKTIALIMNSSGSTGLPKGVALPHRTACVRFSHARDPIFGNQIIPDTAILSVVPFHHGFGMFTTLGYLICGFRVVLMYRFEEELFLRSLQDYKIQSALLVPTLFSFFAKSTLIDKYDLSNLHEIASGGAPLSKEVGEAVAKRFHLPGIRQGYGLTETTSAILITPEGDDKPGAVGKVVPFFEAKVVDLDTGKTLGVNQRGELCVRGPMIMSGYVNNPEATNALIDKDGWLHSGDIAYWDEDEHFFIVDRLKSLIKYKGYQVAPAELESILLQHPNIFDAGVAGLPDDDAGELPAAVVVLEHGKTMTEKEIVDYVASQVTTAKKLRGGVVFVDEVPKGLTGKLDARKIREILIKAKKGGKSKL'
+
 type CaddHit = {
   mol_name: string
   tag: string
@@ -1101,7 +1103,7 @@ function SequenceDesignInput({ protein, molecule, method, useVaxpress, structure
     </section>
 
     <section className="rounded-2xl border border-white/[0.08] bg-[#071719]/70 p-4">
-      <div className="flex flex-wrap items-center justify-between gap-2"><div><div className="field-label mb-0">01 / 目标蛋白</div><div className="mt-1 text-sm font-medium text-[#cfe9df]">目标氨基酸序列</div></div><div className="flex items-center gap-3"><span className="font-mono text-[10px] text-[#6f9189]">{protein.length} aa</span><button type="button" onClick={() => onProteinChange('MKT')} className="rounded-lg border border-white/[0.1] px-2.5 py-1.5 text-[10px] text-[#9fc4b8] transition hover:border-[#71cba7] hover:text-[#e8fff5]">加载演示序列</button></div></div>
+      <div className="flex flex-wrap items-center justify-between gap-2"><div><div className="field-label mb-0">01 / 目标蛋白</div><div className="mt-1 text-sm font-medium text-[#cfe9df]">目标氨基酸序列</div></div><div className="flex items-center gap-3"><span className="font-mono text-[10px] text-[#6f9189]">{protein.length} aa</span><button type="button" onClick={() => onProteinChange(luciferaseDemoProtein)} className="rounded-lg border border-white/[0.1] px-2.5 py-1.5 text-[10px] text-[#9fc4b8] transition hover:border-[#71cba7] hover:text-[#e8fff5]">加载荧光素酶示例（550 aa）</button></div></div>
       <textarea aria-label="目标蛋白序列" value={protein} onChange={(event) => onProteinChange(event.target.value.toUpperCase())} rows={3} className="input-area mt-3 font-mono tracking-[0.16em]" placeholder="例如 MKT..." />
       <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[10px] leading-5 text-[#6f9189]"><span>支持标准单字母氨基酸符号；后端会在运行前校验序列。</span><span className="font-mono">蛋白质 → mRNA</span></div>
     </section>
@@ -1251,13 +1253,18 @@ function SequenceResultPanel({ result, benchmark, reportPath, structureId, onDow
   const benchmarkPayload = benchmark || (result.benchmark && typeof result.benchmark === 'object' && !Array.isArray(result.benchmark) ? result.benchmark as Record<string, unknown> : undefined)
   const benchmarkRows = normalizeSequenceBenchmark(benchmarkPayload)
   const baseline = benchmarkRows.find((row) => row.method === 'naive')
+  const moleculeLabels: Record<string, string> = { linear: '线性 mRNA', circ: '环状 RNA', sa: '自扩增 RNA' }
+  const methodLabels: Record<string, string> = { greedy: '确定性贪心', vaxpress: 'VaxPress 适配器' }
+  const expressionPercent = expression === undefined ? undefined : Math.min(100, Math.max(0, expression <= 1 ? expression * 100 : expression))
+  const visibleCodons = codons.slice(0, 18)
+  const remainingCodons = codons.slice(18)
   const windowSize = 30
   const gcWindows = Array.from({ length: Math.min(12, Math.max(1, Math.ceil(mrna.length / windowSize))) }, (_, index) => {
     const chunk = mrna.slice(index * windowSize, (index + 1) * windowSize)
     const gcValue = chunk ? ((chunk.match(/[GC]/g) || []).length / chunk.length) * 100 : 0
     return { label: `${index * windowSize + 1}-${Math.min(mrna.length, (index + 1) * windowSize)}`, value: gcValue }
   }).filter((item) => item.label.split('-')[0] !== '1' || mrna.length > 0)
-  const qualityValues = [gc || 0, gc3 || 0, cai === undefined ? 0 : cai * 100, expression === undefined ? (checks.length ? (passedChecks / checks.length) * 100 : 0) : expression * 100, result.verify === true ? 100 : 0]
+  const qualityValues = [gc || 0, gc3 || 0, cai === undefined ? 0 : cai * 100, expressionPercent === undefined ? (checks.length ? (passedChecks / checks.length) * 100 : 0) : expressionPercent, result.verify === true ? 100 : 0]
   const benchmarkStatus = benchmarkPayload?.vaxpress ? String(benchmarkPayload.vaxpress) : ''
   const metricCards = [
     { label: 'GC 含量', value: gc === undefined ? '--' : `${gc.toFixed(1)}%`, tone: 'text-[#8fe5c1]' },
@@ -1265,19 +1272,21 @@ function SequenceResultPanel({ result, benchmark, reportPath, structureId, onDow
     { label: 'CAI', value: cai === undefined ? '--' : cai.toFixed(3), tone: 'text-[#f0d38b]' },
     { label: 'UpA / kb', value: upA === undefined ? '--' : upA.toFixed(2), tone: 'text-[#d1a8ff]' },
     { label: 'UpU / kb', value: upU === undefined ? '--' : upU.toFixed(2), tone: 'text-[#f1a99a]' },
+    { label: '表达评分', value: expressionPercent === undefined ? '--' : `${expressionPercent.toFixed(1)}%`, tone: 'text-[#b3f4d4]' },
   ]
   return <section className="mt-5 rounded-2xl border border-[#28524b] bg-[linear-gradient(135deg,rgba(16,43,42,.96),rgba(8,25,29,.96))] p-5 sm:p-6">
     <div className="flex flex-wrap items-start justify-between gap-3">
-      <div><div className="eyebrow">序列设计 / 质量概览</div><h3 className="mt-2 text-lg font-semibold text-[#e4f8ef]">mRNA 优化结果</h3><p className="mt-1 text-xs text-[#7fa99e]">{String(result.molecule || 'linear')} · {String(result.method || 'greedy')} · 优化 → 评分 → 验证</p></div>
+      <div><div className="eyebrow">序列设计 / 质量概览</div><h3 className="mt-2 text-lg font-semibold text-[#e4f8ef]">mRNA 优化结果</h3><p className="mt-1 text-xs text-[#7fa99e]">{moleculeLabels[String(result.molecule || 'linear')] || String(result.molecule || 'linear')} · {methodLabels[String(result.method || 'greedy')] || String(result.method || 'greedy')} · 优化 → 评分 → 验证</p></div>
       <div className="flex flex-wrap items-center justify-end gap-2"><span className={`status-badge ${result.verify === true ? 'status-ok' : 'status-running'}`}><span className="size-1.5 rounded-full bg-current" />{result.verify === true ? '翻译已验证' : String(result.verdict || '待复核')}</span>{reportPath && <><button onClick={() => onOpenReport(reportPath)} className="inline-flex items-center gap-1.5 rounded-full border border-[#405b96] bg-[#152442] px-2.5 py-1 font-mono text-[10px] text-[#cbd4ff] transition hover:border-[#aebfff] hover:text-white"><ArrowUpRight size={12} />查看报告</button><button onClick={() => onDownload(reportPath)} className="inline-flex items-center gap-1.5 rounded-full border border-[#28524b] bg-[#102b2a] px-2.5 py-1 font-mono text-[10px] text-[#b9e6d5] transition hover:border-[#71cba7] hover:text-white"><Download size={12} />下载 HTML</button></>}</div>
     </div>
     <div className="mt-5 rounded-2xl border border-[#32665b] bg-[#061b1d]/80 p-4">
       <div className="flex items-center justify-between gap-3"><div className="field-label mb-0">优化后的 mRNA / {String(result.mrna_len || mrna.length)} nt</div><div className="font-mono text-[10px] text-[#6e9d91]">5&apos; → 3&apos;</div></div>
-      <div className="mt-3 flex flex-wrap gap-1.5">{codons.map((codon, index) => <span key={`${codon}-${index}`} className="rounded-md border border-[#2b6457] bg-[#123631] px-2.5 py-2 font-mono text-sm tracking-[0.16em] text-[#d0f7e5]">{codon}</span>)}</div>
+      <div className="mt-3 flex flex-wrap gap-1.5">{visibleCodons.map((codon, index) => <span key={`${codon}-${index}`} className="rounded-md border border-[#2b6457] bg-[#123631] px-2.5 py-2 font-mono text-sm tracking-[0.16em] text-[#d0f7e5]">{codon}</span>)}</div>
+      {remainingCodons.length > 0 && <details className="mt-3 rounded-lg border border-white/[0.08] bg-[#071719]/70"><summary className="cursor-pointer px-3 py-2.5 text-xs text-[#9fc4b8]">查看完整序列（剩余 {remainingCodons.length} 个密码子）</summary><div className="border-t border-white/[0.07] p-3"><pre className="max-h-52 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] leading-5 tracking-[0.08em] text-[#b9e6d5]">{mrna}</pre></div></details>}
       {!mrna && <div className="mt-2 text-xs text-[#789791]">结果中没有返回序列文本，请下载完整 JSON 查看。</div>}
     </div>
-    <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-5">{metricCards.map((card) => <div key={card.label} className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-3"><div className="font-mono text-[9px] tracking-[0.12em] text-[#63817b]">{card.label}</div><div className={`mt-2 font-mono text-xl ${card.tone}`}>{card.value}</div></div>)}</div>
-    {expression !== undefined && <div className="mt-4 rounded-xl border border-white/[0.08] bg-[#071719]/70 p-3"><div className="flex items-center justify-between text-[10px] text-[#86a59e]"><span className="font-mono tracking-[0.12em]">表达评分</span><span className="font-mono text-[#d4f7e6]">{(expression * 100).toFixed(1)}%</span></div><div className="mt-2 h-2 overflow-hidden rounded-full bg-[#17312f]"><div className="h-full rounded-full bg-gradient-to-r from-[#4dba91] to-[#b3f4d4]" style={{ width: `${Math.min(100, Math.max(0, expression * 100))}%` }} /></div></div>}
+    <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">{metricCards.map((card) => <div key={card.label} className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-3"><div className="font-mono text-[9px] tracking-[0.12em] text-[#63817b]">{card.label}</div><div className={`mt-2 font-mono text-xl ${card.tone}`}>{card.value}</div></div>)}</div>
+    {expressionPercent !== undefined && <div className="mt-4 rounded-xl border border-white/[0.08] bg-[#071719]/70 p-3"><div className="flex items-center justify-between text-[10px] text-[#86a59e]"><span className="font-mono tracking-[0.12em]">表达评分 · 启发式</span><span className="font-mono text-[#d4f7e6]">{expressionPercent.toFixed(1)}%</span></div><div className="mt-2 h-2 overflow-hidden rounded-full bg-[#17312f]"><div className="h-full rounded-full bg-gradient-to-r from-[#4dba91] to-[#b3f4d4]" style={{ width: `${expressionPercent}%` }} /></div></div>}
     <div className="mt-4 grid gap-4 lg:grid-cols-[0.8fr_1.2fr]">
       <div className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-4"><div className="field-label mb-0">质量雷达</div><SequenceQualityRadar values={qualityValues} /></div>
       <div className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-4"><div className="flex items-center justify-between gap-3"><div className="field-label mb-0">滑动窗口 GC / {windowSize} nt</div><span className="font-mono text-[10px] text-[#83e3bc]">{gcWindows.length} 个窗口</span></div>{gcWindows.length ? <div className="mt-5 space-y-3">{gcWindows.map((window) => <div key={window.label} className="grid grid-cols-[78px_1fr_48px] items-center gap-3"><span className="font-mono text-[10px] text-[#6f9189]">{window.label}</span><div className="h-2 overflow-hidden rounded-full bg-[#17312f]"><div className={`h-full rounded-full ${window.value >= 30 && window.value <= 80 ? 'bg-[#74d7ad]' : 'bg-[#e6c875]'}`} style={{ width: `${Math.max(2, Math.min(100, window.value))}%` }} /></div><span className="text-right font-mono text-[10px] text-[#b7dace]">{window.value.toFixed(1)}%</span></div>)}</div> : <div className="mt-5 text-xs text-[#6f9189]">暂无序列窗口。</div>}</div>
