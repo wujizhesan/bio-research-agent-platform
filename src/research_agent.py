@@ -1281,6 +1281,8 @@ def research_execute(workflow, domains=None, output_path='output/research_manife
         'selected_domains': selected,
         'manifest': manifest,
         'report': report,
+        'manifest_path': manifest.get('manifest_path'),
+        'report_path': report.get('path') if isinstance(report, dict) else None,
         'provenance': {
             'application': PLUGIN_NAME,
             'version': PLUGIN_VERSION,

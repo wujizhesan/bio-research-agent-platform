@@ -1,6 +1,7 @@
 import os
 import asyncio
 import json
+import shutil
 import tempfile
 import time
 import unittest
@@ -93,6 +94,16 @@ class FastApiAppTests(unittest.TestCase):
     def _close_app(self, app):
         app.state.job_manager.shutdown()
         asyncio.run(app.state.database.close())
+
+    def _wait_for_job(self, client, job_id):
+        for _ in range(200):
+            response = client.get(f'/api/v1/jobs/{job_id}')
+            self.assertEqual(response.status_code, 200)
+            record = response.json()['job']
+            if record['status'] in {'completed', 'failed', 'cancelled'}:
+                return record
+            time.sleep(0.05)
+        self.fail(f'job did not reach a terminal state: {job_id}')
 
     def test_health_openapi_and_database(self):
         with tempfile.TemporaryDirectory(prefix='fastapi_app_') as raw:
@@ -295,6 +306,83 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(client.get('/api/v1/jobs').status_code, 200)
             finally:
                 self._close_app(app)
+
+    def test_research_plan_execute_and_artifact_download_close_the_loop(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_research_loop_') as raw:
+            app = self._app(raw)
+            output_root = fastapi_module.OUTPUT_ROOT / f'test_research_loop_{Path(raw).name}'
+            try:
+                with TestClient(app) as client:
+                    upload = client.post(
+                        '/api/v1/files',
+                        files={'upload': ('reads.fastq', b'@read1\nACGT\n+\nIIII\n', 'text/plain')},
+                    )
+                    self.assertEqual(upload.status_code, 201)
+                    uploaded_path = upload.json()['file']['path']
+
+                    plan_response = client.post('/api/v1/jobs', json={
+                        'tool': 'research_plan',
+                        'arguments': {
+                            'task': 'Run FASTQ sequencing quality control',
+                            'inputs': {
+                                'input_path': uploaded_path,
+                                'input_type': 'fastq',
+                            },
+                            'planner_mode': 'deterministic',
+                            'output_dir': str(output_root / 'research_run'),
+                        },
+                    })
+                    self.assertEqual(plan_response.status_code, 202)
+                    plan_job = self._wait_for_job(client, plan_response.json()['job']['job_id'])
+                    self.assertEqual(plan_job['status'], 'completed')
+                    plan = plan_job['result']
+                    self.assertEqual(plan['status'], 'planned')
+                    self.assertTrue(plan['execution']['ready'])
+
+                    execute_response = client.post('/api/v1/jobs', json={
+                        'tool': 'research_execute',
+                        'arguments': {
+                            'workflow': plan['execution']['workflow'],
+                            'domains': plan['selected_domains'],
+                            'output_path': str(output_root / 'research_run' / 'manifest.json'),
+                            'report_path': str(output_root / 'research_run' / 'report.md'),
+                            'dry_run': False,
+                            'continue_on_error': False,
+                        },
+                    })
+                    self.assertEqual(execute_response.status_code, 202)
+                    execute_job_id = execute_response.json()['job']['job_id']
+                    with client.stream('GET', f'/api/v1/jobs/{execute_job_id}/events') as events:
+                        event_body = ''.join(events.iter_text())
+                    self.assertEqual(events.status_code, 200)
+                    self.assertIn('"status": "completed"', event_body)
+                    execute_job = self._wait_for_job(client, execute_job_id)
+                    self.assertEqual(execute_job['status'], 'completed')
+                    self.assertEqual(execute_job['result']['status'], 'completed')
+                    manifest_path = execute_job['result']['manifest']['manifest_path']
+                    self.assertTrue(Path(manifest_path).is_file())
+
+                    artifact = client.get(
+                        f"/api/v1/jobs/{execute_job['job_id']}/artifacts",
+                        params={'path': manifest_path},
+                    )
+                    self.assertEqual(artifact.status_code, 200)
+                    self.assertEqual(json.loads(artifact.content)['status'], 'completed')
+                    report_path = execute_job['result']['report']['path']
+                    report_artifact = client.get(
+                        f"/api/v1/jobs/{execute_job['job_id']}/artifacts",
+                        params={'path': report_path},
+                    )
+                    self.assertEqual(report_artifact.status_code, 200)
+                    self.assertIn(b'# Bioinformatics Research Agent Report', report_artifact.content)
+                    audit_actions = {
+                        json.loads(line)['action']
+                        for line in (Path(raw) / 'audit.jsonl').read_text(encoding='utf-8').splitlines()
+                    }
+                    self.assertTrue({'file.upload', 'job.submit', 'job.artifact_download'} <= audit_actions)
+            finally:
+                self._close_app(app)
+                shutil.rmtree(output_root, ignore_errors=True)
 
     def test_jwt_login_and_role_permissions(self):
         users = {
