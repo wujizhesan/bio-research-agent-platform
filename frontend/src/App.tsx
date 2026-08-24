@@ -1257,7 +1257,7 @@ function SequenceInterpretationPanel({ result, checks, gc, cai, benchmarkRows, b
 }
 
 function SequenceStructurePanel({ structureId }: { structureId: string }) {
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(true)
   const pdbId = structureId.trim().toUpperCase()
   const valid = /^[0-9A-Z]{4}$/.test(pdbId)
   if (!valid) return <section className="mt-4 rounded-xl border border-[#70483f] bg-[#251a1a]/80 p-4 text-xs leading-5 text-[#e7ad9d]">PDB ID `{structureId}` 格式不正确。请输入四位结构编号，例如 `1LCI`。</section>
