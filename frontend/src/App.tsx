@@ -364,13 +364,13 @@ function App() {
     return streamController.current === controller
   }
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (authToken = token) => {
     setError('')
     try {
       const [pluginPayload, jobPayload, capabilityPayload] = await Promise.all([
-        apiFetch<{ plugins: Plugin[] }>(apiBase, token, '/api/v1/plugins'),
-        apiFetch<{ jobs: Job[] }>(apiBase, token, '/api/v1/jobs?limit=8'),
-        apiFetch<Capabilities>(apiBase, token, '/api/v1/capabilities'),
+        apiFetch<{ plugins: Plugin[] }>(apiBase, authToken, '/api/v1/plugins'),
+        apiFetch<{ jobs: Job[] }>(apiBase, authToken, '/api/v1/jobs?limit=8'),
+        apiFetch<Capabilities>(apiBase, authToken, '/api/v1/capabilities'),
       ])
       setPlugins(pluginPayload.plugins || [])
       setCapabilities(capabilityPayload)
@@ -418,7 +418,7 @@ function App() {
     if (normalized) localStorage.setItem('bio-agent-token', normalized)
     else localStorage.removeItem('bio-agent-token')
     setToken(normalized)
-    void refresh()
+    void refresh(normalized)
   }
 
   function buildResearchInputs() {
