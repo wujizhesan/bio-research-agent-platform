@@ -451,7 +451,7 @@ function App() {
     const checks: RnaPreflightItem[] = [
       { label: 'R1 FASTQ', detail: fixtureMode ? `${r1Count} 个仓库样例文件` : r1Count ? `${r1Count} 个文件` : '待上传', ready: r1Count > 0, required: true },
       { label: 'R2 FASTQ', detail: fixtureMode ? `${r2Count} 个仓库样例文件` : r2Count ? `${r2Count} 个文件` : pairedEnd ? '双端任务需要上传' : '未上传，按单端处理', ready: !pairedEnd && r2Count === 0 ? true : r2Count > 0 && !pairMismatch, required: pairedEnd },
-      { label: '参考基因组 FASTA', detail: fixtureMode ? '仓库样例已就绪' : rnaFiles.reference_fasta.length ? '已上传' : alignment ? '比对任务需要上传' : '规划器可继续检查', ready: !alignment || fixtureMode || rnaFiles.reference_fasta.length > 0, required: alignment },
+      { label: '参考基因组 FASTA', detail: fixtureMode ? '仓库样例已就绪' : rnaFiles.reference_fasta.length ? '已上传' : alignment ? '比对任务需要上传' : '当前管线可跳过比对', ready: !alignment || fixtureMode || rnaFiles.reference_fasta.length > 0, required: alignment },
       { label: '基因注释 GTF', detail: fixtureMode ? '仓库样例已就绪' : rnaFiles.annotation_gtf.length ? '已上传' : differential ? '差异分析前需要计数注释' : 'featureCounts / 差异分析需要', ready: !differential || fixtureMode || rnaFiles.annotation_gtf.length > 0, required: differential },
       { label: '样本元数据 CSV', detail: fixtureMode ? '仓库样例已就绪' : rnaFiles.metadata.length ? '已上传' : differential ? '差异分析需要' : '可选', ready: !differential || fixtureMode || rnaFiles.metadata.length > 0, required: differential },
       { label: '基因集 CSV', detail: fixtureMode ? '仓库样例已就绪' : rnaFiles.gene_sets.length ? '已上传' : enrichment ? '富集分析需要' : '可选', ready: !enrichment || fixtureMode || rnaFiles.gene_sets.length > 0, required: enrichment },
@@ -928,7 +928,7 @@ function App() {
                     <p className="mt-3 text-xs leading-5 text-[#688983]">上传文件会在服务端校验、计算 SHA-256 并保存到本次研究输入目录；未上传的字段使用仓库示例数据。</p>
                   </> : mode === 'rnaseq' ? <>
                      <div className="mt-6 rounded-xl border border-[#28524b] bg-[#102b2a]/60 p-4"><label className="field-label" htmlFor="rnaseq-input-mode">输入来源</label><select id="rnaseq-input-mode" value={rnaInputMode} onChange={(event) => { const next = event.target.value as RnaInputMode; setRnaInputMode(next); if (next === 'fixture') setRnaFiles({ fastq_r1: [], fastq_r2: [], reference_fasta: [], annotation_gtf: [], metadata: [], gene_sets: [] }); setResearchPlan(null) }} className="input-control"><option value="fixture">仓库样例：原生 RNA-seq</option><option value="upload">上传自定义文件</option></select><p className="mt-2 text-xs leading-5 text-[#789791]">仓库样例会自动使用双端 FASTQ、参考基因组、GTF、元数据和基因集；切换为自定义后可上传自己的文件。</p></div>
-                     <label className="mt-6 block"><span className="field-label">RNA-seq 工作流任务</span><textarea value={rnaseqTask} onChange={(event) => { setRnaseqTask(event.target.value); setResearchPlan(null) }} rows={3} className="input-area" placeholder="例如：运行 FastQC 并比对双端 RNA-seq 读段" /></label>
+                     <label className="mt-6 block"><span className="field-label">RNA-seq 分析说明（可选）</span><textarea value={rnaseqTask} onChange={(event) => { setRnaseqTask(event.target.value); setResearchPlan(null) }} rows={3} className="input-area" placeholder="例如：双端 RNA-seq，完成质控、比对和表达分析" /></label>
                      <div className="mt-5 grid gap-3 sm:grid-cols-2">
                        <RnaFileField id="rna-r1-files" label="R1 FASTQ（可多选）" files={rnaFiles.fastq_r1} fixture={rnaInputMode === 'fixture' ? '6 个仓库样例文件' : undefined} multiple accept=".fastq,.fq,.fastq.gz,.fq.gz,application/gzip,text/plain" uploading={uploadingRnaFile === 'fastq_r1'} onChange={(files) => void handleRnaFileUpload('fastq_r1', files)} />
                        <RnaFileField id="rna-r2-files" label="R2 FASTQ（可多选）" files={rnaFiles.fastq_r2} fixture={rnaInputMode === 'fixture' ? '6 个仓库样例文件' : undefined} multiple accept=".fastq,.fq,.fastq.gz,.fq.gz,application/gzip,text/plain" uploading={uploadingRnaFile === 'fastq_r2'} onChange={(files) => void handleRnaFileUpload('fastq_r2', files)} />
@@ -938,9 +938,9 @@ function App() {
                        <RnaFileField id="rna-gene-sets-file" label="基因集 CSV（可选）" files={rnaFiles.gene_sets} fixture={rnaInputMode === 'fixture' ? '仓库样例 gene_sets.csv' : undefined} accept=".csv,.tsv,text/csv,text/tab-separated-values" uploading={uploadingRnaFile === 'gene_sets'} onChange={(files) => void handleRnaFileUpload('gene_sets', files)} />
                      </div>
                      <RnaPreflightCard items={rnaseqPreflight.checks} pairMismatch={rnaseqPreflight.pairMismatch} />
-                     <p className="mt-3 text-xs leading-5 text-[#688983]">R1/R2 可批量选择；规划器会根据任务文本检查输入，并决定是否继续比对、featureCounts、差异分析和富集。</p>
+                     <p className="mt-3 text-xs leading-5 text-[#688983]">R1/R2 可批量选择；实际执行链由已提供的 FASTQ、参考基因组、GTF、元数据和基因集决定。</p>
                   </> : mode === 'variant' ? <>
-                    <label className="mt-6 block"><span className="field-label">变异研究任务</span><textarea value={variantTask} onChange={(event) => { setVariantTask(event.target.value); setResearchPlan(null) }} rows={3} className="input-area" placeholder="描述 VCF 注释与证据检索任务" /></label>
+                    <label className="mt-6 block"><span className="field-label">VCF 分析说明（可选）</span><textarea value={variantTask} onChange={(event) => { setVariantTask(event.target.value); setResearchPlan(null) }} rows={3} className="input-area" placeholder="例如：注释 VCF 并检索相关基因证据" /></label>
                     <div className="mt-5 grid gap-3 sm:grid-cols-2">
                       <ResearchFileField id="vcf-file" label="VCF / VCF.GZ 输入文件" accept=".vcf,.gz,text/plain" file={uploadedFiles.vcf} uploading={uploadingFile === 'vcf'} onChange={(file) => void handleResearchFileUpload('vcf', file)} />
                       <ResearchFileField id="annotation-file" label="基因区间 CSV" accept=".csv,.tsv,text/csv,text/tab-separated-values" file={uploadedFiles.annotation} uploading={uploadingFile === 'annotation'} onChange={(file) => void handleResearchFileUpload('annotation', file)} />
