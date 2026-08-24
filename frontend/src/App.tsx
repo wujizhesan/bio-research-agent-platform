@@ -693,12 +693,15 @@ function App() {
     }
     if (mode === 'cadd') {
       setResearchPlan(null)
+      const caddInputs = buildCaddInputs()
       await submitToolJob(
-        'research_plan',
+        'cadd_run_screening',
         {
-          task: 'Run a reproducible CADD virtual screening workflow and prioritize docking hits',
-          domains: ['cadd'],
-          inputs: buildCaddInputs(),
+          receptor: caddInputs.receptor,
+          external_dataset: caddInputs.ligand_library,
+          out: caddInputs.output_dir,
+          exhaustiveness: caddInputs.exhaustiveness,
+          max_ligands: caddInputs.max_ligands,
         },
         'CADD 筛选计划已进入审核队列',
         (job) => setResearchPlan(extractResearchPlan(job)),
@@ -1028,6 +1031,7 @@ function RnaPreflightCard({ items, pairMismatch }: { items: RnaPreflightItem[]; 
 
 function ResearchPlanCard({ plan, loading, onExecute }: { plan: ResearchPlan | null; loading: boolean; onExecute: () => void }) {
   const execution = plan?.execution
+  if (!plan && !loading) return null
   return <section className="panel mt-5 overflow-hidden" aria-live="polite">
     <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-5 py-5 sm:px-6">
       <div><div className="eyebrow">02B / 计划检查</div><h2 className="mt-2 text-xl font-semibold">执行前计划检查</h2></div>
@@ -1384,7 +1388,8 @@ function JobResultSummary({ job, structureId, onDownload, onOpenReport }: { job:
   const featureCountsStep = steps.find((step) => step.tool === 'omics_run_feature_counts')
   const featureCountsResult = featureCountsStep?.result && typeof featureCountsStep.result === 'object' && !Array.isArray(featureCountsStep.result) ? featureCountsStep.result as Record<string, unknown> : {}
   const caddStep = steps.find((step) => step.tool === 'cadd_run_screening')
-  const caddEnvelope = caddStep?.result && typeof caddStep.result === 'object' && !Array.isArray(caddStep.result) ? caddStep.result as Record<string, unknown> : {}
+  const directCaddEnvelope = job.tool === 'cadd_run_screening' ? payload : {}
+  const caddEnvelope = caddStep?.result && typeof caddStep.result === 'object' && !Array.isArray(caddStep.result) ? caddStep.result as Record<string, unknown> : directCaddEnvelope
   const caddResult = caddEnvelope.result && typeof caddEnvelope.result === 'object' && !Array.isArray(caddEnvelope.result) ? caddEnvelope.result as Record<string, unknown> : caddEnvelope
   const fastqQcStep = steps.find((step) => step.tool === 'omics_run_fastq_qc')
   const fastqQcResult = fastqQcStep?.result && typeof fastqQcStep.result === 'object' && !Array.isArray(fastqQcStep.result) ? fastqQcStep.result as Record<string, unknown> : {}
