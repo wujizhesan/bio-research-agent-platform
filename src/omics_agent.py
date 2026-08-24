@@ -2121,6 +2121,171 @@ def run_omics_analysis(expression_csv, metadata_csv, gene_sets_csv, output_dir,
     return manifest
 
 
+def _run_specialist_workflow(workflow, output_dir, allowed_tools):
+    try:
+        from .workflow_runner import run_workflow
+    except ImportError:
+        from workflow_runner import run_workflow
+    output_dir = Path(output_dir)
+    manifest_path = output_dir / 'omics_workflow_manifest.json'
+    manifest = run_workflow(
+        workflow,
+        output_path=manifest_path,
+        dry_run=False,
+        allowed_tools=allowed_tools,
+        continue_on_error=False,
+    )
+    return {
+        'status': manifest['status'],
+        'workflow': workflow.get('name', 'omics specialist workflow'),
+        'manifest': manifest,
+        'manifest_path': str(manifest_path),
+    }
+
+
+def run_rnaseq_workbench(
+    fastq_paths,
+    reference_fasta,
+    annotation_gtf,
+    metadata_csv,
+    gene_sets_csv,
+    output_dir,
+    fastq_r2_paths=None,
+    evidence_csv=None,
+    evidence_provider='local',
+    statistics_backend='auto',
+    threads=1,
+    timeout=1800,
+):
+    output_dir = Path(output_dir)
+    fastq_qc_args = {
+        'fastq_paths': fastq_paths,
+        'output_dir': str(output_dir / 'fastq_qc'),
+        'threads': threads,
+        'timeout': timeout,
+    }
+    alignment_args = {
+        'fastq_paths': fastq_paths,
+        'reference_fasta': reference_fasta,
+        'output_dir': str(output_dir / 'alignment'),
+        'threads': threads,
+        'timeout': timeout,
+    }
+    if fastq_r2_paths is not None:
+        fastq_qc_args['fastq_r2_paths'] = fastq_r2_paths
+        alignment_args['fastq_r2_paths'] = fastq_r2_paths
+    analysis_args = {
+        'expression_csv': '${feature_counts.output_csv}',
+        'metadata_csv': metadata_csv,
+        'gene_sets_csv': gene_sets_csv,
+        'evidence_provider': evidence_provider,
+        'statistics_backend': statistics_backend,
+        'output_dir': str(output_dir / 'analysis'),
+    }
+    if evidence_csv is not None:
+        analysis_args['evidence_csv'] = evidence_csv
+    workflow = {
+        'name': 'rnaseq-specialist-workbench',
+        'steps': [
+            {
+                'id': 'fastq_qc',
+                'tool': 'omics_run_fastq_qc',
+                'args': fastq_qc_args,
+            },
+            {
+                'id': 'alignment',
+                'tool': 'omics_run_rnaseq_alignment',
+                'depends_on': ['fastq_qc'],
+                'args': alignment_args,
+            },
+            {
+                'id': 'feature_counts',
+                'tool': 'omics_run_feature_counts',
+                'depends_on': ['alignment'],
+                'args': {
+                    'alignment_paths': '${alignment.alignment_paths}',
+                    'annotation_gtf': annotation_gtf,
+                    'output_dir': str(output_dir / 'feature_counts'),
+                    'output_csv': str(output_dir / 'feature_counts' / 'expression_counts.csv'),
+                    'paired_end': bool(fastq_r2_paths),
+                    'threads': threads,
+                    'timeout': timeout,
+                },
+            },
+            {
+                'id': 'analysis',
+                'tool': 'omics_run_analysis',
+                'depends_on': ['feature_counts'],
+                'args': analysis_args,
+            },
+        ],
+    }
+    return _run_specialist_workflow(workflow, output_dir, [
+        'omics_run_fastq_qc',
+        'omics_run_rnaseq_alignment',
+        'omics_run_feature_counts',
+        'omics_run_analysis',
+    ])
+
+
+def run_variant_workbench(
+    vcf_path,
+    output_dir,
+    annotation_csv=None,
+    annotation_gtf=None,
+    annotation_backend='auto',
+    evidence_csv=None,
+    evidence_provider='local',
+):
+    output_dir = Path(output_dir)
+    annotation_args = {
+        'vcf_path': vcf_path,
+        'output_csv': str(output_dir / 'annotation' / 'variants_annotated.csv'),
+        'annotation_backend': annotation_backend,
+    }
+    if annotation_csv is not None:
+        annotation_args['annotation_csv'] = annotation_csv
+    if annotation_gtf is not None:
+        annotation_args['annotation_gtf'] = annotation_gtf
+    evidence_args = {
+        'gene_ids': '${annotation.gene_ids}',
+        'provider': evidence_provider,
+    }
+    if evidence_csv is not None:
+        evidence_args['evidence_csv'] = evidence_csv
+    workflow = {
+        'name': 'variant-specialist-workbench',
+        'steps': [
+            {
+                'id': 'genomics_qc',
+                'tool': 'omics_run_genomics_qc',
+                'args': {
+                    'input_path': vcf_path,
+                    'input_type': 'vcf',
+                    'output_dir': str(output_dir / 'genomics_qc'),
+                },
+            },
+            {
+                'id': 'annotation',
+                'tool': 'omics_annotate_variants',
+                'depends_on': ['genomics_qc'],
+                'args': annotation_args,
+            },
+            {
+                'id': 'evidence',
+                'tool': 'omics_search_gene_evidence',
+                'depends_on': ['annotation'],
+                'args': evidence_args,
+            },
+        ],
+    }
+    return _run_specialist_workflow(workflow, output_dir, [
+        'omics_run_genomics_qc',
+        'omics_annotate_variants',
+        'omics_search_gene_evidence',
+    ])
+
+
 def _parameters(properties, required=()):
     return {
         'type': 'object',
@@ -2149,6 +2314,37 @@ TOOLS = {
             'gencode_gtf': {'type': 'string'},
         }, required=('expression_csv', 'metadata_csv', 'gene_sets_csv', 'output_dir')),
         'function': run_omics_analysis,
+    },
+    'run_rnaseq_workbench': {
+        'description': 'Run the RNA-seq specialist workbench: FASTQ QC, alignment, feature counts, differential expression and pathway analysis.',
+        'parameters': _parameters({
+            'fastq_paths': {'oneOf': [{'type': 'string'}, {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1}]},
+            'fastq_r2_paths': {'oneOf': [{'type': 'string'}, {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1}]},
+            'reference_fasta': {'type': 'string'},
+            'annotation_gtf': {'type': 'string'},
+            'metadata_csv': {'type': 'string'},
+            'gene_sets_csv': {'type': 'string'},
+            'output_dir': {'type': 'string'},
+            'evidence_csv': {'type': 'string'},
+            'evidence_provider': {'type': 'string', 'enum': ['local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg', 'ucsc', 'gencode']},
+            'statistics_backend': {'type': 'string', 'enum': list(STATISTICS_BACKENDS)},
+            'threads': {'type': 'integer', 'minimum': 1, 'maximum': 64},
+            'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 3600},
+        }, required=('fastq_paths', 'reference_fasta', 'annotation_gtf', 'metadata_csv', 'gene_sets_csv', 'output_dir')),
+        'function': run_rnaseq_workbench,
+    },
+    'run_variant_workbench': {
+        'description': 'Run the VCF specialist workbench: variant QC, annotation and gene evidence retrieval.',
+        'parameters': _parameters({
+            'vcf_path': {'type': 'string'},
+            'output_dir': {'type': 'string'},
+            'annotation_csv': {'type': 'string'},
+            'annotation_gtf': {'type': 'string'},
+            'annotation_backend': {'type': 'string', 'enum': list(VARIANT_ANNOTATION_BACKENDS)},
+            'evidence_csv': {'type': 'string'},
+            'evidence_provider': {'type': 'string', 'enum': ['local', 'uniprot', 'pubmed', 'ncbi_gene', 'kegg', 'ucsc', 'gencode']},
+        }, required=('vcf_path', 'output_dir')),
+        'function': run_variant_workbench,
     },
     'run_differential_expression': {
         'description': 'Run a reproducible two-condition RNA-seq differential expression analysis.',

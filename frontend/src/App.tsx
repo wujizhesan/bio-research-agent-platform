@@ -425,6 +425,12 @@ function App() {
     void refresh()
   }, [refresh])
 
+  useEffect(() => {
+    setResearchPlan(null)
+    setSelectedJob(null)
+    setEvents([])
+  }, [mode])
+
   useEffect(() => () => {
     if (reportPreviewUrl.current) window.URL.revokeObjectURL(reportPreviewUrl.current)
   }, [])
@@ -658,9 +664,9 @@ function App() {
     if (mode === 'rnaseq') {
       setResearchPlan(null)
       await submitToolJob(
-        'research_plan',
-        { task: rnaseqTask, domains: ['omics'], planner_mode: 'deterministic', inputs: buildRnaseqInputs() },
-        'RNA-seq 工作流规划已进入队列',
+        'omics_run_rnaseq_workbench',
+        buildRnaseqInputs(),
+        'RNA-seq 专属分析管线已进入执行队列',
         (job) => setResearchPlan(extractResearchPlan(job)),
       )
       return
@@ -668,9 +674,9 @@ function App() {
     if (mode === 'variant') {
       setResearchPlan(null)
       await submitToolJob(
-        'research_plan',
-        { task: variantTask, domains: ['omics', 'literature'], inputs: buildVariantInputs() },
-        'Variant annotation plan queued for review',
+        'omics_run_variant_workbench',
+        buildVariantInputs(),
+        'VCF 专属变异工作台已进入执行队列',
         (job) => setResearchPlan(extractResearchPlan(job)),
       )
       return
@@ -703,7 +709,7 @@ function App() {
           exhaustiveness: caddInputs.exhaustiveness,
           max_ligands: caddInputs.max_ligands,
         },
-        'CADD 筛选计划已进入审核队列',
+        'CADD 专属筛选管线已进入执行队列',
         (job) => setResearchPlan(extractResearchPlan(job)),
       )
     }

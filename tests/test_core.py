@@ -362,6 +362,8 @@ class CoreTests(unittest.TestCase):
         self.assertIn('cadd_run_screening', names)
         self.assertIn('omics_run_differential_expression', names)
         self.assertIn('omics_run_analysis', names)
+        self.assertIn('omics_run_rnaseq_workbench', names)
+        self.assertIn('omics_run_variant_workbench', names)
         self.assertEqual(len(names), len(specs))
         custom_tools = {'ping': {'description': 'Ping', 'parameters': {'type': 'object'}, 'function': lambda: {'status': 'ok'}}}
         self.assertIs(validate_tool_map('custom', custom_tools), custom_tools)
