@@ -348,8 +348,6 @@ function App() {
   const [sequenceUseVaxpress, setSequenceUseVaxpress] = useState(false)
   const [sequenceStructureId, setSequenceStructureId] = useState('')
   const [evidenceProvider, setEvidenceProvider] = useState('local')
-  const [onlineEvidenceProvider, setOnlineEvidenceProvider] = useState('uniprot')
-  const [onlineEvidenceGenes, setOnlineEvidenceGenes] = useState('TP53, BRCA1')
   const [variantBackend, setVariantBackend] = useState('auto')
   const [caddExhaustiveness, setCaddExhaustiveness] = useState('4')
   const [caddMaxLigands, setCaddMaxLigands] = useState('3')
@@ -663,128 +661,6 @@ function App() {
     )
   }
 
-  async function submitOmicsDemo() {
-    const controller = beginJobStream()
-    setLoading(true)
-    setError('')
-    setEvents([])
-    try {
-      const response = await apiFetch<{ job: Job }>(apiBase, token, '/api/v1/jobs', {
-        method: 'POST',
-        signal: controller.signal,
-        headers: { 'Idempotency-Key': crypto.randomUUID() },
-        body: JSON.stringify({
-          tool: 'omics_run_analysis',
-          arguments: {
-            expression_csv: 'examples/rnaseq/expression.csv',
-            metadata_csv: 'examples/rnaseq/metadata.csv',
-            gene_sets_csv: 'examples/rnaseq/gene_sets.csv',
-            output_dir: 'output/frontend_rnaseq_demo',
-            evidence_csv: 'examples/rnaseq/evidence.csv',
-            evidence_provider: 'local',
-          },
-        }),
-      })
-      const job = response.job
-      setSelectedJob(job)
-      setJobs((current) => [job, ...current.filter((item) => item.job_id !== job.job_id)])
-      setEvents([{ at: formatTime(new Date().toISOString()), type: 'accepted', status: 'queued', detail: 'RNA-seq Agent 已进入执行队列' }])
-      await followJob(apiBase, token, job.job_id, (type, data) => {
-        if (!data.job) return
-        setSelectedJob(data.job)
-        setJobs((current) => [data.job!, ...current.filter((item) => item.job_id !== data.job!.job_id)])
-        setEvents((current) => [...current, {
-          at: formatTime(new Date().toISOString()),
-          type,
-          status: data.job!.status,
-          detail: type === 'timeout' ? 'SSE 订阅超时，任务仍可通过列表查询' : `状态更新为${statusLabels[data.job!.status] || data.job!.status}`,
-        }])
-      }, controller.signal)
-    } catch (err) {
-      if (!isCurrentStream(controller) || (err instanceof Error && err.name === 'AbortError')) return
-      setError(err instanceof Error ? err.message : 'RNA-seq Agent 执行失败')
-    } finally {
-      if (isCurrentStream(controller)) {
-        streamController.current = null
-        setLoading(false)
-        void refresh()
-      }
-    }
-  }
-
-  async function submitBgiMultiomicsDemo() {
-    setResearchPlan(null)
-    await submitToolJob(
-      'research_run_preset',
-      {
-        preset: 'bgi_multiomics_demo',
-        dry_run: false,
-        output_path: 'output/frontend_bgi_multiomics_demo/workflow_manifest.json',
-        report_path: 'output/frontend_bgi_multiomics_demo/workflow_report.md',
-        continue_on_error: false,
-      },
-      'BGI multi-omics demo queued',
-    )
-  }
-
-  async function submitOnlineEvidenceDemo() {
-    const geneIds = onlineEvidenceGenes.split(/[\s,;]+/).map((value) => value.trim()).filter(Boolean).slice(0, 5)
-    if (!geneIds.length) {
-      setError('请输入至少一个基因 ID')
-      return
-    }
-    setResearchPlan(null)
-    await submitToolJob(
-      'literature_search',
-      {
-        gene_ids: geneIds,
-        provider: onlineEvidenceProvider,
-        cache_dir: 'output/frontend_online_evidence',
-      },
-      `在线证据查询已提交：${providerLabels[onlineEvidenceProvider] || onlineEvidenceProvider}`,
-    )
-  }
-
-  async function submitFastqRnaSeqDemo() {
-    setMode('research')
-    setResearchPlan(null)
-    await submitToolJob(
-      'research_plan',
-      {
-        task: 'Run FastQC, align paired-end RNA-seq reads, quantify, differential expression and pathway enrichment',
-        domains: ['omics'],
-        planner_mode: 'deterministic',
-        inputs: {
-          fastq_paths: [
-            'examples/omics/rnaseq_fastq_fixture/A1.fastq',
-            'examples/omics/rnaseq_fastq_fixture/A2.fastq',
-            'examples/omics/rnaseq_fastq_fixture/A3.fastq',
-            'examples/omics/rnaseq_fastq_fixture/B1.fastq',
-            'examples/omics/rnaseq_fastq_fixture/B2.fastq',
-            'examples/omics/rnaseq_fastq_fixture/B3.fastq',
-          ],
-          fastq_r2_paths: [
-            'examples/omics/rnaseq_paired_fixture/A1_R2.fastq',
-            'examples/omics/rnaseq_paired_fixture/A2_R2.fastq',
-            'examples/omics/rnaseq_paired_fixture/A3_R2.fastq',
-            'examples/omics/rnaseq_paired_fixture/B1_R2.fastq',
-            'examples/omics/rnaseq_paired_fixture/B2_R2.fastq',
-            'examples/omics/rnaseq_paired_fixture/B3_R2.fastq',
-          ],
-          reference_fasta: 'examples/omics/rnaseq_fastq_fixture/reference.fa',
-          annotation_gtf: 'examples/omics/rnaseq_fastq_fixture/genes.gtf',
-          metadata_csv: 'examples/omics/rnaseq_fastq_fixture/metadata.csv',
-          gene_sets_csv: 'examples/omics/rnaseq_fastq_fixture/gene_sets.csv',
-          statistics_backend: 'scipy',
-          paired_end: true,
-          output_dir: 'output/frontend_auto_research',
-        },
-      },
-      'RNA-seq FastQC 质控和 paired-end 分析计划已进入队列',
-      (job) => setResearchPlan(extractResearchPlan(job)),
-    )
-  }
-
   async function cancelSelectedJob() {
     if (!selectedJob || !['queued', 'running'].includes(selectedJob.status) || selectedJob.cancel_requested) return
     setError('')
@@ -948,22 +824,6 @@ function App() {
                 </summary>
                 <div className="px-5 pb-1"><CapabilityStrip capabilities={capabilities} /></div>
               </details>
-              <details data-interview-shortcuts className="group mb-5 rounded-2xl border border-[#3f527c] bg-[#0d192b]/85">
-                <summary className="flex cursor-pointer list-none items-center justify-between gap-4 px-5 py-4 outline-none focus-visible:ring-2 focus-visible:ring-[#aebfff] focus-visible:ring-inset">
-                  <div className="flex items-center gap-3"><ChevronRight size={16} className="transition group-open:rotate-90" /><div><div className="eyebrow text-[#9cb9ff]">面试快捷入口</div><div className="mt-1 text-sm text-[#b9c8e8]">预置科研场景，适合面试快速演示</div></div></div>
-                  <span className="status-badge border-[#3f527c] bg-[#111d32] text-[#aebfff]">可选</span>
-                </summary>
-                <div className="border-t border-white/[0.08] px-3 pt-3 sm:px-5">
-              <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#3f527c] bg-[#111d32]/80 px-5 py-4"><div><div className="font-mono text-[10px] tracking-[0.16em] text-[#9cb9ff]">面试演示 / BGI 多组学</div><div className="mt-1 text-sm text-[#b9c8e8]">基因组质控 → 10x 单细胞 → 微生物组 → 证据 → mRNA</div></div><button aria-label="运行 BGI 多组学演示" onClick={() => void submitBgiMultiomicsDemo()} disabled={loading} className="rounded-lg bg-[#aebfff] px-3 py-2 text-xs font-semibold text-[#111a34] transition hover:bg-[#c4d0ff] disabled:cursor-not-allowed disabled:opacity-50">运行 BGI 演示</button></div>
-              <OnlineEvidenceDemoCard provider={onlineEvidenceProvider} genes={onlineEvidenceGenes} loading={loading} onProviderChange={setOnlineEvidenceProvider} onGenesChange={setOnlineEvidenceGenes} onRun={() => void submitOnlineEvidenceDemo()} />
-
-              <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#28524b] bg-[#102b2a]/70 px-5 py-4"><div><div className="font-mono text-[10px] tracking-[0.16em] text-[#8fe5c1]">面试演示 / RNA-seq 代理</div><div className="mt-1 text-sm text-[#b4cdc6]">差异表达 → 通路富集 → 基因证据 → 可追溯报告</div></div><button onClick={() => void submitOmicsDemo()} disabled={loading} className="rounded-lg bg-[#8fe5c1] px-3 py-2 text-xs font-semibold text-[#092521] transition hover:bg-[#b8f4d8] disabled:cursor-not-allowed disabled:opacity-50">运行 RNA-seq 代理</button></div>
-
-              <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#3d5a8c] bg-[#111d32]/80 px-5 py-4"><div><div className="font-mono text-[10px] tracking-[0.16em] text-[#aebfff]">面试演示 / 原生 RNA-seq</div><div className="mt-1 text-sm text-[#c3d1f4]">FastQC → MultiQC → HISAT2 → featureCounts → 差异分析</div></div><button aria-label="运行原生 RNA-seq 演示" onClick={() => void submitFastqRnaSeqDemo()} disabled={loading} className="rounded-lg bg-[#aebfff] px-3 py-2 text-xs font-semibold text-[#111a34] transition hover:bg-[#cbd4ff] disabled:cursor-not-allowed disabled:opacity-50">运行真实 RNA-seq 流程</button></div>
-
-                </div>
-              </details>
-
               {selectedJob && ['queued', 'running'].includes(selectedJob.status) && <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#5c4930] bg-[#211d16] px-5 py-4"><div className="flex items-center gap-3"><Ban size={16} className="text-[#e6c875]" /><div><div className="text-sm font-medium text-[#f1dfaa]">任务控制</div><div className="mt-1 text-xs text-[#aa9767]">排队中的任务会立即取消，运行中的任务采用协作式取消。</div></div></div><button onClick={() => void cancelSelectedJob()} disabled={selectedJob.cancel_requested} className="rounded-lg border border-[#80643c] px-3 py-2 text-xs font-medium text-[#f1d889] transition hover:bg-[#392d1c] disabled:cursor-not-allowed disabled:opacity-50">{selectedJob.cancel_requested ? '取消请求已发送' : '取消任务'}</button></div>}
               {selectedJob && ['failed', 'cancelled'].includes(selectedJob.status) && <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#3f527c] bg-[#111d32] px-5 py-4"><div className="flex items-center gap-3"><RefreshCw size={16} className="text-[#aebfff]" /><div><div className="text-sm font-medium text-[#d7ddff]">任务恢复</div><div className="mt-1 text-xs text-[#99a6cf]">保留原任务记录，复制原始参数重新提交。</div></div></div><button aria-label="Retry selected task" onClick={() => void retryJob(selectedJob)} disabled={loading} className="rounded-lg bg-[#aebfff] px-3 py-2 text-xs font-semibold text-[#111a34] transition hover:bg-[#c4d0ff] disabled:cursor-not-allowed disabled:opacity-50">重试任务</button></div>}
 
@@ -1041,10 +901,6 @@ function CapabilityStrip({ capabilities }: { capabilities: Capabilities | null }
     { key: 'a2a', label: 'A2A / JSON-RPC', icon: GitBranch, detail: capabilities.interfaces.a2a?.endpoint || '/a2a' },
   ]
   return <section className="mb-5" aria-label="集成能力"><div className="mb-2 flex items-center justify-between"><div className="eyebrow">集成能力</div><div className="font-mono text-[10px] text-[#66857e]">{capabilities.tool_count} 个工具契约</div></div><div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">{cards.map((card) => { const capability = capabilities.interfaces[card.key]; const Icon = card.icon; const available = capability?.status === 'available'; return <div key={card.key} className="rounded-xl border border-white/[0.08] bg-white/[0.035] px-3 py-3"><div className="flex items-center justify-between gap-2"><div className="flex items-center gap-2 text-xs font-medium text-[#c9e5dc]"><Icon size={14} className="text-[#8fe5c1]" />{card.label}</div><span className={`status-badge ${available ? 'status-ok' : 'status-failed'}`}>{available ? '就绪' : capability?.status || '未知'}</span></div><div className="mt-2 truncate font-mono text-[9px] text-[#66857e]" title={card.detail}>{card.detail}</div></div> })}</div></section>
-}
-
-function OnlineEvidenceDemoCard({ provider, genes, loading, onProviderChange, onGenesChange, onRun }: { provider: string; genes: string; loading: boolean; onProviderChange: (value: string) => void; onGenesChange: (value: string) => void; onRun: () => void }) {
-  return <section className="mb-5 flex flex-wrap items-end gap-4 rounded-2xl border border-[#28524b] bg-[#102b2a]/70 px-5 py-4"><div className="min-w-[220px] flex-1"><div className="font-mono text-[10px] tracking-[0.16em] text-[#8fe5c1]">在线证据 / 来源切换</div><div className="mt-1 text-sm text-[#b4cdc6]">用同一代理契约切换 UniProt、NCBI Gene、PubMed 或 KEGG，并在结果区展示真实来源</div></div><div className="grid w-full gap-2 sm:w-auto sm:grid-cols-[150px_190px_auto]"><label className="sr-only" htmlFor="online-evidence-provider">在线证据来源</label><select id="online-evidence-provider" value={provider} onChange={(event) => onProviderChange(event.target.value)} className="input-control"><option value="uniprot">UniProt</option><option value="ncbi_gene">NCBI Gene</option><option value="pubmed">PubMed</option><option value="kegg">KEGG</option></select><label className="sr-only" htmlFor="online-evidence-genes">基因 ID</label><input id="online-evidence-genes" value={genes} onChange={(event) => onGenesChange(event.target.value)} className="input-control font-mono" placeholder="TP53, BRCA1" /><button onClick={onRun} disabled={loading} className="rounded-lg bg-[#8fe5c1] px-3 py-2 text-xs font-semibold text-[#092521] transition hover:bg-[#b8f4d8] disabled:cursor-not-allowed disabled:opacity-50">查询在线证据</button></div></section>
 }
 
 function Metric({ label, value, icon }: { label: string; value: string; icon: React.ReactNode }) {
@@ -1609,7 +1465,7 @@ function JobResultSummary({ job, structureId, onDownload, onOpenReport }: { job:
     <AgentExecutionAuditPanel status={typeof manifest.status === 'string' ? manifest.status : undefined} steps={steps} manifestPath={typeof manifest.manifest_path === 'string' ? manifest.manifest_path : undefined} reportPath={typeof sequenceReport.output_html === 'string' ? sequenceReport.output_html : typeof omicsReport.output_md === 'string' ? omicsReport.output_md : typeof report.path === 'string' ? report.path : undefined} />
      {Boolean(fastqQcResult.status) && <div className="border-t border-white/[0.08] px-5 py-5 sm:px-6"><div className="flex flex-wrap items-center justify-between gap-3"><div><div className="field-label">FASTQ 质量控制</div><div className="mt-1 text-sm text-[#b9e6d5]">FastQC {fastqQcSummaries.length ? `完成 ${fastqQcSummaries.length} 个报告` : '报告'} · MultiQC 汇总已生成</div></div>{fastqQcReport && <button onClick={() => onDownload(fastqQcReport)} className="inline-flex items-center gap-2 rounded-lg border border-[#3d5a8c] bg-[#111d32] px-3 py-2 text-xs font-medium text-[#cbd4ff] transition hover:border-[#aebfff] hover:text-white"><Download size={13} />下载 MultiQC 报告</button>}</div><div className="mt-4 grid grid-cols-3 gap-2 sm:max-w-md"><QcStatusMetric label="通过" value={fastqQcCounts.pass} className="status-ok" /><QcStatusMetric label="警告" value={fastqQcCounts.warn} className="status-running" /><QcStatusMetric label="失败" value={fastqQcCounts.fail} className="status-failed" /></div></div>}
      {toolProvenance.length > 0 && <div className="border-t border-white/[0.08] px-5 py-5 sm:px-6"><div className="flex flex-wrap items-center justify-between gap-3"><div><div className="field-label">工具链溯源</div><div className="mt-1 text-sm text-[#b9e6d5]">版本信息来自本次任务的实际执行环境</div></div><span className="status-badge status-ok"><span className="size-1.5 rounded-full bg-current" />运行环境已验证</span></div><div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">{toolProvenance.map((item) => <div key={item.label} className="rounded-lg border border-white/[0.07] bg-[#071719]/70 px-3 py-2.5"><div className="font-mono text-[9px] tracking-[0.12em] text-[#63817b]">{item.label}</div><div className="mt-1 truncate text-[11px] text-[#c9e5dc]" title={item.version}>{item.version}</div></div>)}</div></div>}
-     {(alignmentSamples.length > 0 || featureCountsResult.n_genes !== undefined || Boolean(differential.output_csv)) && <div className="border-t border-white/[0.08] px-5 py-5 sm:px-6"><div className="flex flex-wrap items-center justify-between gap-3"><div><div className="field-label">RNA-seq 流程摘要</div><div className="mt-1 text-sm text-[#b9e6d5]">比对、计数和差异分析结果已汇总，可直接用于面试演示。</div></div><span className="status-badge status-ok"><span className="size-1.5 rounded-full bg-current" />链路完成</span></div><div className="mt-4 grid grid-cols-2 gap-2 lg:grid-cols-4"><PipelineMetric label="样本数" value={alignmentSamples.length || featureCountsResult.n_samples || '—'} /><PipelineMetric label="平均比对率" value={alignmentRate || '—'} /><PipelineMetric label="计数基因数" value={featureCountsResult.n_genes ?? '—'} /><PipelineMetric label="显著差异基因" value={differential.n_significant ?? '—'} /></div>{alignmentSamples.length > 0 && <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{alignmentSamples.map((sample, index) => <div key={`${String(sample.sample_id || 'sample')}-${index}`} className="flex items-center justify-between rounded-lg border border-white/[0.07] bg-[#071719]/70 px-3 py-2.5"><span className="font-mono text-[10px] text-[#a9cbc0]">{String(sample.sample_id || `sample-${index + 1}`)}</span><span className="font-mono text-[10px] text-[#8fe5c1]">{String(sample.overall_alignment_rate || '—')}</span></div>)}</div>}</div>}
+     {(alignmentSamples.length > 0 || featureCountsResult.n_genes !== undefined || Boolean(differential.output_csv)) && <div className="border-t border-white/[0.08] px-5 py-5 sm:px-6"><div className="flex flex-wrap items-center justify-between gap-3"><div><div className="field-label">RNA-seq 流程摘要</div><div className="mt-1 text-sm text-[#b9e6d5]">比对、计数和差异分析结果已汇总，可直接查看或继续分析。</div></div><span className="status-badge status-ok"><span className="size-1.5 rounded-full bg-current" />链路完成</span></div><div className="mt-4 grid grid-cols-2 gap-2 lg:grid-cols-4"><PipelineMetric label="样本数" value={alignmentSamples.length || featureCountsResult.n_samples || '—'} /><PipelineMetric label="平均比对率" value={alignmentRate || '—'} /><PipelineMetric label="计数基因数" value={featureCountsResult.n_genes ?? '—'} /><PipelineMetric label="显著差异基因" value={differential.n_significant ?? '—'} /></div>{alignmentSamples.length > 0 && <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{alignmentSamples.map((sample, index) => <div key={`${String(sample.sample_id || 'sample')}-${index}`} className="flex items-center justify-between rounded-lg border border-white/[0.07] bg-[#071719]/70 px-3 py-2.5"><span className="font-mono text-[10px] text-[#a9cbc0]">{String(sample.sample_id || `sample-${index + 1}`)}</span><span className="font-mono text-[10px] text-[#8fe5c1]">{String(sample.overall_alignment_rate || '—')}</span></div>)}</div>}</div>}
      {traceSteps.length > 0 && <div className="border-t border-white/[0.08] px-5 py-4 sm:px-6"><div className="field-label">工作流追踪 / 工具链</div><div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{traceSteps.map((step) => <div key={`${step.index}-${step.id}`} className="flex items-center gap-3 rounded-xl border border-white/[0.08] bg-[#071719]/70 px-3 py-3"><div className="grid size-7 shrink-0 place-items-center rounded-lg border border-[#28524b] bg-[#102b2a] font-mono text-[10px] text-[#8fe5c1]">{String(step.index).padStart(2, '0')}</div><div className="min-w-0 flex-1"><div className="truncate text-xs font-medium text-[#c9e5dc]">{step.id}</div><div className="mt-1 truncate font-mono text-[9px] text-[#66857e]">{step.tool}</div></div><span className={`status-badge ${step.status === 'completed' ? 'status-ok' : step.status === 'failed' ? 'status-failed' : 'status-running'}`}>{step.status === 'completed' ? '已完成' : step.status === 'failed' ? '失败' : '运行中'}</span></div>)}</div></div>}
     {geneIds.length > 0 && <div className="border-t border-white/[0.08] px-5 py-4 sm:px-6"><div className="field-label">已注释基因 ID</div><div className="mt-2 flex flex-wrap gap-2">{geneIds.map((geneId) => <span key={geneId} className="rounded-md border border-[#28524b] bg-[#102b2a] px-2 py-1 font-mono text-[10px] text-[#b9e6d5]">{geneId}</span>)}</div></div>}
     <details className="border-t border-white/[0.08] px-5 py-4 sm:px-6"><summary className="cursor-pointer text-xs text-[#8fb2a8]">查看完整结果 JSON</summary><pre className="mt-3 max-h-64 overflow-auto rounded-xl bg-[#061113] p-3 text-[10px] leading-5 text-[#91b8ac]">{JSON.stringify(payload, null, 2)}</pre></details>
