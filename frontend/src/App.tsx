@@ -139,6 +139,7 @@ type RnaPreflightItem = {
 type View = 'workspace' | 'domains'
 type RunMode = 'research' | 'rnaseq' | 'variant' | 'sequence' | 'cadd'
 type ResearchPreset = 'custom' | 'bgi_multiomics' | 'online_evidence'
+type RnaInputMode = 'fixture' | 'upload'
 type PlannerMode = 'auto' | 'deterministic' | 'llm'
 
 const runtimeApiBase = new URLSearchParams(window.location.search).get('api') || ''
@@ -183,6 +184,29 @@ const pluginDescriptions: Record<string, string> = {
   knowledge: '本地科研知识检索',
   imaging: '显微成像与图像质控',
   sequence: 'mRNA-Forge 序列设计',
+}
+
+const rnaseqFixture = {
+  fastqPaths: [
+    'examples/omics/rnaseq_fastq_fixture/A1.fastq',
+    'examples/omics/rnaseq_fastq_fixture/A2.fastq',
+    'examples/omics/rnaseq_fastq_fixture/A3.fastq',
+    'examples/omics/rnaseq_fastq_fixture/B1.fastq',
+    'examples/omics/rnaseq_fastq_fixture/B2.fastq',
+    'examples/omics/rnaseq_fastq_fixture/B3.fastq',
+  ],
+  fastqR2Paths: [
+    'examples/omics/rnaseq_paired_fixture/A1_R2.fastq',
+    'examples/omics/rnaseq_paired_fixture/A2_R2.fastq',
+    'examples/omics/rnaseq_paired_fixture/A3_R2.fastq',
+    'examples/omics/rnaseq_paired_fixture/B1_R2.fastq',
+    'examples/omics/rnaseq_paired_fixture/B2_R2.fastq',
+    'examples/omics/rnaseq_paired_fixture/B3_R2.fastq',
+  ],
+  referenceFasta: 'examples/omics/rnaseq_fastq_fixture/reference.fa',
+  annotationGtf: 'examples/omics/rnaseq_fastq_fixture/genes.gtf',
+  metadataCsv: 'examples/omics/rnaseq_fastq_fixture/metadata.csv',
+  geneSetsCsv: 'examples/omics/rnaseq_fastq_fixture/gene_sets.csv',
 }
 
 const terminalJobStatuses = new Set<Job['status']>(['completed', 'failed', 'cancelled'])
@@ -351,6 +375,7 @@ function App() {
   const [sequenceStructureId, setSequenceStructureId] = useState('')
   const [evidenceProvider, setEvidenceProvider] = useState('local')
   const [variantBackend, setVariantBackend] = useState('auto')
+  const [rnaInputMode, setRnaInputMode] = useState<RnaInputMode>('fixture')
   const [caddExhaustiveness, setCaddExhaustiveness] = useState('4')
   const [caddMaxLigands, setCaddMaxLigands] = useState('3')
   const [uploadedFiles, setUploadedFiles] = useState<Record<ResearchFileSlot, UploadedFile | null>>({ expression: null, metadata: null, gene_sets: null, vcf: null, annotation: null, receptor: null, ligand_library: null })
@@ -411,19 +436,20 @@ function App() {
     const alignment = /align|hisat|比对|featurecounts|计数|定量/.test(taskText)
     const differential = /differential|deseq|差异表达|差异分析/.test(taskText)
     const enrichment = /enrichment|pathway|gene set|富集|通路|基因集/.test(taskText)
-    const r1Count = rnaFiles.fastq_r1.length
-    const r2Count = rnaFiles.fastq_r2.length
+    const fixtureMode = rnaInputMode === 'fixture'
+    const r1Count = fixtureMode ? rnaseqFixture.fastqPaths.length : rnaFiles.fastq_r1.length
+    const r2Count = fixtureMode ? rnaseqFixture.fastqR2Paths.length : rnaFiles.fastq_r2.length
     const pairMismatch = r2Count > 0 && (r1Count === 0 || r1Count !== r2Count)
     const checks: RnaPreflightItem[] = [
-      { label: 'R1 FASTQ', detail: r1Count ? `${r1Count} 个文件` : '待上传', ready: r1Count > 0, required: true },
-      { label: 'R2 FASTQ', detail: r2Count ? `${r2Count} 个文件` : pairedEnd ? '双端任务需要上传' : '未上传，按单端处理', ready: !pairedEnd && r2Count === 0 ? true : r2Count > 0 && !pairMismatch, required: pairedEnd },
-      { label: '参考基因组 FASTA', detail: rnaFiles.reference_fasta.length ? '已上传' : alignment ? '比对任务需要上传' : '规划器可继续检查', ready: !alignment || rnaFiles.reference_fasta.length > 0, required: alignment },
-      { label: '基因注释 GTF', detail: rnaFiles.annotation_gtf.length ? '已上传' : differential ? '差异分析前需要计数注释' : 'featureCounts / 差异分析需要', ready: !differential || rnaFiles.annotation_gtf.length > 0, required: differential },
-      { label: '样本元数据 CSV', detail: rnaFiles.metadata.length ? '已上传' : differential ? '差异分析需要' : '可选', ready: !differential || rnaFiles.metadata.length > 0, required: differential },
-      { label: '基因集 CSV', detail: rnaFiles.gene_sets.length ? '已上传' : enrichment ? '富集分析需要' : '可选', ready: !enrichment || rnaFiles.gene_sets.length > 0, required: enrichment },
+      { label: 'R1 FASTQ', detail: fixtureMode ? `${r1Count} 个仓库样例文件` : r1Count ? `${r1Count} 个文件` : '待上传', ready: r1Count > 0, required: true },
+      { label: 'R2 FASTQ', detail: fixtureMode ? `${r2Count} 个仓库样例文件` : r2Count ? `${r2Count} 个文件` : pairedEnd ? '双端任务需要上传' : '未上传，按单端处理', ready: !pairedEnd && r2Count === 0 ? true : r2Count > 0 && !pairMismatch, required: pairedEnd },
+      { label: '参考基因组 FASTA', detail: fixtureMode ? '仓库样例已就绪' : rnaFiles.reference_fasta.length ? '已上传' : alignment ? '比对任务需要上传' : '规划器可继续检查', ready: !alignment || fixtureMode || rnaFiles.reference_fasta.length > 0, required: alignment },
+      { label: '基因注释 GTF', detail: fixtureMode ? '仓库样例已就绪' : rnaFiles.annotation_gtf.length ? '已上传' : differential ? '差异分析前需要计数注释' : 'featureCounts / 差异分析需要', ready: !differential || fixtureMode || rnaFiles.annotation_gtf.length > 0, required: differential },
+      { label: '样本元数据 CSV', detail: fixtureMode ? '仓库样例已就绪' : rnaFiles.metadata.length ? '已上传' : differential ? '差异分析需要' : '可选', ready: !differential || fixtureMode || rnaFiles.metadata.length > 0, required: differential },
+      { label: '基因集 CSV', detail: fixtureMode ? '仓库样例已就绪' : rnaFiles.gene_sets.length ? '已上传' : enrichment ? '富集分析需要' : '可选', ready: !enrichment || fixtureMode || rnaFiles.gene_sets.length > 0, required: enrichment },
     ]
     return { checks, pairMismatch }
-  }, [rnaFiles, rnaseqTask])
+  }, [rnaFiles, rnaInputMode, rnaseqTask])
 
   function saveToken() {
     const normalized = tokenDraft.trim()
@@ -504,13 +530,14 @@ function App() {
   }
 
   function buildRnaseqInputs() {
+    const fixtureMode = rnaInputMode === 'fixture'
     return {
-      fastq_paths: rnaFiles.fastq_r1.length ? rnaFiles.fastq_r1.map((file) => file.path) : undefined,
-      fastq_r2_paths: rnaFiles.fastq_r2.length ? rnaFiles.fastq_r2.map((file) => file.path) : undefined,
-      reference_fasta: rnaFiles.reference_fasta[0]?.path,
-      annotation_gtf: rnaFiles.annotation_gtf[0]?.path,
-      metadata_csv: rnaFiles.metadata[0]?.path,
-      gene_sets_csv: rnaFiles.gene_sets[0]?.path,
+      fastq_paths: fixtureMode ? rnaseqFixture.fastqPaths : rnaFiles.fastq_r1.length ? rnaFiles.fastq_r1.map((file) => file.path) : undefined,
+      fastq_r2_paths: fixtureMode ? rnaseqFixture.fastqR2Paths : rnaFiles.fastq_r2.length ? rnaFiles.fastq_r2.map((file) => file.path) : undefined,
+      reference_fasta: fixtureMode ? rnaseqFixture.referenceFasta : rnaFiles.reference_fasta[0]?.path,
+      annotation_gtf: fixtureMode ? rnaseqFixture.annotationGtf : rnaFiles.annotation_gtf[0]?.path,
+      metadata_csv: fixtureMode ? rnaseqFixture.metadataCsv : rnaFiles.metadata[0]?.path,
+      gene_sets_csv: fixtureMode ? rnaseqFixture.geneSetsCsv : rnaFiles.gene_sets[0]?.path,
       output_dir: 'output/frontend_rnaseq_custom',
       statistics_backend: 'scipy',
     }
@@ -894,14 +921,15 @@ function App() {
                     </div>
                     <p className="mt-3 text-xs leading-5 text-[#688983]">上传文件会在服务端校验、计算 SHA-256 并保存到本次研究输入目录；未上传的字段使用仓库示例数据。</p>
                   </> : mode === 'rnaseq' ? <>
+                     <div className="mt-6 rounded-xl border border-[#28524b] bg-[#102b2a]/60 p-4"><label className="field-label" htmlFor="rnaseq-input-mode">输入来源</label><select id="rnaseq-input-mode" value={rnaInputMode} onChange={(event) => { const next = event.target.value as RnaInputMode; setRnaInputMode(next); if (next === 'fixture') setRnaFiles({ fastq_r1: [], fastq_r2: [], reference_fasta: [], annotation_gtf: [], metadata: [], gene_sets: [] }); setResearchPlan(null) }} className="input-control"><option value="fixture">仓库样例：原生 RNA-seq</option><option value="upload">上传自定义文件</option></select><p className="mt-2 text-xs leading-5 text-[#789791]">仓库样例会自动使用双端 FASTQ、参考基因组、GTF、元数据和基因集；切换为自定义后可上传自己的文件。</p></div>
                      <label className="mt-6 block"><span className="field-label">RNA-seq 工作流任务</span><textarea value={rnaseqTask} onChange={(event) => { setRnaseqTask(event.target.value); setResearchPlan(null) }} rows={3} className="input-area" placeholder="例如：运行 FastQC 并比对双端 RNA-seq 读段" /></label>
                      <div className="mt-5 grid gap-3 sm:grid-cols-2">
-                       <RnaFileField id="rna-r1-files" label="R1 FASTQ（可多选）" files={rnaFiles.fastq_r1} multiple accept=".fastq,.fq,.fastq.gz,.fq.gz,application/gzip,text/plain" uploading={uploadingRnaFile === 'fastq_r1'} onChange={(files) => void handleRnaFileUpload('fastq_r1', files)} />
-                       <RnaFileField id="rna-r2-files" label="R2 FASTQ（可多选）" files={rnaFiles.fastq_r2} multiple accept=".fastq,.fq,.fastq.gz,.fq.gz,application/gzip,text/plain" uploading={uploadingRnaFile === 'fastq_r2'} onChange={(files) => void handleRnaFileUpload('fastq_r2', files)} />
-                       <RnaFileField id="rna-reference-file" label="参考基因组 FASTA" files={rnaFiles.reference_fasta} accept=".fa,.fasta,.fna,text/plain" uploading={uploadingRnaFile === 'reference_fasta'} onChange={(files) => void handleRnaFileUpload('reference_fasta', files)} />
-                       <RnaFileField id="rna-gtf-file" label="基因注释 GTF" files={rnaFiles.annotation_gtf} accept=".gtf,.gff,.gff3,text/plain" uploading={uploadingRnaFile === 'annotation_gtf'} onChange={(files) => void handleRnaFileUpload('annotation_gtf', files)} />
-                       <RnaFileField id="rna-metadata-file" label="样本元数据 CSV（可选）" files={rnaFiles.metadata} accept=".csv,.tsv,text/csv,text/tab-separated-values" uploading={uploadingRnaFile === 'metadata'} onChange={(files) => void handleRnaFileUpload('metadata', files)} />
-                       <RnaFileField id="rna-gene-sets-file" label="基因集 CSV（可选）" files={rnaFiles.gene_sets} accept=".csv,.tsv,text/csv,text/tab-separated-values" uploading={uploadingRnaFile === 'gene_sets'} onChange={(files) => void handleRnaFileUpload('gene_sets', files)} />
+                       <RnaFileField id="rna-r1-files" label="R1 FASTQ（可多选）" files={rnaFiles.fastq_r1} fixture={rnaInputMode === 'fixture' ? '6 个仓库样例文件' : undefined} multiple accept=".fastq,.fq,.fastq.gz,.fq.gz,application/gzip,text/plain" uploading={uploadingRnaFile === 'fastq_r1'} onChange={(files) => void handleRnaFileUpload('fastq_r1', files)} />
+                       <RnaFileField id="rna-r2-files" label="R2 FASTQ（可多选）" files={rnaFiles.fastq_r2} fixture={rnaInputMode === 'fixture' ? '6 个仓库样例文件' : undefined} multiple accept=".fastq,.fq,.fastq.gz,.fq.gz,application/gzip,text/plain" uploading={uploadingRnaFile === 'fastq_r2'} onChange={(files) => void handleRnaFileUpload('fastq_r2', files)} />
+                       <RnaFileField id="rna-reference-file" label="参考基因组 FASTA" files={rnaFiles.reference_fasta} fixture={rnaInputMode === 'fixture' ? '仓库样例 reference.fa' : undefined} accept=".fa,.fasta,.fna,text/plain" uploading={uploadingRnaFile === 'reference_fasta'} onChange={(files) => void handleRnaFileUpload('reference_fasta', files)} />
+                       <RnaFileField id="rna-gtf-file" label="基因注释 GTF" files={rnaFiles.annotation_gtf} fixture={rnaInputMode === 'fixture' ? '仓库样例 genes.gtf' : undefined} accept=".gtf,.gff,.gff3,text/plain" uploading={uploadingRnaFile === 'annotation_gtf'} onChange={(files) => void handleRnaFileUpload('annotation_gtf', files)} />
+                       <RnaFileField id="rna-metadata-file" label="样本元数据 CSV（可选）" files={rnaFiles.metadata} fixture={rnaInputMode === 'fixture' ? '仓库样例 metadata.csv' : undefined} accept=".csv,.tsv,text/csv,text/tab-separated-values" uploading={uploadingRnaFile === 'metadata'} onChange={(files) => void handleRnaFileUpload('metadata', files)} />
+                       <RnaFileField id="rna-gene-sets-file" label="基因集 CSV（可选）" files={rnaFiles.gene_sets} fixture={rnaInputMode === 'fixture' ? '仓库样例 gene_sets.csv' : undefined} accept=".csv,.tsv,text/csv,text/tab-separated-values" uploading={uploadingRnaFile === 'gene_sets'} onChange={(files) => void handleRnaFileUpload('gene_sets', files)} />
                      </div>
                      <RnaPreflightCard items={rnaseqPreflight.checks} pairMismatch={rnaseqPreflight.pairMismatch} />
                      <p className="mt-3 text-xs leading-5 text-[#688983]">R1/R2 可批量选择；规划器会根据任务文本检查输入，并决定是否继续比对、featureCounts、差异分析和富集。</p>
@@ -979,12 +1007,13 @@ function ResearchFileField({ id, label, accept = '.csv,.tsv,text/csv,text/tab-se
   </div>
 }
 
-function RnaFileField({ id, label, accept, files, multiple = false, uploading, onChange }: { id: string; label: string; accept?: string; files: UploadedFile[]; multiple?: boolean; uploading: boolean; onChange: (files: FileList | null) => void }) {
+function RnaFileField({ id, label, accept, files, fixture, multiple = false, uploading, onChange }: { id: string; label: string; accept?: string; files: UploadedFile[]; fixture?: string; multiple?: boolean; uploading: boolean; onChange: (files: FileList | null) => void }) {
+  const fixtureActive = Boolean(fixture) && files.length === 0
   return <div>
     <div className="field-label">{label}</div>
     <label htmlFor={id} className="flex min-h-[88px] cursor-pointer items-center justify-between gap-3 rounded-xl border border-dashed border-[#315d55] bg-[#071719]/70 px-3 py-3 transition hover:border-[#71cba7] hover:bg-[#102b2a]">
       <input id={id} type="file" accept={accept} multiple={multiple} className="sr-only" onChange={(event) => { onChange(event.target.files); event.currentTarget.value = '' }} />
-      <div className="min-w-0"><div className="truncate text-xs font-medium text-[#b8d8ce]">{uploading ? '上传中…' : files.length ? `${files.length} 个文件已选择` : '选择输入文件'}</div><div className="mt-1 truncate font-mono text-[9px] text-[#668983]">{files.length ? files.map((file) => file.filename).join(', ') : '服务端安全存储并计算 SHA-256'}</div></div>
+      <div className="min-w-0"><div className="truncate text-xs font-medium text-[#b8d8ce]">{uploading ? '上传中…' : fixtureActive ? fixture : files.length ? `${files.length} 个文件已选择` : '选择输入文件'}</div><div className="mt-1 truncate font-mono text-[9px] text-[#668983]">{fixtureActive ? '使用仓库样例，可切换为自定义上传' : files.length ? files.map((file) => file.filename).join(', ') : '服务端安全存储并计算 SHA-256'}</div></div>
       {uploading ? <RefreshCw size={15} className="shrink-0 animate-spin text-[#8fe5c1]" /> : <Upload size={15} className="shrink-0 text-[#78cdaa]" />}
     </label>
   </div>
