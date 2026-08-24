@@ -235,6 +235,35 @@ def sequence_pipeline(protein, molecule='linear', method='greedy'):
     return _envelope('pipeline', result, method=method)
 
 
+def sequence_workbench(
+    protein,
+    molecule='linear',
+    method='greedy',
+    include_benchmark=True,
+    use_vaxpress=False,
+    output_dir='output/frontend_sequence_research',
+):
+    pipeline = sequence_pipeline(protein, molecule, method)
+    if pipeline.get('status') != 'ok':
+        return pipeline
+    result = dict(pipeline.get('result', {}))
+    benchmark = None
+    if include_benchmark:
+        benchmark_result = sequence_benchmark(protein, molecule, use_vaxpress)
+        if benchmark_result.get('status') != 'ok':
+            return benchmark_result
+        benchmark = benchmark_result.get('result')
+        result['benchmark'] = benchmark
+    report_path = Path(output_dir) / 'sequence_report.html'
+    report = sequence_report(pipeline, str(report_path))
+    if report.get('status') != 'ok':
+        return report
+    report_payload = report.get('result', {})
+    result['report'] = report_payload
+    result['output_html'] = report_payload.get('output_html')
+    return _envelope('workbench', result, method=method)
+
+
 def sequence_report(result, output_path='output/sequence_report.html'):
     backend, _ = _get_backend()
     if not isinstance(result, dict):
@@ -302,6 +331,15 @@ TOOLS = {
         'description': 'Run optimize, score and translation verification as one deterministic sequence workflow.',
         'parameters': _parameters({key: value for key, value in _sequence_properties.items() if key in {'protein', 'molecule', 'method'}}, ('protein',)),
         'function': sequence_pipeline,
+    },
+    'workbench': {
+        'description': 'Run the mRNA specialist workbench: optimization, scoring, verification, benchmark and report.',
+        'parameters': _parameters({
+            **{key: value for key, value in _sequence_properties.items() if key in {'protein', 'molecule', 'method', 'use_vaxpress'}},
+            'include_benchmark': {'type': 'boolean'},
+            'output_dir': {'type': 'string'},
+        }, ('protein',)),
+        'function': sequence_workbench,
     },
     'report': {
         'description': 'Render a sequence pipeline result as a standalone HTML report.',

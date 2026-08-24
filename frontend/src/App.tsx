@@ -678,21 +678,16 @@ function App() {
     if (mode === 'sequence') {
       setResearchPlan(null)
       await submitToolJob(
-        'research_plan',
+        'sequence_workbench',
         {
-          task: 'Design and validate an mRNA sequence for the provided protein',
-          domains: ['sequence'],
-          inputs: {
-            protein,
-            molecule: sequenceMolecule,
-            method: sequenceMethod,
-            include_benchmark: true,
-            use_vaxpress: sequenceUseVaxpress,
-            output_dir: 'output/frontend_sequence_research',
-          },
+          protein,
+          molecule: sequenceMolecule,
+          method: sequenceMethod,
+          include_benchmark: true,
+          use_vaxpress: sequenceUseVaxpress,
+          output_dir: 'output/frontend_sequence_research',
         },
-        'mRNA design plan queued for review',
-        (job) => setResearchPlan(extractResearchPlan(job)),
+        'mRNA 专属序列工作台已进入执行队列',
       )
       return
     }
@@ -958,7 +953,7 @@ function App() {
               {selectedJob?.status === 'completed' && <JobResultSummary job={selectedJob} structureId={sequenceStructureId} onDownload={(path) => void downloadJobArtifact(selectedJob.job_id, path)} onOpenReport={(path) => void previewJobArtifact(selectedJob.job_id, path)} />}
               {reportPreview && <ReportPreviewModal preview={reportPreview} onClose={closeReportPreview} />}
 
-              {(mode === 'research' || mode === 'rnaseq' || mode === 'variant' || mode === 'sequence' || mode === 'cadd') && selectedJob?.tool !== 'research_execute' && <ResearchPlanCard plan={researchPlan} loading={loading && selectedJob?.tool === 'research_plan'} onExecute={() => void executeResearchPlan()} />}
+              {(mode !== 'sequence' && (mode === 'research' || mode === 'rnaseq' || mode === 'variant' || mode === 'cadd')) && selectedJob?.tool !== 'research_execute' && <ResearchPlanCard plan={researchPlan} loading={loading && selectedJob?.tool === 'research_plan'} onExecute={() => void executeResearchPlan()} />}
 
               <section className="panel mt-5 overflow-hidden"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-5 py-5 sm:px-6"><div><div className="eyebrow">03 / 最近任务</div><h2 className="mt-2 text-xl font-semibold">最近任务</h2></div><button onClick={() => void refresh()} className="inline-flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-xs text-[#9bb7b0] transition hover:border-[#4f8c7d] hover:text-[#d6eee7]"><RefreshCw size={13} />刷新</button></div>{jobs.length ? <div className="overflow-x-auto"><table className="w-full min-w-[680px] text-left text-sm"><thead className="bg-white/[0.025] font-mono text-[10px] tracking-[0.12em] text-[#63817b]"><tr><th className="px-5 py-3 font-normal sm:px-6">任务 ID</th><th className="px-5 py-3 font-normal">工具</th><th className="px-5 py-3 font-normal">状态</th><th className="px-5 py-3 font-normal">创建时间</th><th className="px-5 py-3 font-normal" /></tr></thead><tbody>{jobs.map((job) => <tr key={job.job_id} onClick={() => { setSelectedJob(job); setEvents([]) }} className="cursor-pointer border-t border-white/[0.06] transition hover:bg-white/[0.035]"><td className="px-5 py-4 font-mono text-xs text-[#81aaa1] sm:px-6">{formatJobId(job.job_id)}</td><td className="px-5 py-4 font-medium text-[#c7ddd7]">{job.tool}</td><td className="px-5 py-4"><StatusBadge status={job.status} /></td><td className="px-5 py-4 font-mono text-xs text-[#66837d]">{formatTime(job.created_at)}</td><td className="px-5 py-4 text-right text-[#6b8f87]"><ChevronRight size={15} /></td></tr>)}</tbody></table></div> : <div className="px-6 py-12 text-center text-sm text-[#66837d]">还没有运行记录，先启动一条研究路径。</div>}</section>
             </>

@@ -23,6 +23,24 @@ class SequencePluginTests(unittest.TestCase):
         names = {spec['name'] for spec in tool_specs('sequence')}
         self.assertIn('sequence_optimize', names)
         self.assertIn('sequence_pipeline', names)
+        self.assertIn('sequence_workbench', names)
+
+    def test_sequence_workbench_keeps_specialist_outputs_together(self):
+        if 'sequence' not in available_domains():
+            self.skipTest('mRNA-Forge backend is not installed')
+        with tempfile.TemporaryDirectory(prefix='sequence_workbench_') as raw:
+            result = run_tool('sequence_workbench', {
+                'protein': 'MKT',
+                'molecule': 'linear',
+                'method': 'greedy',
+                'include_benchmark': True,
+                'output_dir': raw,
+            })
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(result['plugin'], 'sequence')
+        self.assertTrue(result['result']['verify'])
+        self.assertIn('benchmark', result['result'])
+        self.assertTrue(result['result']['output_html'])
 
     def test_sequence_pipeline_returns_a_verified_result(self):
         if 'sequence' not in available_domains():
