@@ -391,6 +391,7 @@ function App() {
   const [reportPreview, setReportPreview] = useState<{ url: string; filename: string } | null>(null)
   const streamController = useRef<AbortController | null>(null)
   const reportPreviewUrl = useRef<string | null>(null)
+  const sequenceDemoStarted = useRef(false)
 
   function beginJobStream() {
     streamController.current?.abort()
@@ -429,6 +430,12 @@ function App() {
     setResearchPlan(null)
     setSelectedJob(null)
     setEvents([])
+  }, [mode])
+
+  useEffect(() => {
+    if (mode !== 'sequence' || sequenceDemoStarted.current) return
+    sequenceDemoStarted.current = true
+    void submitSequenceDemo()
   }, [mode])
 
   useEffect(() => () => {
@@ -713,6 +720,24 @@ function App() {
         (job) => setResearchPlan(extractResearchPlan(job)),
       )
     }
+  }
+
+  async function submitSequenceDemo() {
+    setProtein(luciferaseDemoProtein)
+    setSequenceStructureId('1LCI')
+    setResearchPlan(null)
+    await submitToolJob(
+      'sequence_workbench',
+      {
+        protein: luciferaseDemoProtein,
+        molecule: sequenceMolecule,
+        method: sequenceMethod,
+        include_benchmark: true,
+        use_vaxpress: sequenceUseVaxpress,
+        output_dir: 'output/frontend_sequence_research',
+      },
+      'mRNA 专属序列工作台已进入执行队列',
+    )
   }
 
   async function executeResearchPlan() {
