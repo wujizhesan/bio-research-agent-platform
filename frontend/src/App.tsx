@@ -320,7 +320,7 @@ function App() {
   const [mode, setMode] = useState<RunMode>('research')
   const [plannerMode, setPlannerMode] = useState<PlannerMode>('auto')
   const [apiBase] = useState(defaultApiBase)
-  const [token, setToken] = useState(() => localStorage.getItem('bio-agent-token') || import.meta.env.VITE_API_TOKEN || 'change-me-in-development')
+  const [token, setToken] = useState(() => localStorage.getItem('bio-agent-token') || import.meta.env.VITE_API_TOKEN || '')
   const [plugins, setPlugins] = useState<Plugin[]>([])
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null)
   const [jobs, setJobs] = useState<Job[]>([])
@@ -330,6 +330,7 @@ function App() {
   const [rnaseqTask, setRnaseqTask] = useState('Run FastQC and align paired-end RNA-seq reads')
   const [variantTask, setVariantTask] = useState('Annotate VCF variants and retrieve gene evidence')
   const [protein, setProtein] = useState('MKT')
+  const [geneIds, setGeneIds] = useState('')
   const [sequenceMolecule, setSequenceMolecule] = useState<SequenceMolecule>('linear')
   const [sequenceMethod, setSequenceMethod] = useState<SequenceMethod>('greedy')
   const [sequenceUseVaxpress, setSequenceUseVaxpress] = useState(false)
@@ -413,7 +414,10 @@ function App() {
   }, [rnaFiles, rnaseqTask])
 
   function saveToken() {
-    localStorage.setItem('bio-agent-token', token)
+    const normalized = token.trim()
+    if (normalized) localStorage.setItem('bio-agent-token', normalized)
+    else localStorage.removeItem('bio-agent-token')
+    setToken(normalized)
     void refresh()
   }
 
@@ -424,6 +428,7 @@ function App() {
       gene_sets_csv: uploadedFiles.gene_sets?.path || 'examples/rnaseq/gene_sets.csv',
       evidence_csv: evidenceProvider === 'local' ? 'examples/rnaseq/evidence.csv' : undefined,
       evidence_provider: evidenceProvider,
+      gene_ids: geneIds.split(/[\s,;]+/).map((value) => value.trim()).filter(Boolean).slice(0, 20),
       protein,
       output_dir: 'output/frontend_auto_research',
     }
@@ -900,11 +905,11 @@ function App() {
         <main className="min-w-0 flex-1 px-5 py-5 sm:px-8 lg:px-10 lg:py-8">
           <header className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-5">
             <div className="flex items-center gap-2 font-mono text-[11px] tracking-[0.16em] text-[#74918c]"><span className="text-[#a8f0d2]">PLATFORM</span><ChevronRight size={13} /><span>{view === 'workspace' ? 'WORKSPACE' : 'DOMAINS'}</span></div>
-            <div className="flex items-center gap-3">
+            <form onSubmit={(event) => { event.preventDefault(); saveToken() }} className="flex items-center gap-3">
               <div className="hidden items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 font-mono text-[10px] text-[#8aa9a2] sm:flex"><LockKeyhole size={12} />Bearer token</div>
-              <input aria-label="API Token" value={token} onChange={(event) => setToken(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && saveToken()} type="password" className="w-32 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 font-mono text-[10px] text-[#c7ded8] outline-none transition focus:border-[#72dcb4] sm:w-48" placeholder="API token" />
-              <button onClick={saveToken} className="rounded-lg bg-[#a8f0d2] px-3 py-1.5 text-xs font-semibold text-[#092521] transition hover:bg-[#c6f8e1]">连接</button>
-            </div>
+              <input aria-label="API Token" autoComplete="off" value={token} onChange={(event) => setToken(event.target.value)} type="password" className="w-32 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 font-mono text-[10px] text-[#c7ded8] outline-none transition focus:border-[#72dcb4] sm:w-48" placeholder="本地可留空，生产请输入 Token" />
+              <button type="submit" className="rounded-lg bg-[#a8f0d2] px-3 py-1.5 text-xs font-semibold text-[#092521] transition hover:bg-[#c6f8e1]">连接</button>
+            </form>
           </header>
 
           {error && <div className="mt-5 flex items-center gap-3 rounded-xl border border-[#75483d] bg-[#2b1a1b] px-4 py-3 text-sm text-[#f5b7a4]"><XCircle size={16} />{error}<button onClick={() => setError('')} className="ml-auto text-xs underline">关闭</button></div>}
@@ -956,8 +961,9 @@ function App() {
                   {mode === 'research' ? <>
                     <label className="mt-6 block"><span className="field-label">科学问题</span><textarea value={task} onChange={(event) => { setTask(event.target.value); setResearchPlan(null) }} rows={4} className="input-area" placeholder="描述你希望 Agent 协助完成的研究任务" /></label>
                     <div className="mt-5 grid gap-4 sm:grid-cols-[0.8fr_1.2fr]"><div><label className="field-label" htmlFor="planner-mode">Planner 模式</label><select id="planner-mode" value={plannerMode} onChange={(event) => { setPlannerMode(event.target.value as PlannerMode); setResearchPlan(null) }} className="input-control"><option value="auto">Auto：有 Key 用 LLM</option><option value="deterministic">Deterministic：规则规划</option><option value="llm">LLM：必须调用模型</option></select></div><div className="flex items-end pb-1 text-xs leading-5 text-[#688983]">Auto 会在配置模型密钥时调用 LLM；模型不可用时保留 fallback 原因并回退到确定性规划。</div></div>
-                    <div className="mt-5 grid gap-4 sm:grid-cols-[1fr_0.8fr]">
+                    <div className="mt-5 grid gap-4 sm:grid-cols-3">
                       <div><label className="field-label" htmlFor="protein-context">蛋白输入上下文</label><input id="protein-context" value={protein} onChange={(event) => { setProtein(event.target.value.toUpperCase()); setResearchPlan(null) }} className="input-control font-mono tracking-[0.18em]" placeholder="例如 MKT" /></div>
+                      <div><label className="field-label" htmlFor="gene-ids-context">基因 ID（可选）</label><input id="gene-ids-context" value={geneIds} onChange={(event) => { setGeneIds(event.target.value); setResearchPlan(null) }} className="input-control font-mono" placeholder="例如 TP53, BRCA1" /><span className="mt-2 block text-[10px] leading-5 text-[#688983]">文献或在线证据任务会使用这里的基因 ID。</span></div>
                       <div><label className="field-label" htmlFor="evidence-provider">证据源</label><select id="evidence-provider" value={evidenceProvider} onChange={(event) => { setEvidenceProvider(event.target.value); setResearchPlan(null) }} className="input-control"><option value="local">本地证据</option><option value="kegg">KEGG</option><option value="ncbi_gene">NCBI Gene</option><option value="pubmed">PubMed</option><option value="uniprot">UniProt</option></select></div>
                     </div>
                     <div className="mt-5 grid gap-3 sm:grid-cols-3">
