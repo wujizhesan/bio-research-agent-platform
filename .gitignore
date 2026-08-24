@@ -34,6 +34,7 @@ frontend/vite.config.js
 frontend/vite.config.d.ts
 
 .playwright-cli/
+outputs/playwright/*.png
 
 # Local collaboration and UI state
 .chainlit/
