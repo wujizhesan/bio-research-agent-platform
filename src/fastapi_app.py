@@ -24,7 +24,7 @@ from starlette.responses import Response
 try:
     from .api_server import list_run_manifests
     from .audit_log import AuditLogger
-    from .auth import AuthService, AuthenticationError, Principal
+    from .auth import AuthService, AuthenticationError, LoginRateLimiter, Principal
     from .database import Database
     from .domain_registry import active_tool_specs
     from .file_storage import LocalFileStorage
@@ -35,7 +35,7 @@ try:
 except ImportError:
     from api_server import list_run_manifests
     from audit_log import AuditLogger
-    from auth import AuthService, AuthenticationError, Principal
+    from auth import AuthService, AuthenticationError, LoginRateLimiter, Principal
     from database import Database
     from domain_registry import active_tool_specs
     from file_storage import LocalFileStorage
@@ -213,6 +213,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
     plugins = plugin_manager or PluginManager(state_path=OUTPUT_ROOT / 'plugin_state.json')
     db = database or Database()
     auth = AuthService.from_env()
+    login_rate_limiter = LoginRateLimiter.from_env()
     audit = audit_log or AuditLogger(OUTPUT_ROOT / 'audit.jsonl')
     configured_upload_root = os.environ.get('UPLOAD_ROOT')
     upload_root = Path(configured_upload_root) if configured_upload_root else OUTPUT_ROOT / 'uploads'
@@ -381,7 +382,15 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         }
 
     @app.post('/api/v1/auth/token', tags=['auth'])
-    async def issue_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    async def issue_token(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
+        client_host = request.client.host if request.client else 'unknown'
+        rate_key = f'{client_host}:{form_data.username.strip().lower()}'
+        if not login_rate_limiter.allow(rate_key):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail='login rate limit exceeded',
+                headers={'Retry-After': str(login_rate_limiter.window_seconds)},
+            )
         try:
             payload = auth.issue_token(form_data.username, form_data.password)
         except AuthenticationError as exc:
@@ -390,6 +399,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
                 detail=str(exc),
                 headers={'WWW-Authenticate': 'Bearer'},
             ) from exc
+        login_rate_limiter.reset(rate_key)
         principal_data = payload['principal']
         audit.record(
             Principal(principal_data['sub'], tuple(principal_data['roles']), principal_data['auth_type']),

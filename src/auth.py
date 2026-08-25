@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import time
+from threading import Lock
 from typing import Any
 
 import jwt
@@ -28,6 +29,37 @@ ROLE_PERMISSIONS = {
 
 class AuthenticationError(ValueError):
     pass
+
+
+class LoginRateLimiter:
+    def __init__(self, max_attempts=5, window_seconds=60):
+        self.max_attempts = max(int(max_attempts), 1)
+        self.window_seconds = max(int(window_seconds), 1)
+        self._attempts = {}
+        self._lock = Lock()
+
+    @classmethod
+    def from_env(cls):
+        return cls(
+            max_attempts=os.environ.get('AUTH_LOGIN_RATE_LIMIT', '5'),
+            window_seconds=os.environ.get('AUTH_LOGIN_RATE_WINDOW_SECONDS', '60'),
+        )
+
+    def allow(self, key):
+        now = time.monotonic()
+        cutoff = now - self.window_seconds
+        with self._lock:
+            attempts = [value for value in self._attempts.get(key, []) if value > cutoff]
+            if len(attempts) >= self.max_attempts:
+                self._attempts[key] = attempts
+                return False
+            attempts.append(now)
+            self._attempts[key] = attempts
+            return True
+
+    def reset(self, key):
+        with self._lock:
+            self._attempts.pop(key, None)
 
 
 @dataclass(frozen=True)

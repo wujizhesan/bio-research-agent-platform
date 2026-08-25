@@ -494,6 +494,27 @@ class FastApiAppTests(unittest.TestCase):
             finally:
                 self._close_app(app)
 
+    def test_login_rate_limit_returns_429_after_failed_attempts(self):
+        users = {'alice': {'password': 'secret', 'roles': ['researcher']}}
+        with tempfile.TemporaryDirectory(prefix='fastapi_rate_limit_') as raw:
+            with patch.dict(os.environ, {
+                'CADD_API_TOKEN': '',
+                'CADD_JWT_SECRET': 'test-secret-' * 4,
+                'CADD_AUTH_USERS_JSON': json.dumps(users),
+                'AUTH_LOGIN_RATE_LIMIT': '1',
+                'AUTH_LOGIN_RATE_WINDOW_SECONDS': '60',
+            }, clear=False):
+                app = self._app(raw)
+                try:
+                    with TestClient(app) as client:
+                        first = client.post('/api/v1/auth/token', data={'username': 'alice', 'password': 'wrong'})
+                        second = client.post('/api/v1/auth/token', data={'username': 'alice', 'password': 'wrong'})
+                        self.assertEqual(first.status_code, 401)
+                        self.assertEqual(second.status_code, 429)
+                        self.assertEqual(second.headers['retry-after'], '60')
+                finally:
+                    self._close_app(app)
+
     def test_cancel_endpoint_returns_terminal_job(self):
         with tempfile.TemporaryDirectory(prefix='fastapi_cancel_') as raw:
             app = self._app(raw)
