@@ -264,6 +264,7 @@ class Database:
                 owner_subject=owner_subject,
                 created_at=created_at,
             ))
+            await session.flush()
             session.add(ProjectMemberRow(
                 project_id=project_id,
                 subject=owner_subject,

@@ -778,6 +778,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
             record = jobs.submit(payload.tool, payload.arguments, idempotency_key=idempotency_key)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await db.upsert_job(record)
         if payload.project_id:
             await db.assign_job_project(
                 record['job_id'],
@@ -785,7 +786,6 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
                 datetime.now(timezone.utc).isoformat(),
             )
             record = await expose_job(record)
-        await db.upsert_job(record)
         if not record.get('deduplicated'):
             JOB_SUBMISSIONS.labels(payload.tool).inc()
         JOB_STATUS.labels(payload.tool, record['status']).set(1)
