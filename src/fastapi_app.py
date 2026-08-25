@@ -5,10 +5,11 @@ import json
 import os
 import asyncio
 import secrets
+from datetime import datetime, timezone
 from importlib.util import find_spec
 from pathlib import Path
 from time import monotonic, time
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import jwt
@@ -62,6 +63,16 @@ class JobCreate(BaseModel):
 
 class PluginStateUpdate(BaseModel):
     enabled: bool
+
+
+class ProjectCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2000)
+
+
+class ProjectMemberCreate(BaseModel):
+    subject: str = Field(min_length=1, max_length=200)
+    role: Literal['owner', 'editor', 'viewer'] = 'viewer'
 
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl='/api/v1/auth/token', auto_error=False)
@@ -283,6 +294,17 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
                 headers={'WWW-Authenticate': 'Bearer'},
             ) from exc
 
+    async def project_access(project_id, principal, allowed_roles):
+        project = await db.get_project(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f'project not found: {project_id}')
+        if 'admin' in principal.roles or project['owner_subject'] == principal.subject:
+            return project
+        member = await db.get_project_member(project_id, principal.subject)
+        if member is None or member['role'] not in allowed_roles:
+            raise HTTPException(status_code=403, detail='project access denied')
+        return project
+
     def require_permission(permission):
         async def dependency(principal: Principal = Depends(current_principal)):
             if not auth.has_permission(principal, permission):
@@ -418,6 +440,70 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
                 },
             },
         }
+
+    @app.post('/api/v1/projects', status_code=201, tags=['projects'])
+    async def create_project(
+        payload: ProjectCreate,
+        principal: Principal = Depends(require_permission('projects:write')),
+    ):
+        project_id = uuid4().hex
+        created_at = datetime.now(timezone.utc).isoformat()
+        project = await db.create_project(
+            project_id,
+            payload.name,
+            payload.description,
+            principal.subject,
+            created_at,
+        )
+        audit.record(principal, 'project.create', 'project', project_id, {'name': payload.name})
+        return {'status': 'created', 'project': project}
+
+    @app.get('/api/v1/projects', tags=['projects'])
+    async def list_projects(
+        limit: int = Query(default=20, ge=1, le=100),
+        principal: Principal = Depends(require_permission('projects:read')),
+    ):
+        return {'status': 'ok', 'projects': await db.list_projects(principal.subject, limit)}
+
+    @app.get('/api/v1/projects/{project_id}', tags=['projects'])
+    async def get_project(
+        project_id: str,
+        principal: Principal = Depends(require_permission('projects:read')),
+    ):
+        project = await project_access(project_id, principal, {'owner', 'editor', 'viewer'})
+        return {'status': 'ok', 'project': project}
+
+    @app.get('/api/v1/projects/{project_id}/members', tags=['projects'])
+    async def list_project_members(
+        project_id: str,
+        principal: Principal = Depends(require_permission('projects:read')),
+    ):
+        await project_access(project_id, principal, {'owner', 'editor', 'viewer'})
+        return {'status': 'ok', 'members': await db.list_project_members(project_id)}
+
+    @app.post('/api/v1/projects/{project_id}/members', status_code=201, tags=['projects'])
+    async def add_project_member(
+        project_id: str,
+        payload: ProjectMemberCreate,
+        principal: Principal = Depends(require_permission('members:write')),
+    ):
+        project = await project_access(project_id, principal, {'owner'})
+        if payload.role == 'owner' and payload.subject != project['owner_subject']:
+            raise HTTPException(status_code=400, detail='project owner cannot be reassigned')
+        member = await db.upsert_project_member(
+            project_id,
+            payload.subject,
+            payload.role,
+            datetime.now(timezone.utc).isoformat(),
+        )
+        audit.record(
+            principal,
+            'project.member_upsert',
+            'project',
+            project_id,
+            {'subject': payload.subject, 'role': payload.role},
+        )
+        return {'status': 'ok', 'member': member}
 
     @app.get('/.well-known/agent-card.json', tags=['a2a'])
     async def agent_card(request: Request):

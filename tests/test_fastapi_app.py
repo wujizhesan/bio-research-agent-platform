@@ -119,6 +119,37 @@ class FastApiAppTests(unittest.TestCase):
             finally:
                 self._close_app(app)
 
+    def test_project_workspace_and_members(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_projects_') as raw:
+            app = self._app(raw)
+            try:
+                with TestClient(app) as client:
+                    created = client.post('/api/v1/projects', json={
+                        'name': 'EGFR research',
+                        'description': 'Shared workspace',
+                    })
+                    self.assertEqual(created.status_code, 201)
+                    project = created.json()['project']
+                    project_id = project['project_id']
+                    self.assertEqual(project['owner_subject'], 'local-dev')
+
+                    listed = client.get('/api/v1/projects')
+                    self.assertEqual(listed.status_code, 200)
+                    self.assertEqual(listed.json()['projects'][0]['project_id'], project_id)
+
+                    member = client.post(f'/api/v1/projects/{project_id}/members', json={
+                        'subject': 'alice',
+                        'role': 'editor',
+                    })
+                    self.assertEqual(member.status_code, 201)
+                    self.assertEqual(member.json()['member']['role'], 'editor')
+
+                    members = client.get(f'/api/v1/projects/{project_id}/members')
+                    self.assertEqual(members.status_code, 200)
+                    self.assertEqual({item['subject'] for item in members.json()['members']}, {'local-dev', 'alice'})
+            finally:
+                self._close_app(app)
+
     def test_capabilities_expose_rest_sse_mcp_and_embedded_surfaces(self):
         with tempfile.TemporaryDirectory(prefix='fastapi_capabilities_') as raw:
             app = self._app(raw)

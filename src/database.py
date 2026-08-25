@@ -2,7 +2,7 @@
 from pathlib import Path
 import os
 
-from sqlalchemy import Boolean, Float, Integer, JSON, String, Text, inspect, or_, select, text
+from sqlalchemy import Boolean, Float, ForeignKey, Integer, JSON, String, Text, inspect, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -45,6 +45,27 @@ class JobRow(Base):
     cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lease_until: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class ProjectRow(Base):
+    __tablename__ = 'projects'
+
+    project_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    owner_subject: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    created_at: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+
+
+class ProjectMemberRow(Base):
+    __tablename__ = 'project_members'
+
+    project_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey('projects.project_id', ondelete='CASCADE'), primary_key=True,
+    )
+    subject: Mapped[str] = mapped_column(String(200), primary_key=True)
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default='viewer')
+    created_at: Mapped[str] = mapped_column(String(64), nullable=False)
 
 
 def _row_values(record):
@@ -102,6 +123,16 @@ def _public_row(row):
     if row.cancel_requested:
         output['cancel_requested'] = True
     return output
+
+
+def _public_project(row):
+    return {
+        'project_id': row.project_id,
+        'name': row.name,
+        'description': row.description,
+        'owner_subject': row.owner_subject,
+        'created_at': row.created_at,
+    }
 
 
 class Database:
@@ -203,6 +234,100 @@ class Database:
         async with self.sessions() as session:
             rows = (await session.execute(statement)).scalars().all()
             return [_public_row(row) for row in rows]
+
+    async def create_project(self, project_id, name, description, owner_subject, created_at):
+        async with self.sessions() as session:
+            session.add(ProjectRow(
+                project_id=project_id,
+                name=name,
+                description=description,
+                owner_subject=owner_subject,
+                created_at=created_at,
+            ))
+            session.add(ProjectMemberRow(
+                project_id=project_id,
+                subject=owner_subject,
+                role='owner',
+                created_at=created_at,
+            ))
+            await session.commit()
+            row = await session.get(ProjectRow, project_id)
+            return _public_project(row)
+
+    async def get_project(self, project_id):
+        async with self.sessions() as session:
+            row = await session.get(ProjectRow, str(project_id))
+            return _public_project(row) if row else None
+
+    async def list_projects(self, subject, limit=20):
+        size = min(max(int(limit), 1), 100)
+        statement = (
+            select(ProjectRow)
+            .join(ProjectMemberRow, ProjectMemberRow.project_id == ProjectRow.project_id)
+            .where(ProjectMemberRow.subject == str(subject))
+            .order_by(ProjectRow.created_at.desc())
+            .limit(size)
+        )
+        async with self.sessions() as session:
+            rows = (await session.execute(statement)).scalars().all()
+            return [_public_project(row) for row in rows]
+
+    async def get_project_member(self, project_id, subject):
+        async with self.sessions() as session:
+            row = await session.get(ProjectMemberRow, {
+                'project_id': str(project_id),
+                'subject': str(subject),
+            })
+            if row is None:
+                return None
+            return {
+                'project_id': row.project_id,
+                'subject': row.subject,
+                'role': row.role,
+                'created_at': row.created_at,
+            }
+
+    async def list_project_members(self, project_id):
+        statement = (
+            select(ProjectMemberRow)
+            .where(ProjectMemberRow.project_id == str(project_id))
+            .order_by(ProjectMemberRow.created_at)
+        )
+        async with self.sessions() as session:
+            rows = (await session.execute(statement)).scalars().all()
+            return [
+                {
+                    'project_id': row.project_id,
+                    'subject': row.subject,
+                    'role': row.role,
+                    'created_at': row.created_at,
+                }
+                for row in rows
+            ]
+
+    async def upsert_project_member(self, project_id, subject, role, created_at):
+        async with self.sessions() as session:
+            row = await session.get(ProjectMemberRow, {
+                'project_id': str(project_id),
+                'subject': str(subject),
+            })
+            if row is None:
+                row = ProjectMemberRow(
+                    project_id=str(project_id),
+                    subject=str(subject),
+                    role=role,
+                    created_at=created_at,
+                )
+                session.add(row)
+            else:
+                row.role = role
+            await session.commit()
+            return {
+                'project_id': row.project_id,
+                'subject': row.subject,
+                'role': row.role,
+                'created_at': row.created_at,
+            }
 
     async def close(self):
         await self.engine.dispose()

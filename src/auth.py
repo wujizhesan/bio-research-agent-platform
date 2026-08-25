@@ -15,13 +15,14 @@ import jwt
 ROLE_PERMISSIONS = {
     'admin': frozenset({
         'catalog:read', 'files:read', 'files:write', 'jobs:read', 'jobs:write',
-        'metrics:read', 'plugins:write', 'runs:read',
+        'metrics:read', 'members:write', 'plugins:write', 'projects:read',
+        'projects:write', 'runs:read',
     }),
     'researcher': frozenset({
         'catalog:read', 'files:read', 'files:write', 'jobs:read', 'jobs:write',
-        'runs:read',
+        'members:write', 'projects:read', 'projects:write', 'runs:read',
     }),
-    'viewer': frozenset({'catalog:read', 'files:read', 'jobs:read', 'runs:read'}),
+    'viewer': frozenset({'catalog:read', 'files:read', 'jobs:read', 'projects:read', 'runs:read'}),
 }
 
 
