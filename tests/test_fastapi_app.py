@@ -113,6 +113,7 @@ class FastApiAppTests(unittest.TestCase):
                     health = client.get('/health', headers={'X-Request-ID': 'interview-trace-001'})
                     self.assertEqual(health.status_code, 200)
                     self.assertEqual(health.json()['database'], 'ok')
+                    self.assertEqual(health.json()['storage_backend'], 'local')
                     self.assertEqual(health.headers['x-request-id'], 'interview-trace-001')
                     self.assertIn('/api/v1/jobs', client.get('/openapi.json').json()['paths'])
                     self.assertIn('bio_agent_http_requests_total', client.get('/metrics').text)

@@ -70,3 +70,13 @@ REDIS_WORKER_ACTIVE = Gauge(
     'Number of jobs currently executing in this Redis worker process.',
     ['namespace'],
 )
+FILE_OPERATIONS = Counter(
+    'bio_agent_file_operations_total',
+    'File storage operations by backend and outcome.',
+    ['backend', 'operation', 'outcome'],
+)
+FILE_UPLOAD_BYTES = Counter(
+    'bio_agent_file_upload_bytes_total',
+    'Total bytes accepted by the file storage layer.',
+    ['backend'],
+)

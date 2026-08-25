@@ -27,10 +27,10 @@ try:
     from .auth import AuthService, AuthenticationError, LoginRateLimiter, Principal
     from .database import Database
     from .domain_registry import active_tool_specs
-    from .file_storage import LocalFileStorage
+    from .file_storage import LocalFileStorage, S3FileStorage
     from .job_manager import JobManager
     from .plugin_manager import PluginManager
-    from .observability import HTTP_LATENCY, HTTP_REQUESTS, JOB_STATUS, JOB_SUBMISSIONS, REQUEST_ID, request_id
+    from .observability import FILE_OPERATIONS, FILE_UPLOAD_BYTES, HTTP_LATENCY, HTTP_REQUESTS, JOB_STATUS, JOB_SUBMISSIONS, REQUEST_ID, request_id
     from .redis_job_manager import RedisJobManager
 except ImportError:
     from api_server import list_run_manifests
@@ -38,10 +38,10 @@ except ImportError:
     from auth import AuthService, AuthenticationError, LoginRateLimiter, Principal
     from database import Database
     from domain_registry import active_tool_specs
-    from file_storage import LocalFileStorage
+    from file_storage import LocalFileStorage, S3FileStorage
     from job_manager import JobManager
     from plugin_manager import PluginManager
-    from observability import HTTP_LATENCY, HTTP_REQUESTS, JOB_STATUS, JOB_SUBMISSIONS, REQUEST_ID, request_id
+    from observability import FILE_OPERATIONS, FILE_UPLOAD_BYTES, HTTP_LATENCY, HTTP_REQUESTS, JOB_STATUS, JOB_SUBMISSIONS, REQUEST_ID, request_id
     from redis_job_manager import RedisJobManager
 
 
@@ -219,10 +219,25 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
     upload_root = Path(configured_upload_root) if configured_upload_root else OUTPUT_ROOT / 'uploads'
     if not upload_root.is_absolute():
         upload_root = PROJECT_ROOT / upload_root
-    storage = file_storage or LocalFileStorage(
-        upload_root,
-        max_bytes=int(os.environ.get('UPLOAD_MAX_BYTES', str(50 * 1024 * 1024))),
-    )
+    upload_max_bytes = int(os.environ.get('UPLOAD_MAX_BYTES', str(50 * 1024 * 1024)))
+    storage_backend = os.environ.get('STORAGE_BACKEND', 'local').strip().lower()
+    if file_storage is not None:
+        storage = file_storage
+    elif storage_backend == 'local':
+        storage = LocalFileStorage(upload_root, max_bytes=upload_max_bytes)
+    elif storage_backend == 's3':
+        storage = S3FileStorage(
+            upload_root,
+            bucket=os.environ.get('S3_BUCKET', ''),
+            prefix=os.environ.get('S3_PREFIX', 'bio-agent'),
+            endpoint_url=os.environ.get('S3_ENDPOINT_URL') or None,
+            region_name=os.environ.get('S3_REGION') or None,
+            access_key_id=os.environ.get('AWS_ACCESS_KEY_ID') or None,
+            secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY') or None,
+            max_bytes=upload_max_bytes,
+        )
+    else:
+        raise ValueError(f'unsupported STORAGE_BACKEND: {storage_backend}')
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -244,6 +259,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
     app.state.plugin_manager = plugins
     app.state.database = db
     app.state.file_storage = storage
+    app.state.storage_backend = getattr(storage, 'backend', storage_backend)
     app.state.audit_log = audit
     app.state.auth_service = auth
     stream_ticket_secret = auth.jwt_secret or secrets.token_urlsafe(32)
@@ -379,6 +395,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
             'version': API_VERSION,
             'database': 'ok',
             'job_backend': app.state.job_backend,
+            'storage_backend': app.state.storage_backend,
         }
 
     @app.post('/api/v1/auth/token', tags=['auth'])
@@ -709,9 +726,15 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         try:
             stored = await storage.save(upload)
         except ValueError as exc:
+            FILE_OPERATIONS.labels(app.state.storage_backend, 'upload', 'rejected').inc()
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception:
+            FILE_OPERATIONS.labels(app.state.storage_backend, 'upload', 'error').inc()
+            raise
         finally:
             await upload.close()
+        FILE_OPERATIONS.labels(app.state.storage_backend, 'upload', 'success').inc()
+        FILE_UPLOAD_BYTES.labels(app.state.storage_backend).inc(stored.size_bytes)
         audit.record(
             principal,
             'file.upload',
@@ -735,9 +758,15 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         if project_id:
             await project_access(project_id, principal, {'owner', 'editor', 'viewer'})
         try:
-            stored = storage.get(file_id)
+            async_get = getattr(storage, 'aget', None)
+            stored = await async_get(file_id) if async_get else storage.get(file_id)
         except FileNotFoundError as exc:
+            FILE_OPERATIONS.labels(app.state.storage_backend, 'download', 'not_found').inc()
             raise HTTPException(status_code=404, detail=f'file not found: {file_id}') from exc
+        except Exception:
+            FILE_OPERATIONS.labels(app.state.storage_backend, 'download', 'error').inc()
+            raise
+        FILE_OPERATIONS.labels(app.state.storage_backend, 'download', 'success').inc()
         audit.record(principal, 'file.download', 'file', file_id, {'filename': stored.filename})
         return FileResponse(
             stored.path,
