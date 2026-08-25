@@ -2557,6 +2557,7 @@ TOOLS = {
         'parameters': _parameters({
             'de_csv': {'type': 'string'},
             'pathway_csv': {'type': 'string'},
+            'evidence': {'type': 'object'},
             'output_md': {'type': 'string'},
         }, required=('de_csv', 'pathway_csv', 'output_md')),
         'function': generate_omics_report,

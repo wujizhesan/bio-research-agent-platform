@@ -56,10 +56,12 @@ steps:
     depends_on:
       - pathway_enrichment
       - literature_summary
+      - literature_search
       - knowledge_search
     args:
       de_csv: ${differential_expression.output_csv}
       pathway_csv: ${pathway_enrichment.output_csv}
+      evidence: ${literature_search.result}
       output_md: output/bgi_research_demo/omics_report.md
 
   - id: sequence_design
