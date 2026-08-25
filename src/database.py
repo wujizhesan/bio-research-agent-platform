@@ -68,6 +68,26 @@ class ProjectMemberRow(Base):
     created_at: Mapped[str] = mapped_column(String(64), nullable=False)
 
 
+class JobProjectRow(Base):
+    __tablename__ = 'job_projects'
+
+    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey('projects.project_id', ondelete='CASCADE'), nullable=False, index=True,
+    )
+    created_at: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class FileProjectRow(Base):
+    __tablename__ = 'file_projects'
+
+    file_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey('projects.project_id', ondelete='CASCADE'), nullable=False, index=True,
+    )
+    created_at: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
 def _row_values(record):
     return {
         'job_id': record['job_id'],
@@ -328,6 +348,42 @@ class Database:
                 'role': row.role,
                 'created_at': row.created_at,
             }
+
+    async def assign_job_project(self, job_id, project_id, created_at):
+        async with self.sessions() as session:
+            row = await session.get(JobProjectRow, str(job_id))
+            if row is None:
+                session.add(JobProjectRow(
+                    job_id=str(job_id),
+                    project_id=str(project_id),
+                    created_at=created_at,
+                ))
+            else:
+                row.project_id = str(project_id)
+            await session.commit()
+
+    async def get_job_project(self, job_id):
+        async with self.sessions() as session:
+            row = await session.get(JobProjectRow, str(job_id))
+            return row.project_id if row else None
+
+    async def assign_file_project(self, file_id, project_id, created_at):
+        async with self.sessions() as session:
+            row = await session.get(FileProjectRow, str(file_id))
+            if row is None:
+                session.add(FileProjectRow(
+                    file_id=str(file_id),
+                    project_id=str(project_id),
+                    created_at=created_at,
+                ))
+            else:
+                row.project_id = str(project_id)
+            await session.commit()
+
+    async def get_file_project(self, file_id):
+        async with self.sessions() as session:
+            row = await session.get(FileProjectRow, str(file_id))
+            return row.project_id if row else None
 
     async def close(self):
         await self.engine.dispose()

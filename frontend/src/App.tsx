@@ -131,6 +131,14 @@ type UploadedFile = {
   download_url: string
 }
 
+type Project = {
+  project_id: string
+  name: string
+  description?: string | null
+  owner_subject: string
+  created_at: string
+}
+
 type RnaPreflightItem = {
   label: string
   detail: string
@@ -150,7 +158,6 @@ const defaultApiBase = runtimeApiBase || import.meta.env.VITE_API_BASE_URL || (
     ? 'http://127.0.0.1:8000'
     : ''
 )
-
 const statusLabels: Record<string, string> = {
   queued: '排队中',
   running: '执行中',
@@ -249,9 +256,10 @@ async function apiFetch<T>(base: string, token: string, path: string, init: Requ
   return payload as T
 }
 
-async function uploadFile(base: string, token: string, file: File): Promise<UploadedFile> {
+async function uploadFile(base: string, token: string, file: File, projectId = ''): Promise<UploadedFile> {
   const body = new FormData()
   body.append('upload', file)
+  if (projectId) body.append('project_id', projectId)
   const response = await fetch(`${base}/api/v1/files`, {
     method: 'POST',
     body,
@@ -361,6 +369,8 @@ function App() {
   const [apiBase] = useState(defaultApiBase)
   const [token, setToken] = useState(() => localStorage.getItem('bio-agent-token') || import.meta.env.VITE_API_TOKEN || '')
   const [tokenDraft, setTokenDraft] = useState(() => token)
+  const [projects, setProjects] = useState<Project[]>([])
+  const [selectedProjectId, setSelectedProjectId] = useState('')
   const [plugins, setPlugins] = useState<Plugin[]>([])
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null)
   const [jobs, setJobs] = useState<Job[]>([])
@@ -407,13 +417,17 @@ function App() {
   const refresh = useCallback(async (authToken = token) => {
     setError('')
     try {
-      const [pluginPayload, jobPayload, capabilityPayload] = await Promise.all([
+      const [pluginPayload, jobPayload, capabilityPayload, projectPayload] = await Promise.all([
         apiFetch<{ plugins: Plugin[] }>(apiBase, authToken, '/api/v1/plugins'),
         apiFetch<{ jobs: Job[] }>(apiBase, authToken, '/api/v1/jobs?limit=8'),
         apiFetch<Capabilities>(apiBase, authToken, '/api/v1/capabilities'),
+        apiFetch<{ projects: Project[] }>(apiBase, authToken, '/api/v1/projects'),
       ])
       setPlugins(pluginPayload.plugins || [])
       setCapabilities(capabilityPayload)
+      const nextProjects = projectPayload.projects || []
+      setProjects(nextProjects)
+      setSelectedProjectId((current) => nextProjects.some((project) => project.project_id === current) ? current : nextProjects[0]?.project_id || '')
       setJobs((current) => mergeJobList(current, jobPayload.jobs || []))
       setConnected(true)
     } catch (err) {
@@ -473,6 +487,21 @@ function App() {
     setTokenDraft(normalized)
     setToken(normalized)
     if (normalized === token) void refresh(normalized)
+  }
+
+  async function createProject() {
+    const name = window.prompt('项目名称')?.trim()
+    if (!name) return
+    try {
+      const payload = await apiFetch<{ project: Project }>(apiBase, token, '/api/v1/projects', {
+        method: 'POST',
+        body: JSON.stringify({ name }),
+      })
+      setProjects((current) => [payload.project, ...current])
+      setSelectedProjectId(payload.project.project_id)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '项目创建失败')
+    }
   }
 
   function applyResearchPreset(preset: ResearchPreset) {
@@ -573,7 +602,7 @@ function App() {
     setUploadingFile(slot)
     setError('')
     try {
-      const uploaded = await uploadFile(apiBase, token, file)
+      const uploaded = await uploadFile(apiBase, token, file, selectedProjectId)
       setUploadedFiles((current) => ({ ...current, [slot]: uploaded }))
       setResearchPlan(null)
     } catch (err) {
@@ -589,7 +618,7 @@ function App() {
     setError('')
     try {
       const uploaded: UploadedFile[] = []
-      for (const file of Array.from(files)) uploaded.push(await uploadFile(apiBase, token, file))
+      for (const file of Array.from(files)) uploaded.push(await uploadFile(apiBase, token, file, selectedProjectId))
       const values = slot === 'fastq_r1' || slot === 'fastq_r2' ? uploaded : uploaded.slice(0, 1)
       setRnaFiles((current) => ({ ...current, [slot]: values }))
       setResearchPlan(null)
@@ -623,7 +652,7 @@ function App() {
         method: 'POST',
         signal: controller.signal,
         headers: { 'Idempotency-Key': crypto.randomUUID() },
-        body: JSON.stringify({ tool, arguments: arguments_ }),
+        body: JSON.stringify({ tool, arguments: arguments_, project_id: selectedProjectId || undefined }),
       })
       const job = response.job
       setSelectedJob(job)
@@ -899,6 +928,13 @@ function App() {
         <main className="min-w-0 flex-1 px-5 py-5 sm:px-8 lg:px-10 lg:py-8">
           <header className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-5">
             <div className="flex items-center gap-2 font-mono text-[11px] tracking-[0.16em] text-[#74918c]"><span className="text-[#a8f0d2]">平台</span><ChevronRight size={13} /><span>{view === 'workspace' ? '工作台' : '领域'}</span></div>
+            <div className="flex items-center gap-2">
+              <select aria-label="当前项目" value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.target.value)} className="max-w-44 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-xs text-[#c7ded8] outline-none focus:border-[#72dcb4]">
+                <option value="">未选择项目</option>
+                {projects.map((project) => <option key={project.project_id} value={project.project_id}>{project.name}</option>)}
+              </select>
+              <button type="button" onClick={() => void createProject()} className="rounded-lg border border-[#28524b] px-2.5 py-1.5 text-xs text-[#a8f0d2] transition hover:bg-[#102b2a]">新建项目</button>
+            </div>
             <form onSubmit={(event) => { event.preventDefault(); saveToken() }} className="flex items-center gap-3">
               <div className="hidden items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 font-mono text-[10px] text-[#8aa9a2] sm:flex"><LockKeyhole size={12} />访问令牌</div>
               <input aria-label="访问令牌" autoComplete="off" value={tokenDraft} onChange={(event) => setTokenDraft(event.target.value)} type="password" className="w-32 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 font-mono text-[10px] text-[#c7ded8] outline-none transition focus:border-[#72dcb4] sm:w-48" placeholder="本地可留空，生产请输入 Token" />

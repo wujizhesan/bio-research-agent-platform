@@ -147,6 +147,28 @@ class FastApiAppTests(unittest.TestCase):
                     members = client.get(f'/api/v1/projects/{project_id}/members')
                     self.assertEqual(members.status_code, 200)
                     self.assertEqual({item['subject'] for item in members.json()['members']}, {'local-dev', 'alice'})
+
+                    uploaded = client.post(
+                        '/api/v1/files',
+                        data={'project_id': project_id},
+                        files={'upload': ('notes.txt', b'project notes', 'text/plain')},
+                    )
+                    self.assertEqual(uploaded.status_code, 201)
+                    self.assertEqual(uploaded.json()['file']['project_id'], project_id)
+
+                    submitted = client.post('/api/v1/jobs', json={
+                        'tool': 'research_catalog',
+                        'arguments': {},
+                        'project_id': project_id,
+                    })
+                    self.assertEqual(submitted.status_code, 202)
+                    job_id = submitted.json()['job']['job_id']
+                    self.assertEqual(submitted.json()['job']['project_id'], project_id)
+                    completed = self._wait_for_job(client, job_id)
+                    self.assertEqual(completed['project_id'], project_id)
+                    filtered = client.get(f'/api/v1/jobs?project_id={project_id}')
+                    self.assertEqual(filtered.status_code, 200)
+                    self.assertIn(job_id, {item['job_id'] for item in filtered.json()['jobs']})
             finally:
                 self._close_app(app)
 

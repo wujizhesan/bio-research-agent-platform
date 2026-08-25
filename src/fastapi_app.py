@@ -13,7 +13,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 import jwt
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -59,6 +59,7 @@ ARTIFACT_RESULT_KEYS = frozenset({
 class JobCreate(BaseModel):
     tool: str = Field(min_length=1, max_length=200)
     arguments: dict[str, Any] = Field(default_factory=dict)
+    project_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class PluginStateUpdate(BaseModel):
@@ -304,6 +305,20 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         if member is None or member['role'] not in allowed_roles:
             raise HTTPException(status_code=403, detail='project access denied')
         return project
+
+    async def job_access(job_id, principal, allowed_roles):
+        project_id = await db.get_job_project(job_id)
+        if project_id:
+            await project_access(project_id, principal, allowed_roles)
+        return project_id
+
+    async def expose_job(record):
+        if record is None:
+            return None
+        project_id = await db.get_job_project(record['job_id'])
+        if not project_id:
+            return record
+        return {**record, 'project_id': project_id}
 
     def require_permission(permission):
         async def dependency(principal: Principal = Depends(current_principal)):
@@ -676,8 +691,11 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
     @app.post('/api/v1/files', status_code=201, tags=['files'])
     async def upload_file(
         upload: UploadFile = File(...),
+        project_id: str | None = Form(default=None, min_length=1, max_length=64),
         principal: Principal = Depends(require_permission('files:write')),
     ):
+        if project_id:
+            await project_access(project_id, principal, {'owner', 'editor'})
         try:
             stored = await storage.save(upload)
         except ValueError as exc:
@@ -691,13 +709,21 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
             stored.file_id,
             {'filename': stored.filename, 'size_bytes': stored.size_bytes, 'sha256': stored.sha256},
         )
+        if project_id:
+            await db.assign_file_project(file_id=stored.file_id, project_id=project_id, created_at=datetime.now(timezone.utc).isoformat())
         return {
             'status': 'uploaded',
-            'file': storage.payload(stored, PROJECT_ROOT, f'/api/v1/files/{stored.file_id}'),
+            'file': {
+                **storage.payload(stored, PROJECT_ROOT, f'/api/v1/files/{stored.file_id}'),
+                'project_id': project_id,
+            },
         }
 
     @app.get('/api/v1/files/{file_id}', tags=['files'])
     async def download_file(file_id: str, principal: Principal = Depends(require_permission('files:read'))):
+        project_id = await db.get_file_project(file_id)
+        if project_id:
+            await project_access(project_id, principal, {'owner', 'editor', 'viewer'})
         try:
             stored = storage.get(file_id)
         except FileNotFoundError as exc:
@@ -718,17 +744,17 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
                 record = None
             if record is not None:
                 JOB_STATUS.labels(record['tool'], record['status']).set(1)
-                return record
+                return await expose_job(record)
             record = await db.get_job(job_id)
             if record is not None:
                 JOB_STATUS.labels(record['tool'], record['status']).set(1)
-            return record
+            return await expose_job(record)
         record = jobs.get(job_id)
         if record is not None:
             await db.upsert_job(record)
             JOB_STATUS.labels(record['tool'], record['status']).set(1)
-            return record
-        return await db.get_job(job_id)
+            return await expose_job(record)
+        return await expose_job(await db.get_job(job_id))
 
     @app.post('/api/v1/jobs', status_code=202, tags=['jobs'])
     async def submit_job(
@@ -736,10 +762,19 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         idempotency_key: str | None = Header(default=None, alias='Idempotency-Key'),
         principal: Principal = Depends(require_permission('jobs:write')),
     ):
+        if payload.project_id:
+            await project_access(payload.project_id, principal, {'owner', 'editor'})
         try:
             record = jobs.submit(payload.tool, payload.arguments, idempotency_key=idempotency_key)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if payload.project_id:
+            await db.assign_job_project(
+                record['job_id'],
+                payload.project_id,
+                datetime.now(timezone.utc).isoformat(),
+            )
+            record = await expose_job(record)
         await db.upsert_job(record)
         if not record.get('deduplicated'):
             JOB_SUBMISSIONS.labels(payload.tool).inc()
@@ -753,25 +788,50 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         )
         return {'status': 'deduplicated' if record.get('deduplicated') else 'accepted', 'job': record}
 
-    @app.get('/api/v1/jobs', dependencies=[Depends(require_permission('jobs:read'))], tags=['jobs'])
-    async def list_jobs(limit: int = Query(default=20, ge=1, le=100)):
+    @app.get('/api/v1/jobs', tags=['jobs'])
+    async def list_jobs(
+        limit: int = Query(default=20, ge=1, le=100),
+        project_id: str | None = Query(default=None, min_length=1, max_length=64),
+        principal: Principal = Depends(require_permission('jobs:read')),
+    ):
+        if project_id:
+            await project_access(project_id, principal, {'owner', 'editor', 'viewer'})
+        visible_projects = None if 'admin' in principal.roles else {
+            item['project_id'] for item in await db.list_projects(principal.subject, 100)
+        }
+
+        async def visible(record):
+            item = await expose_job(record)
+            item_project = item.get('project_id')
+            if project_id and item_project != project_id:
+                return None
+            if item_project and visible_projects is not None and item_project not in visible_projects:
+                return None
+            return item
+
         if app.state.job_backend == 'redis':
             records = await db.list_jobs(limit)
             if records:
+                records = [item for item in [await visible(record) for record in records] if item is not None]
                 for record in records:
                     JOB_STATUS.labels(record['tool'], record['status']).set(1)
                 return {'status': 'ok', 'jobs': records}
         records = jobs.list(limit)
+        records = [item for item in [await visible(record) for record in records] if item is not None]
         for record in records:
             await db.upsert_job(record)
             JOB_STATUS.labels(record['tool'], record['status']).set(1)
         return {'status': 'ok', 'jobs': records}
 
-    @app.get('/api/v1/jobs/{job_id}', dependencies=[Depends(require_permission('jobs:read'))], tags=['jobs'])
-    async def get_job(job_id: str):
+    @app.get('/api/v1/jobs/{job_id}', tags=['jobs'])
+    async def get_job(
+        job_id: str,
+        principal: Principal = Depends(require_permission('jobs:read')),
+    ):
         record = await read_job(job_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f'job not found: {job_id}')
+        await job_access(job_id, principal, {'owner', 'editor', 'viewer'})
         return {'status': 'ok', 'job': record}
 
     @app.post('/api/v1/jobs/{job_id}/events/ticket', tags=['jobs'])
@@ -781,6 +841,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
     ):
         if await read_job(job_id) is None:
             raise HTTPException(status_code=404, detail=f'job not found: {job_id}')
+        await job_access(job_id, principal, {'owner', 'editor', 'viewer'})
         return {
             'status': 'ok',
             'ticket': issue_stream_ticket(job_id, principal),
@@ -796,6 +857,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         record = await read_job(job_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f'job not found: {job_id}')
+        await job_access(job_id, principal, {'owner', 'editor', 'viewer'})
         allowed_paths = {
             _resolve_artifact_path(path, OUTPUT_ROOT)
             for path in _iter_artifact_values(record.get('result'))
@@ -815,6 +877,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
     ):
         if await read_job(job_id) is None:
             raise HTTPException(status_code=404, detail=f'job not found: {job_id}')
+        await job_access(job_id, principal, {'owner', 'editor', 'viewer'})
         subscriber = None
         if app.state.job_backend == 'redis':
             subscribe = getattr(jobs, 'subscribe_job_events', None)
@@ -872,6 +935,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
 
     @app.post('/api/v1/jobs/{job_id}/cancel', status_code=202, tags=['jobs'])
     async def cancel_job(job_id: str, principal: Principal = Depends(require_permission('jobs:write'))):
+        await job_access(job_id, principal, {'owner', 'editor'})
         try:
             record = jobs.cancel(job_id)
         except ValueError as exc:
@@ -885,11 +949,19 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
 
     @app.post('/api/v1/jobs/{job_id}/retry', status_code=202, tags=['jobs'])
     async def retry_job(job_id: str, principal: Principal = Depends(require_permission('jobs:write'))):
+        project_id = await job_access(job_id, principal, {'owner', 'editor'})
         try:
             record = jobs.retry(job_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         await db.upsert_job(record)
+        if project_id:
+            await db.assign_job_project(
+                record['job_id'],
+                project_id,
+                datetime.now(timezone.utc).isoformat(),
+            )
+            record = await expose_job(record)
         JOB_SUBMISSIONS.labels(record['tool']).inc()
         JOB_STATUS.labels(record['tool'], record['status']).set(1)
         audit.record(principal, 'job.retry', 'job', record['job_id'], {'retry_of': job_id})
