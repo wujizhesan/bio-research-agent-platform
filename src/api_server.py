@@ -1,8 +1,11 @@
-"""Local HTTP adapter for the unified bioinformatics tool registry."""
+"""Deprecated local HTTP adapter retained temporarily for compatibility."""
 import argparse
 import hmac
 import json
 import os
+import warnings
+from datetime import datetime, timezone
+from email.utils import format_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -21,10 +24,67 @@ except ImportError:
 
 API_NAME = 'cadd-bio-agent-api'
 API_VERSION = '0.1.0'
+LEGACY_API_REMOVAL_AT = datetime(2026, 12, 31, tzinfo=timezone.utc)
+LEGACY_API_REMOVAL_DATE = LEGACY_API_REMOVAL_AT.date()
+LEGACY_API_SUNSET = format_datetime(LEGACY_API_REMOVAL_AT, usegmt=True)
+LEGACY_API_MIGRATION_URL = (
+    'https://github.com/wujizhesan/bio-research-agent-platform/blob/'
+    'platform-main/README.md'
+)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_ROOT = PROJECT_ROOT / 'output'
 JOB_MANAGER = None
 PLUGIN_MANAGER = PluginManager(state_path=OUTPUT_ROOT / 'plugin_state.json')
+
+
+def _utc_today():
+    return datetime.now(timezone.utc).date()
+
+
+def legacy_api_lifecycle(today=None):
+    current = today or _utc_today()
+    return {
+        'deprecated': True,
+        'removal_date': LEGACY_API_REMOVAL_DATE.isoformat(),
+        'expired': current >= LEGACY_API_REMOVAL_DATE,
+        'successor': 'FastAPI',
+        'command': 'bio-agent-api',
+    }
+
+
+def legacy_api_response_headers():
+    return {
+        'Deprecation': 'true',
+        'Sunset': LEGACY_API_SUNSET,
+        'Link': f'<{LEGACY_API_MIGRATION_URL}>; rel="deprecation"',
+        'Warning': (
+            '299 cadd-bio-agent-api "Deprecated API; migrate to FastAPI '
+            f'before {LEGACY_API_REMOVAL_DATE.isoformat()}"'
+        ),
+        'X-API-Successor': 'FastAPI; command="bio-agent-api"',
+    }
+
+
+def ensure_legacy_api_available(today=None):
+    lifecycle = legacy_api_lifecycle(today)
+    if os.environ.get('APP_ENV', 'development').strip().lower() in {
+        'production', 'prod'
+    }:
+        raise SystemExit(
+            'legacy api_server is disabled in production; use bio-agent-api'
+        )
+    if lifecycle['expired']:
+        raise SystemExit(
+            'legacy api_server reached its removal date on '
+            f'{lifecycle["removal_date"]}; use bio-agent-api'
+        )
+    warnings.warn(
+        'api_server is deprecated and will stop starting on '
+        f'{lifecycle["removal_date"]}; migrate to bio-agent-api',
+        FutureWarning,
+        stacklevel=2,
+    )
+    return lifecycle
 
 
 def _default_job_manager():
@@ -133,7 +193,12 @@ def route_request(method, target, payload=None, output_root=None, job_manager=No
             jobs = _default_job_manager()
         return jobs
     if method == 'GET' and path in {'/', '/health'}:
-        return 200, {'status': 'ok', 'service': API_NAME, 'version': API_VERSION}
+        return 200, {
+            'status': 'ok',
+            'service': API_NAME,
+            'version': API_VERSION,
+            'lifecycle': legacy_api_lifecycle(),
+        }
     if method == 'GET' and path == '/plugins':
         return 200, {'status': 'ok', 'plugins': plugins.list()}
     if method == 'POST' and path == '/plugins/validate':
@@ -249,12 +314,24 @@ class BioAPIHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(data)))
-        for name, value in (headers or {}).items():
+        response_headers = legacy_api_response_headers()
+        response_headers.update(headers or {})
+        for name, value in response_headers.items():
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 
     def _check_auth(self):
+        lifecycle = legacy_api_lifecycle()
+        if lifecycle['expired']:
+            self._write(410, {
+                'status': 'error',
+                'error': (
+                    'legacy api_server has been removed; use bio-agent-api'
+                ),
+                'lifecycle': lifecycle,
+            })
+            return False
         if is_authorized(self.path, self.headers):
             return True
         self._write(401, {'status': 'error', 'error': 'authentication required'}, {'WWW-Authenticate': 'Bearer'})
@@ -288,12 +365,7 @@ class BioAPIHandler(BaseHTTPRequestHandler):
 
 
 def main(argv=None):
-    if os.environ.get('APP_ENV', 'development').strip().lower() in {
-        'production', 'prod'
-    }:
-        raise SystemExit(
-            'legacy api_server is disabled in production; use fastapi_app'
-        )
+    ensure_legacy_api_available()
     parser = argparse.ArgumentParser(description='Run the local bioinformatics HTTP API')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8765)

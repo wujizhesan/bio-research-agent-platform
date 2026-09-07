@@ -36,6 +36,8 @@ bio-agent-api --port 8000
 
 服务启动后访问 `http://127.0.0.1:8000/docs`。`CADD_API_TOKEN` 仅保留给本地兼容测试；`APP_ENV=production` 时平台会拒绝该 Token 并强制要求至少 32 字符的 `CADD_JWT_SECRET`。Secret 和用户配置也可分别通过 `CADD_JWT_SECRET_FILE`、`CADD_AUTH_USERS_FILE` 从外部 Secret 挂载读取。生产环境同时禁用旧 `api_server`，只允许 FastAPI JWT 入口。角色支持 `admin`、`researcher` 和 `viewer`，任务提交、文件上传下载和插件状态变更会写入 `output/audit.jsonl`。
 
+旧 `python -m src.api_server` HTTP 服务已进入兼容期，并将在 **2026-12-31 00:00 UTC** 起拒绝启动，随后从发行包移除。兼容期内它仍只允许开发环境使用，启动时会发出废弃警告，所有 HTTP 响应会携带 `Deprecation`、`Sunset`、`Link` 和 `X-API-Successor` 迁移信息。新部署和调用方必须使用 `bio-agent-api`（即 `src.fastapi_app`）及 `/api/v1/*` 接口；Docker、Compose 和项目脚本均已只指向 FastAPI。
+
 JWT 用户配置示例：
 
 ```json
