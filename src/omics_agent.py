@@ -8,12 +8,54 @@ import re
 import shutil
 import subprocess
 import zipfile
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from scipy.stats import hypergeom, ttest_ind
+
+try:
+    from .omics_results import (
+        build_omics_manifest,
+        differential_expression_result,
+        pathway_enrichment_result,
+        specialist_workflow_result,
+        variant_annotation_result,
+        write_omics_manifest,
+        write_omics_report,
+    )
+    from .omics_validation import (
+        GENOMICS_QC_TYPES,
+        condition_pair as _condition_pair,
+        infer_qc_type as _infer_qc_type,
+        load_expression_matrix,
+        normalize_alignment_paths as _normalize_alignment_paths,
+        normalize_fastq_paths as _normalize_fastq_paths,
+        normalize_qc_paths as _normalize_qc_paths,
+        require_columns as _require_columns,
+        resolve_qc_type as _resolve_qc_type,
+    )
+except ImportError:
+    from omics_results import (
+        build_omics_manifest,
+        differential_expression_result,
+        pathway_enrichment_result,
+        specialist_workflow_result,
+        variant_annotation_result,
+        write_omics_manifest,
+        write_omics_report,
+    )
+    from omics_validation import (
+        GENOMICS_QC_TYPES,
+        condition_pair as _condition_pair,
+        infer_qc_type as _infer_qc_type,
+        load_expression_matrix,
+        normalize_alignment_paths as _normalize_alignment_paths,
+        normalize_fastq_paths as _normalize_fastq_paths,
+        normalize_qc_paths as _normalize_qc_paths,
+        require_columns as _require_columns,
+        resolve_qc_type as _resolve_qc_type,
+    )
 
 PLUGIN_NAME = 'RNA-seq and omics domain'
 PLUGIN_VERSION = '0.7.0'
@@ -51,14 +93,6 @@ TOOLCHAIN_EXECUTABLES = {
 }
 DESEQ2_RUNNER = Path(__file__).resolve().parents[1] / 'tools' / 'deseq2_runner.R'
 
-
-
-def _require_columns(frame, columns, label):
-    missing = set(columns) - set(frame.columns)
-    if missing:
-        raise ValueError(f'{label} missing columns: {sorted(missing)}')
-
-
 def _bh_adjust(values):
     values = np.asarray(values, dtype=float)
     if values.size == 0:
@@ -69,38 +103,6 @@ def _bh_adjust(values):
     result = np.empty_like(adjusted)
     result[order] = np.clip(adjusted, 0.0, 1.0)
     return result
-
-
-def load_expression_matrix(expression_csv, metadata_csv):
-    expression = pd.read_csv(expression_csv)
-    metadata = pd.read_csv(metadata_csv)
-    if expression.empty:
-        raise ValueError('expression matrix is empty')
-    _require_columns(expression, {'gene_id'}, 'expression matrix')
-    _require_columns(metadata, {'sample_id', 'condition'}, 'metadata')
-    sample_columns = [column for column in expression.columns if column != 'gene_id']
-    if not sample_columns:
-        raise ValueError('expression matrix has no sample columns')
-    if expression['gene_id'].isna().any() or expression['gene_id'].duplicated().any():
-        raise ValueError('gene_id values must be non-empty and unique')
-    if metadata['sample_id'].duplicated().any():
-        raise ValueError('metadata sample_id values must be unique')
-    missing_metadata = set(sample_columns) - set(metadata['sample_id'])
-    missing_expression = set(metadata['sample_id']) - set(sample_columns)
-    if missing_metadata or missing_expression:
-        raise ValueError(
-            f'sample mismatch: missing_metadata={sorted(missing_metadata)}, '
-            f'missing_expression={sorted(missing_expression)}'
-        )
-    expression[sample_columns] = expression[sample_columns].apply(pd.to_numeric, errors='raise')
-    metadata = metadata.set_index('sample_id').loc[sample_columns].reset_index()
-    conditions = metadata['condition'].astype(str)
-    if conditions.nunique() != 2:
-        raise ValueError('RNA-seq adapter currently requires exactly two conditions')
-    counts = conditions.value_counts()
-    if counts.min() < 2:
-        raise ValueError('each condition requires at least two replicates')
-    return expression, metadata
 
 
 def _deseq2_runtime():
@@ -177,17 +179,6 @@ def _run_deseq2_backend(expression_csv, metadata_csv, output_csv, condition_a, c
     return pd.read_csv(output_csv)
 
 
-def _condition_pair(metadata, condition_a=None, condition_b=None):
-    conditions = sorted(metadata['condition'].astype(str).unique())
-    condition_a = str(condition_a or conditions[0])
-    condition_b = str(condition_b or conditions[1])
-    if condition_a == condition_b or {condition_a, condition_b} != set(conditions):
-        raise ValueError(f'conditions must be the two observed values: {conditions}')
-    samples_a = metadata.loc[metadata['condition'].astype(str) == condition_a, 'sample_id'].tolist()
-    samples_b = metadata.loc[metadata['condition'].astype(str) == condition_b, 'sample_id'].tolist()
-    return condition_a, condition_b, samples_a, samples_b
-
-
 def run_differential_expression(expression_csv, metadata_csv, output_csv,
                                 condition_a=None, condition_b=None,
                                 statistics_backend='scipy'):
@@ -204,19 +195,15 @@ def run_differential_expression(expression_csv, metadata_csv, output_csv,
         output_csv = Path(output_csv)
         output_csv.parent.mkdir(parents=True, exist_ok=True)
         result.to_csv(output_csv, index=False)
-        return {
-            'status': 'completed',
-            'output_csv': str(output_csv),
-            'condition_a': condition_a,
-            'condition_b': condition_b,
-            'n_genes': int(len(result)),
-            'n_significant': int(result['significant'].sum()),
-            'samples_a': samples_a,
-            'samples_b': samples_b,
-            'backend_requested': backend['requested'],
-            'backend': backend['backend'],
-            'fallback_reason': backend['fallback_reason'],
-        }
+        return differential_expression_result(
+            output_csv,
+            result,
+            condition_a,
+            condition_b,
+            samples_a,
+            samples_b,
+            backend,
+        )
     values_a = expression[samples_a].to_numpy(dtype=float)
     values_b = expression[samples_b].to_numpy(dtype=float)
     means_a = values_a.mean(axis=1)
@@ -235,19 +222,15 @@ def run_differential_expression(expression_csv, metadata_csv, output_csv,
     output_csv = Path(output_csv)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output_csv, index=False)
-    return {
-        'status': 'completed',
-        'output_csv': str(output_csv),
-        'condition_a': condition_a,
-        'condition_b': condition_b,
-        'n_genes': int(len(result)),
-        'n_significant': int(result['significant'].sum()),
-        'samples_a': samples_a,
-        'samples_b': samples_b,
-        'backend_requested': backend['requested'],
-        'backend': backend['backend'],
-        'fallback_reason': backend['fallback_reason'],
-    }
+    return differential_expression_result(
+        output_csv,
+        result,
+        condition_a,
+        condition_b,
+        samples_a,
+        samples_b,
+        backend,
+    )
 
 
 def _load_gene_sets(gene_sets_csv):
@@ -305,14 +288,7 @@ def run_pathway_enrichment(de_csv, gene_sets_csv, output_csv,
     output_csv = Path(output_csv)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output_csv, index=False)
-    return {
-        'status': 'completed',
-        'output_csv': str(output_csv),
-        'n_background_genes': len(background),
-        'n_selected_genes': len(selected),
-        'n_pathways': len(result),
-        'n_significant_pathways': int((result['padj'] <= 0.05).sum()) if not result.empty else 0,
-    }
+    return pathway_enrichment_result(output_csv, result, background, selected)
 
 
 def toolchain_status():
@@ -620,20 +596,6 @@ def normalize_variants(vcf_path, reference_fasta, output_dir, output_vcf=None,
     })
 
 
-def _normalize_alignment_paths(alignment_paths):
-    values = alignment_paths if isinstance(alignment_paths, (list, tuple)) else [alignment_paths]
-    if not values or any(value is None or not str(value).strip() for value in values):
-        raise ValueError('alignment_paths must contain at least one BAM/CRAM path')
-    paths = [Path(str(value)) for value in values]
-    missing = [str(path) for path in paths if not path.is_file()]
-    if missing:
-        raise ValueError(f'alignment files do not exist: {missing}')
-    invalid = [str(path) for path in paths if path.suffix.lower() not in {'.bam', '.cram'}]
-    if invalid:
-        raise ValueError(f'featureCounts requires BAM/CRAM inputs: {invalid}')
-    return paths
-
-
 def _feature_counts_sample_name(value):
     normalized = str(value).replace('\\', '/')
     name = normalized.rsplit('/', 1)[-1]
@@ -665,20 +627,6 @@ def _parse_feature_counts_output(counts_path, output_csv):
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output_csv, index=False)
     return result, sample_names
-
-
-def _normalize_fastq_paths(fastq_paths):
-    values = fastq_paths if isinstance(fastq_paths, (list, tuple)) else [fastq_paths]
-    if not values or any(value is None or not str(value).strip() for value in values):
-        raise ValueError('fastq_paths must contain at least one FASTQ path')
-    paths = [Path(str(value)) for value in values]
-    missing = [str(path) for path in paths if not path.is_file()]
-    if missing:
-        raise ValueError(f'FASTQ inputs do not exist: {missing}')
-    invalid = [str(path) for path in paths if not path.name.lower().endswith(('.fastq', '.fq', '.fastq.gz', '.fq.gz'))]
-    if invalid:
-        raise ValueError(f'RNA-seq alignment requires FASTQ inputs: {invalid}')
-    return paths
 
 
 def _fastq_sample_name(path):
@@ -1008,43 +956,6 @@ def run_feature_counts(alignment_paths, annotation_gtf, output_dir, output_csv=N
         'sample_names': sample_names,
         'provenance': provenance,
     })
-
-
-GENOMICS_QC_TYPES = ('auto', 'fastq', 'bam', 'vcf')
-
-
-def _normalize_qc_paths(input_path):
-    values = input_path if isinstance(input_path, (list, tuple)) else [input_path]
-    if not values or any(value is None or not str(value).strip() for value in values):
-        raise ValueError('input_path must contain at least one file path')
-    paths = [Path(str(value)) for value in values]
-    missing = [str(path) for path in paths if not path.is_file()]
-    if missing:
-        raise ValueError(f'input files do not exist: {missing}')
-    return paths
-
-
-def _infer_qc_type(path):
-    name = path.name.lower()
-    if name.endswith(('.fastq', '.fq', '.fastq.gz', '.fq.gz')):
-        return 'fastq'
-    if name.endswith(('.bam', '.cram')):
-        return 'bam'
-    if name.endswith(('.vcf', '.vcf.gz', '.bcf')):
-        return 'vcf'
-    raise ValueError(f'cannot infer genomics QC input type from: {path}')
-
-
-def _resolve_qc_type(paths, requested):
-    requested = str(requested or 'auto').lower()
-    if requested not in GENOMICS_QC_TYPES:
-        raise ValueError(f'unknown genomics QC input type: {requested}')
-    if requested != 'auto':
-        return requested
-    detected = {_infer_qc_type(path) for path in paths}
-    if len(detected) != 1:
-        raise ValueError(f'input files must share one QC type: {sorted(detected)}')
-    return detected.pop()
 
 
 def _fastq_file_stats(path):
@@ -1978,18 +1889,16 @@ def annotate_variants(vcf_path, output_csv, annotation_csv=None,
     result.to_csv(output_csv, index=False)
     gene_ids = sorted({str(value) for value in result['gene_id'] if str(value).strip()})
     effective_backend = 'mixed' if len(sources) > 1 else (next(iter(sources)) if sources else requested)
-    return {
-        'status': 'completed',
-        'output_csv': str(output_csv),
-        'backend_requested': requested,
-        'backend': effective_backend,
-        'n_variants': n_variants,
-        'n_alleles': n_alleles,
-        'n_annotated': int((result['annotation_status'] == 'annotated').sum()),
-        'n_unmatched': int((result['annotation_status'] == 'unmatched').sum()),
-        'gene_ids': gene_ids,
-        'toolchain': toolchain_status(),
-    }
+    return variant_annotation_result(
+        output_csv,
+        requested,
+        effective_backend,
+        result,
+        n_variants,
+        n_alleles,
+        gene_ids,
+        toolchain_status(),
+    )
 
 
 def search_gene_evidence(gene_ids, evidence_csv=None, provider='local',
@@ -2011,56 +1920,14 @@ def search_gene_evidence(gene_ids, evidence_csv=None, provider='local',
 def generate_omics_report(de_csv, pathway_csv, output_md, evidence=None):
     de = pd.read_csv(de_csv)
     pathways = pd.read_csv(pathway_csv)
-    significant = de[de['significant'].astype(bool)] if 'significant' in de else de.iloc[0:0]
-    lines = [
-        '# RNA-seq Agent Analysis Report',
-        '',
-        f'- Generated at: {datetime.now(timezone.utc).isoformat()}',
-        f'- Differential-expression result: {de_csv}',
-        f'- Pathway result: {pathway_csv}',
-        f'- Genes tested: {len(de)}',
-        f'- Significant genes: {len(significant)}',
-        f'- Pathways tested: {len(pathways)}',
-        '',
-        '## Top Differentially Expressed Genes',
-        '',
-        '| Gene | log2 FC | adjusted p-value |',
-        '|---|---:|---:|',
-    ]
-    for _, row in significant.head(10).iterrows():
-        lines.append(f'| {row["gene_id"]} | {row["log2_fc"]:.3f} | {row["padj"]:.3g} |')
-    if significant.empty:
-        lines.append('| None | n/a | n/a |')
-    lines.extend([
-        '',
-        '## Top Enriched Pathways',
-        '',
-        '| Pathway | Overlap | adjusted p-value |',
-        '|---|---:|---:|',
-    ])
-    if pathways.empty:
-        lines.append('| None | 0 | n/a |')
-    else:
-        for _, row in pathways.head(10).iterrows():
-            lines.append(f'| {row["pathway_name"]} | {row["overlap_count"]} | {row["padj"]:.3g} |')
-    if evidence:
-        lines.extend(['', '## Evidence', ''])
-        lines.append(f'- Evidence matches: {evidence.get("n_matches", 0)}')
-        evidence_source = evidence.get('source_file') or evidence.get('endpoint') or evidence.get('provider', 'n/a')
-        lines.append(f'- Evidence source: {evidence_source}')
-        for item in evidence.get('matches', [])[:10]:
-            lines.append(f'- **{item.get("gene_id", "")}**: {item.get("title", "")} ({item.get("source", "")})')
-    output_md = Path(output_md)
-    output_md.parent.mkdir(parents=True, exist_ok=True)
-    output_md.write_text('\n'.join(lines) + '\n', encoding='utf-8')
-    return {
-        'status': 'completed',
-        'output_md': str(output_md),
-        'n_genes': int(len(de)),
-        'n_significant_genes': int(len(significant)),
-        'n_pathways': int(len(pathways)),
-        'n_evidence_matches': int((evidence or {}).get('n_matches', 0)),
-    }
+    return write_omics_report(
+        de,
+        pathways,
+        de_csv,
+        pathway_csv,
+        output_md,
+        evidence,
+    )
 
 
 def run_omics_analysis(expression_csv, metadata_csv, gene_sets_csv, output_dir,
@@ -2096,29 +1963,21 @@ def run_omics_analysis(expression_csv, metadata_csv, gene_sets_csv, output_dir,
             gencode_gtf=gencode_gtf,
         )
     report_meta = generate_omics_report(de_csv, pathway_csv, report_md, evidence)
-    manifest = {
-        'status': 'completed',
-        'created_at': datetime.now(timezone.utc).isoformat(),
-        'inputs': {
-            'expression_csv': str(expression_csv),
-            'metadata_csv': str(metadata_csv),
-            'gene_sets_csv': str(gene_sets_csv),
-            'evidence_csv': str(evidence_csv) if evidence_csv else None,
-            'evidence_provider': evidence_provider,
-            'evidence_cache_dir': str(evidence_cache_dir) if evidence_cache_dir else None,
-            'genome': genome,
-            'gencode_gtf': str(gencode_gtf) if gencode_gtf else None,
-            'statistics_backend': statistics_backend,
-        },
-        'differential_expression': de_meta,
-        'pathway_enrichment': pathway_meta,
-        'report': report_meta,
-    }
-    (output_dir / 'omics_manifest.json').write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + '\n',
-        encoding='utf-8',
+    manifest = build_omics_manifest(
+        expression_csv,
+        metadata_csv,
+        gene_sets_csv,
+        evidence_csv,
+        evidence_provider,
+        evidence_cache_dir,
+        genome,
+        gencode_gtf,
+        statistics_backend,
+        de_meta,
+        pathway_meta,
+        report_meta,
     )
-    return manifest
+    return write_omics_manifest(output_dir, manifest)
 
 
 def _run_specialist_workflow(workflow, output_dir, allowed_tools):
@@ -2135,12 +1994,7 @@ def _run_specialist_workflow(workflow, output_dir, allowed_tools):
         allowed_tools=allowed_tools,
         continue_on_error=False,
     )
-    return {
-        'status': manifest['status'],
-        'workflow': workflow.get('name', 'omics specialist workflow'),
-        'manifest': manifest,
-        'manifest_path': str(manifest_path),
-    }
+    return specialist_workflow_result(workflow, manifest, manifest_path)
 
 
 def run_rnaseq_workbench(

@@ -1,6 +1,37 @@
 """Application layer for a traceable bioinformatics research Agent."""
 from pathlib import Path
 
+try:
+    from .research_results import (
+        catalog_result,
+        execution_result,
+        plan_result,
+        presets_result,
+        workflow_result,
+        write_research_report as _write_research_report,
+    )
+    from .research_validation import (
+        select_domains,
+        validate_planning_request,
+        validate_preset,
+        validate_workflow,
+    )
+except ImportError:
+    from research_results import (
+        catalog_result,
+        execution_result,
+        plan_result,
+        presets_result,
+        workflow_result,
+        write_research_report as _write_research_report,
+    )
+    from research_validation import (
+        select_domains,
+        validate_planning_request,
+        validate_preset,
+        validate_workflow,
+    )
+
 
 PLUGIN_NAME = 'Bioinformatics Research Agent'
 PLUGIN_VERSION = '0.1.0'
@@ -164,23 +195,12 @@ def _available_domain_names():
 
 
 def _select_domains(task, requested):
-    available = _available_domain_names() - {'research'}
-    if requested:
-        selected = []
-        for domain in requested:
-            if domain not in available:
-                raise ValueError(f'unknown or unavailable research domain: {domain}')
-            if domain not in selected:
-                selected.append(domain)
-        return selected
-    text = task.lower()
-    scores = {
-        domain: sum(keyword.lower() in text for keyword in keywords)
-        for domain, keywords in _DOMAIN_KEYWORDS.items()
-        if domain in available
-    }
-    selected = [domain for domain, score in scores.items() if score > 0]
-    return selected or sorted(available)
+    return select_domains(
+        task,
+        requested,
+        _available_domain_names(),
+        _DOMAIN_KEYWORDS,
+    )
 
 
 def _resolve_domains(task, requested, inputs=None, planner_mode='deterministic'):
@@ -1168,32 +1188,17 @@ def _build_workflow(task, domains, inputs=None, output_dir='output/research_auto
 
 def research_catalog():
     domain_catalog = _domain_registry_module().active_domain_catalog
-    return {
-        'status': 'ok',
-        'application': 'bioinformatics-research-agent',
-        'application_version': PLUGIN_VERSION,
-        'domains': domain_catalog(),
-        'policy': 'catalog-only; no computation or external network call',
-    }
+    return catalog_result(PLUGIN_VERSION, domain_catalog())
 
 
 def research_presets():
-    return {
-        'status': 'ok',
-        'application': 'bioinformatics-research-agent',
-        'presets': [
-            {'id': preset_id, **preset}
-            for preset_id, preset in RESEARCH_PRESETS.items()
-        ],
-    }
+    return presets_result(RESEARCH_PRESETS)
 
 
 def research_run_preset(preset, output_path='output/research_manifest.json',
                         report_path='output/research_report.md', dry_run=True,
                         continue_on_error=False, resume=False):
-    if preset not in RESEARCH_PRESETS:
-        raise ValueError(f'unknown research preset: {preset}')
-    preset_config = RESEARCH_PRESETS[preset]
+    preset_config = validate_preset(preset, RESEARCH_PRESETS)
     workflow_path = _project_root() / preset_config['path']
     workflow = _workflow_runner_module().load_workflow(workflow_path)
     return research_execute(
@@ -1208,10 +1213,7 @@ def research_run_preset(preset, output_path='output/research_manifest.json',
 
 
 def research_plan(task, domains=None, inputs=None, output_dir='output/research_auto', planner_mode='deterministic'):
-    if not isinstance(task, str) or not task.strip():
-        raise ValueError('task must be a non-empty string')
-    if inputs is not None and not isinstance(inputs, dict):
-        raise ValueError('inputs must be an object')
+    task, inputs = validate_planning_request(task, inputs)
     selected, planner = _resolve_domains(task, domains, inputs, planner_mode)
     tool_specs = _domain_registry_module().active_tool_specs
     capabilities = [
@@ -1247,120 +1249,28 @@ def research_plan(task, domains=None, inputs=None, output_dir='output/research_a
         },
     ]
     execution = _build_workflow(task, selected, inputs, output_dir)
-    return {
-        'status': 'planned',
-        'application': 'bioinformatics-research-agent',
-        'task': task.strip(),
-        'selected_domains': selected,
-        'capabilities': capabilities,
-        'required_inputs': _required_inputs(selected, task, inputs),
-        'execution': execution,
-        'evidence_provider': execution['evidence_provider'],
-        'steps': steps,
-        'planner': planner,
-        'provenance': {
-            'planner': planner['backend'],
-            'planner_mode': planner['mode'],
-            'planner_model': planner.get('model'),
-            'fallback_reason': planner.get('fallback_reason'),
-        },
-        'policy': {
-            'llm_may_select_tools': False,
-            'llm_may_select_domains': planner['backend'] == 'llm',
-            'llm_may_invent_measurements': False,
-            'execution_requires_validated_workflow': True,
-        },
-    }
+    return plan_result(
+        task,
+        selected,
+        capabilities,
+        _required_inputs(selected, task, inputs),
+        execution,
+        steps,
+        planner,
+    )
 
 
 def research_build_workflow(task, inputs, domains=None, output_dir='output/research_auto', planner_mode='deterministic'):
-    if not isinstance(task, str) or not task.strip():
-        raise ValueError('task must be a non-empty string')
-    if not isinstance(inputs, dict):
-        raise ValueError('inputs must be an object')
+    task, inputs = validate_planning_request(task, inputs, require_inputs=True)
     selected, planner = _resolve_domains(task, domains, inputs, planner_mode)
     execution = _build_workflow(task, selected, inputs, output_dir)
-    return {
-        'status': 'planned',
-        'application': 'bioinformatics-research-agent',
-        'task': task.strip(),
-        'selected_domains': selected,
-        **execution,
-        'provenance': {
-            'planner': planner['backend'],
-            'planner_mode': planner['mode'],
-            'planner_model': planner.get('model'),
-            'fallback_reason': planner.get('fallback_reason'),
-            'workflow_validation': 'delegated to research_execute',
-        },
-    }
-
-
-def _write_research_report(manifest, report_path):
-    report_path = Path(report_path)
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [
-        '# Bioinformatics Research Agent Report',
-        '',
-        f"- Workflow: {manifest.get('workflow', 'unnamed')}",
-        f"- Status: {manifest.get('status', 'unknown')}",
-        f"- Completed steps: {manifest.get('completed_steps', 0)}",
-        f"- Failed steps: {manifest.get('failed_steps', 0)}",
-        f"- Resumed steps: {manifest.get('resumed_steps', 0)}",
-        f"- Reproducibility fingerprint: {manifest.get('reproducibility', {}).get('run_fingerprint', 'n/a')}",
-        f"- Random seed status: {manifest.get('reproducibility', {}).get('seed_status', 'n/a')}",
-        f"- Trace ID: {manifest.get('observability', {}).get('trace_id', 'n/a')}",
-        f"- Job ID: {manifest.get('observability', {}).get('job_id', 'n/a')}",
-        '',
-        '## Steps',
-        '',
-        '| Step | Tool | Status |',
-        '|---|---|---|',
-    ]
-    for step in manifest.get('steps', []):
-        lines.append(
-            f"| {step.get('id', '')} | {step.get('tool', '')} | {step.get('status', '')} |"
-        )
-    lines.extend(['', '## Evidence and outputs', ''])
-    for step in manifest.get('steps', []):
-        result = step.get('result', {})
-        if not isinstance(result, dict):
-            continue
-        payload = result.get('result', result)
-        if not isinstance(payload, dict):
-            continue
-        if result.get('plugin') == 'literature':
-            lines.append(
-                f"- {step.get('id')}: literature matches={payload.get('n_matches', 0)}"
-            )
-        if result.get('plugin') == 'knowledge':
-            matches = payload.get('matches', [])
-            lines.append(
-                f"- {step.get('id')}: retrieved knowledge matches={payload.get('n_matches', 0)}"
-            )
-            for match in matches[:3]:
-                lines.append(
-                    f"  - {match.get('title', match.get('document_id', 'document'))} "
-                    f"(score={match.get('score', 0)})"
-                )
-        if result.get('plugin') == 'sequence':
-            metrics = payload.get('metrics') or payload.get('result', {}).get('metrics', {})
-            lines.append(
-                f"- {step.get('id')}: sequence verdict={payload.get('verdict', 'n/a')}, "
-                f"verified={payload.get('verify', 'n/a')}, metrics={metrics}"
-            )
-        for key in ('output_csv', 'output_md', 'output_html'):
-            if payload.get(key):
-                lines.append(f"- {step.get('id')}: {key} = {payload[key]}")
-    report_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
-    return {'status': 'ok', 'path': str(report_path)}
+    return workflow_result(task, selected, execution, planner)
 
 
 def research_execute(workflow, domains=None, output_path='output/research_manifest.json',
                      report_path='output/research_report.md', dry_run=True,
                      continue_on_error=False, resume=False):
-    if not isinstance(workflow, dict):
-        raise ValueError('workflow must be an object')
+    workflow = validate_workflow(workflow)
     registry = _domain_registry_module()
     tool_specs = registry.active_tool_specs
     run_workflow = _workflow_runner_module().run_workflow
@@ -1399,23 +1309,15 @@ def research_execute(workflow, domains=None, output_path='output/research_manife
         )
         if report_path else None
     )
-    return {
-        'status': manifest['status'],
-        'application': 'bioinformatics-research-agent',
-        'selected_domains': selected,
-        'manifest': manifest,
-        'report': report,
-        'manifest_path': manifest.get('manifest_path'),
-        'report_path': report.get('path') if isinstance(report, dict) else None,
-        'provenance': {
-            'application': PLUGIN_NAME,
-            'version': PLUGIN_VERSION,
-            'dry_run': dry_run,
-            'resume': resume,
-            'run_fingerprint': manifest.get('reproducibility', {}).get('run_fingerprint'),
-            'seed_status': manifest.get('reproducibility', {}).get('seed_status'),
-        },
-    }
+    return execution_result(
+        manifest,
+        selected,
+        report,
+        PLUGIN_NAME,
+        PLUGIN_VERSION,
+        dry_run,
+        resume,
+    )
 
 
 def research_verify_reproducibility(manifest_path, check_environment=True):
