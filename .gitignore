@@ -32,6 +32,8 @@ frontend/dist/
 frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
+frontend/vitest.config.js
+frontend/vitest.config.d.ts
 
 .playwright-cli/
 outputs/playwright/*.png
