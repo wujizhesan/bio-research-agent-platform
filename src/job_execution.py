@@ -17,6 +17,7 @@ try:
         current_context,
         log_event,
     )
+    from .run_context import current_run_context
 except ImportError:
     from observability import (
         TOOL_DURATION,
@@ -24,6 +25,7 @@ except ImportError:
         current_context,
         log_event,
     )
+    from run_context import current_run_context
 
 
 class JobExecutionError(RuntimeError):
@@ -239,7 +241,9 @@ class ProcessToolExecutor:
     def execute(self, tool, arguments, *, cancelled=None, heartbeat=None):
         if self._shutdown.is_set():
             raise JobExecutionCancelled('tool executor is shutting down')
-        with tempfile.TemporaryDirectory(prefix='bio_agent_job_') as raw:
+        with tempfile.TemporaryDirectory(
+            prefix='bio_agent_job_', ignore_cleanup_errors=True
+        ) as raw:
             root = Path(raw)
             request_path = root / 'request.json'
             response_path = root / 'response.json'
@@ -252,6 +256,7 @@ class ProcessToolExecutor:
                         'arguments': arguments,
                         'limits': self.limits.as_dict(),
                         'observability': current_context(),
+                        'run_context': current_run_context(as_dict=True),
                     },
                     ensure_ascii=False,
                     default=str,

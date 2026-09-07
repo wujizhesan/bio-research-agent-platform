@@ -19,6 +19,7 @@ from src.job_execution import (
 )
 from src.job_manager import JobManager
 from src.observability import bind_context
+from src.run_context import bind_run_context, build_run_context
 
 
 HELPER = """import json
@@ -28,7 +29,7 @@ import time
 request = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
 arguments = request.get('arguments', {})
 time.sleep(float(arguments.get('sleep', 0)))
-result = {'status': 'ok', 'value': arguments.get('value'), 'blob': 'x' * int(arguments.get('blob', 0)), 'observability': request.get('observability', {})}
+result = {'status': 'ok', 'value': arguments.get('value'), 'blob': 'x' * int(arguments.get('blob', 0)), 'observability': request.get('observability', {}), 'run_context': request.get('run_context')}
 Path(sys.argv[2]).write_text(json.dumps({'ok': True, 'result': result}), encoding='utf-8')
 """
 
@@ -70,6 +71,18 @@ class JobExecutionTests(unittest.TestCase):
             executor = self._executor(raw, timeout_seconds=0.1)
             with self.assertRaisesRegex(JobExecutionTimedOut, '0.1 seconds'):
                 executor.execute('tool', {'sleep': 5})
+
+    def test_process_executor_propagates_run_context(self):
+        with tempfile.TemporaryDirectory(prefix='job_execution_') as raw:
+            context = build_run_context(
+                'research_catalog',
+                {'seed': 9},
+                spec={'domain': 'research'},
+                job_id='context-job',
+            )
+            with bind_run_context(context):
+                result = self._executor(raw).execute('research_catalog', {})
+        self.assertEqual(result['run_context'], context.as_dict())
 
     def test_process_executor_terminates_cancelled_job(self):
         with tempfile.TemporaryDirectory(prefix='job_execution_') as raw:

@@ -22,10 +22,10 @@ try:
         normalize_priority,
     )
     from .workflow_checkpoint import resumable_retry_arguments
+    from .run_context import build_run_context, bind_run_context, RunContext
     from .observability import (
         JOB_ACTIVE, JOB_DURATION, JOB_EXECUTIONS, JOB_QUEUE_DURATION,
-        JOB_TRANSITIONS, bind_context, current_context, log_event,
-        trace_id as make_trace_id,
+        JOB_TRANSITIONS, log_event, trace_id as make_trace_id,
     )
 except ImportError:
     from domain_registry import run_tool, active_tool_specs, tool_specs
@@ -38,10 +38,10 @@ except ImportError:
         normalize_priority,
     )
     from workflow_checkpoint import resumable_retry_arguments
+    from run_context import build_run_context, bind_run_context, RunContext
     from observability import (
         JOB_ACTIVE, JOB_DURATION, JOB_EXECUTIONS, JOB_QUEUE_DURATION,
-        JOB_TRANSITIONS, bind_context, current_context, log_event,
-        trace_id as make_trace_id,
+        JOB_TRANSITIONS, log_event, trace_id as make_trace_id,
     )
 
 
@@ -105,7 +105,7 @@ class JobManager:
                 'arguments_json TEXT, result_json TEXT, error TEXT, retry_of TEXT, '
                 'idempotency_key TEXT, cancel_requested INTEGER DEFAULT 0, '
                 'resources_json TEXT, priority INTEGER DEFAULT 0, '
-                'trace_id TEXT, request_id TEXT)'
+                'trace_id TEXT, request_id TEXT, run_context_json TEXT)'
             )
             columns = {row[1] for row in connection.execute('PRAGMA table_info(jobs)').fetchall()}
             if 'arguments_json' not in columns:
@@ -124,6 +124,8 @@ class JobManager:
                 connection.execute('ALTER TABLE jobs ADD COLUMN trace_id TEXT')
             if 'request_id' not in columns:
                 connection.execute('ALTER TABLE jobs ADD COLUMN request_id TEXT')
+            if 'run_context_json' not in columns:
+                connection.execute('ALTER TABLE jobs ADD COLUMN run_context_json TEXT')
 
     def _persist(self, record):
         if not self._store_path:
@@ -133,8 +135,9 @@ class JobManager:
                 'INSERT OR REPLACE INTO jobs '
                 '(job_id, tool, status, created_at, started_at, finished_at, '
                 'arguments_json, result_json, error, retry_of, idempotency_key, '
-                'cancel_requested, resources_json, priority, trace_id, request_id) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ',
+                'cancel_requested, resources_json, priority, trace_id, request_id, '
+                'run_context_json) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ',
                 (
                     record['job_id'],
                     record['tool'],
@@ -153,6 +156,8 @@ class JobManager:
                     int(record.get('priority', 0)),
                     record.get('trace_id'),
                     record.get('request_id'),
+                    json.dumps(record.get('run_context'), ensure_ascii=False, default=str)
+                    if record.get('run_context') else None,
                 ),
             )
 
@@ -161,12 +166,13 @@ class JobManager:
             rows = connection.execute(
                 'SELECT job_id, tool, status, created_at, started_at, finished_at, '
                 'arguments_json, result_json, error, retry_of, idempotency_key, '
-                'cancel_requested, resources_json, priority, trace_id, request_id FROM jobs'
+                'cancel_requested, resources_json, priority, trace_id, request_id, '
+                'run_context_json FROM jobs'
             ).fetchall()
         interrupted_at = _now()
         resumable = []
         for row in rows:
-            job_id, tool, status, created_at, started_at, finished_at, arguments_json, result_json, error, retry_of, idempotency_key, cancel_requested, resources_json, priority, trace_value, request_value = row
+            job_id, tool, status, created_at, started_at, finished_at, arguments_json, result_json, error, retry_of, idempotency_key, cancel_requested, resources_json, priority, trace_value, request_value, run_context_json = row
             record = {
                 'job_id': job_id,
                 'tool': tool,
@@ -178,6 +184,13 @@ class JobManager:
             }
             if request_value:
                 record['request_id'] = request_value
+            if run_context_json:
+                try:
+                    record['run_context'] = RunContext.from_dict(
+                        json.loads(run_context_json)
+                    ).as_dict()
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    record.pop('run_context', None)
             if arguments_json:
                 try:
                     record['_arguments'] = json.loads(arguments_json)
@@ -226,6 +239,21 @@ class JobManager:
                             'error': 'resource request exceeds current scheduler capacity: '
                             + self._capacity.rejection_reason(request),
                         })
+            if 'run_context' not in record:
+                try:
+                    spec = self._validate_tool_state(tool)
+                except ValueError:
+                    spec = {'domain': 'unknown'}
+                record['run_context'] = build_run_context(
+                    tool,
+                    record.get('_arguments', {}),
+                    spec=spec,
+                    resources=record['resources'],
+                    priority=record['priority'],
+                    job_id=job_id,
+                    trace_id=record['trace_id'],
+                    request_id=record.get('request_id'),
+                ).as_dict()
             self._jobs[job_id] = record
         for record in self._jobs.values():
             self._persist(record)
@@ -250,9 +278,20 @@ class JobManager:
         self._condition.notify_all()
 
     def _create_job_locked(self, tool, arguments, resources, priority,
-                           retry_of=None, idempotency_key=None):
+                           retry_of=None, idempotency_key=None, spec=None,
+                           parent_context=None):
         job_id = uuid4().hex
-        context = current_context()
+        run_context = build_run_context(
+            tool,
+            arguments,
+            spec=spec,
+            resources=resources.as_dict(),
+            priority=priority,
+            job_id=job_id,
+            retry_of=retry_of,
+            parent=parent_context,
+            run_id=uuid4().hex if parent_context is not None else None,
+        ).as_dict()
         record = {
             'job_id': job_id,
             'tool': tool,
@@ -262,10 +301,11 @@ class JobManager:
             '_cancel_requested': False,
             'resources': resources.as_dict(),
             'priority': priority,
-            'trace_id': context.get('trace_id') or make_trace_id(),
+            'trace_id': run_context['trace_id'],
+            'run_context': run_context,
         }
-        if context.get('request_id'):
-            record['request_id'] = context['request_id']
+        if run_context.get('request_id'):
+            record['request_id'] = run_context['request_id']
         if idempotency_key:
             record['idempotency_key'] = idempotency_key
         if retry_of:
@@ -333,6 +373,7 @@ class JobManager:
                 request,
                 priority,
                 idempotency_key=idempotency_key,
+                spec=spec,
             )
 
     def retry(self, job_id):
@@ -359,6 +400,8 @@ class JobManager:
                 resources,
                 int(original.get('priority', 0)),
                 retry_of=original['job_id'],
+                spec=spec,
+                parent_context=original.get('run_context'),
             )
 
     def _schedule_forever(self):
@@ -427,15 +470,16 @@ class JobManager:
                 return
             record.update({'status': 'running', 'started_at': _now()})
             self._persist(record)
-            trace_value = record.get('trace_id') or make_trace_id()
-            request_value = record.get('request_id')
             created_at = record.get('created_at')
-        with bind_context(
-            trace_id=trace_value,
-            request_id=request_value,
+        run_context = record.get('run_context') or build_run_context(
+            tool,
+            arguments,
+            spec=self._validate_tool_state(tool),
+            resources=resources.as_dict(),
+            priority=record.get('priority', 0),
             job_id=job_id,
-            tool=tool,
-        ):
+        ).as_dict()
+        with bind_run_context(run_context):
             started = perf_counter()
             try:
                 queued_seconds = (

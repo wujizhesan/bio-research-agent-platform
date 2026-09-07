@@ -10,8 +10,10 @@ import traceback
 
 try:
     from .observability import bind_context
+    from .run_context import bind_run_context
 except ImportError:
     from observability import bind_context
+    from run_context import bind_run_context
 
 
 def _apply_posix_limits(limits):
@@ -43,7 +45,12 @@ def main(argv=None):
             from .domain_registry import run_tool
         except ImportError:
             from domain_registry import run_tool
-        with bind_context(**request.get('observability', {})):
+        context = (
+            bind_run_context(request['run_context'])
+            if request.get('run_context')
+            else bind_context(**request.get('observability', {}))
+        )
+        with context:
             result = run_tool(request['tool'], request.get('arguments', {}))
         payload = {'ok': True, 'result': result}
         exit_code = 0

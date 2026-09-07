@@ -66,6 +66,11 @@ class DatabaseStateTests(unittest.TestCase):
                 'priority': 50,
                 'trace_id': 'trace-worker-1',
                 'request_id': 'request-worker-1',
+                'run_context': {
+                    'schema_version': 1,
+                    'run_id': 'run-worker-1',
+                    'trace_id': 'trace-worker-1',
+                },
             }
             with patch.dict(os.environ, {'AUTO_CREATE_SCHEMA': 'true'}, clear=False):
                 writer = DatabaseStateWriter(url)
@@ -83,6 +88,7 @@ class DatabaseStateTests(unittest.TestCase):
             self.assertEqual(stored['priority'], 50)
             self.assertEqual(stored['trace_id'], 'trace-worker-1')
             self.assertEqual(stored['request_id'], 'request-worker-1')
+            self.assertEqual(stored['run_context']['run_id'], 'run-worker-1')
 
 
 if __name__ == '__main__':

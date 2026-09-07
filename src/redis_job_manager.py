@@ -21,6 +21,7 @@ try:
         normalize_priority,
     )
     from .workflow_checkpoint import resumable_retry_arguments
+    from .run_context import build_run_context, bind_run_context
     from .observability import (
         REDIS_JOB_DURATION,
         REDIS_DEAD_LETTER_DEPTH,
@@ -36,10 +37,7 @@ try:
         JOB_EXECUTIONS,
         JOB_QUEUE_DURATION,
         JOB_TRANSITIONS,
-        bind_context,
-        current_context,
         log_event,
-        trace_id as make_trace_id,
     )
 except ImportError:
     from domain_registry import active_tool_specs, run_tool, tool_specs
@@ -53,6 +51,7 @@ except ImportError:
         normalize_priority,
     )
     from workflow_checkpoint import resumable_retry_arguments
+    from run_context import build_run_context, bind_run_context
     from observability import (
         REDIS_JOB_DURATION,
         REDIS_DEAD_LETTER_DEPTH,
@@ -68,10 +67,7 @@ except ImportError:
         JOB_EXECUTIONS,
         JOB_QUEUE_DURATION,
         JOB_TRANSITIONS,
-        bind_context,
-        current_context,
         log_event,
-        trace_id as make_trace_id,
     )
 
 
@@ -231,9 +227,19 @@ class RedisJobManager:
         return active[tool]
 
     def _create_job(self, tool, arguments, resources, priority, retry_of=None,
-                    idempotency_key=None):
+                    idempotency_key=None, spec=None, parent_context=None):
         job_id = uuid4().hex
-        context = current_context()
+        run_context = build_run_context(
+            tool,
+            arguments,
+            spec=spec,
+            resources=resources.as_dict(),
+            priority=priority,
+            job_id=job_id,
+            retry_of=retry_of,
+            parent=parent_context,
+            run_id=uuid4().hex if parent_context is not None else None,
+        ).as_dict()
         record = {
             'job_id': job_id,
             'tool': tool,
@@ -245,10 +251,11 @@ class RedisJobManager:
             '_execution_key': uuid4().hex,
             'resources': resources.as_dict(),
             'priority': priority,
-            'trace_id': context.get('trace_id') or make_trace_id(),
+            'trace_id': run_context['trace_id'],
+            'run_context': run_context,
         }
-        if context.get('request_id'):
-            record['request_id'] = context['request_id']
+        if run_context.get('request_id'):
+            record['request_id'] = run_context['request_id']
         if retry_of:
             record['retry_of'] = retry_of
         if idempotency_key:
@@ -306,6 +313,7 @@ class RedisJobManager:
                 request,
                 priority,
                 idempotency_key=idempotency_key,
+                spec=spec,
             )
 
     def get(self, job_id):
@@ -360,6 +368,8 @@ class RedisJobManager:
             ResourceRequest.from_mapping(record.get('resources')),
             int(record.get('priority', 0)),
             retry_of=record['job_id'],
+            spec=spec,
+            parent_context=record.get('run_context'),
         )
 
     @staticmethod
@@ -573,12 +583,23 @@ class RedisJobManager:
         record = self._load(str(job_id))
         if record is None:
             return None
-        with bind_context(
-            trace_id=record.get('trace_id') or make_trace_id(),
-            request_id=record.get('request_id'),
-            job_id=record.get('job_id'),
-            tool=record.get('tool'),
-        ):
+        run_context = record.get('run_context')
+        if run_context is None:
+            spec = self._validate_tool_state(record['tool'])
+            run_context = build_run_context(
+                record['tool'],
+                record.get('_arguments', {}),
+                spec=spec,
+                resources=record.get('resources', {}),
+                priority=record.get('priority', 0),
+                job_id=record.get('job_id'),
+                trace_id=record.get('trace_id'),
+                request_id=record.get('request_id'),
+            ).as_dict()
+            record['run_context'] = run_context
+            record['trace_id'] = run_context['trace_id']
+            self._save(record)
+        with bind_run_context(run_context):
             return self._run_job(job_id)
 
     def _run_job(self, job_id):

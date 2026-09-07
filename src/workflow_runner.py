@@ -41,6 +41,12 @@ try:
         current_context,
         log_event,
     )
+    from .run_context import (
+        bind_run_context,
+        build_run_context,
+        current_run_context,
+        derive_run_context,
+    )
 except ImportError:
     from domain_registry import run_tool, active_tool_specs
     from workflow_checkpoint import (
@@ -67,6 +73,12 @@ except ImportError:
         bind_context,
         current_context,
         log_event,
+    )
+    from run_context import (
+        bind_run_context,
+        build_run_context,
+        current_run_context,
+        derive_run_context,
     )
 
 
@@ -240,6 +252,14 @@ def _run_workflow(workflow, output_path=None, dry_run=False, max_steps=32,
             'recipe_fingerprint': definition_fingerprint,
         },
     }
+    workflow_context = build_run_context(
+        f"workflow:{manifest['workflow']}",
+        recipe,
+        spec={'domain': 'workflow', 'version': CHECKPOINT_VERSION},
+        parent=current_run_context(),
+        run_id=manifest['run_id'],
+    )
+    manifest['run_context'] = workflow_context.as_dict()
     if previous_manifest:
         manifest['resumed_from'] = str(checkpoint.path)
     if output_path:
@@ -271,6 +291,13 @@ def _run_workflow(workflow, output_path=None, dry_run=False, max_steps=32,
             args = _resolve(raw_args, context)
             _validate_args(tool, args, specs)
             trace['resolved_args'] = args
+            step_context = derive_run_context(
+                workflow_context,
+                tool,
+                args,
+                spec=specs[tool],
+            )
+            trace['run_context'] = step_context.as_dict()
             provenance = step_provenance(
                 args,
                 specs[tool],
@@ -329,11 +356,8 @@ def _run_workflow(workflow, output_path=None, dry_run=False, max_steps=32,
             manifest['executed_steps'] += 1
             manifest['updated_at'] = _now()
             checkpoint.write(manifest)
-            with bind_context(
-                run_id=manifest['run_id'],
-                step_id=step_id,
-                tool=tool,
-            ):
+            with bind_run_context(step_context), bind_context(
+                    run_id=manifest['run_id'], step_id=step_id, tool=tool):
                 log_event('workflow.step.started')
                 result = {'status': 'planned'} if dry_run else run_tool(tool, args)
             trace['result'] = result

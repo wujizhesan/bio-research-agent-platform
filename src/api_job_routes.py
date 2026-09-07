@@ -17,10 +17,12 @@ try:
     )
     from .auth import Principal
     from .observability import JOB_STATUS, JOB_SUBMISSIONS
+    from .run_context import bind_run_actor
 except ImportError:
     from api_contracts import JobCreate, iter_artifact_values, resolve_artifact_path
     from auth import Principal
     from observability import JOB_STATUS, JOB_SUBMISSIONS
+    from run_context import bind_run_actor
 
 
 @dataclass(frozen=True)
@@ -334,7 +336,8 @@ def _register_job_mutation_routes(
     ):
         project_id = await job_access(job_id, principal, {'owner', 'editor'})
         try:
-            record = jobs.retry(job_id)
+            with bind_run_actor(principal):
+                record = jobs.retry(job_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         await database.upsert_job(record)
@@ -418,17 +421,18 @@ def register_job_routes(
                 {'owner', 'editor'},
             )
         try:
-            record = jobs.submit(
-                payload.tool,
-                payload.arguments,
-                idempotency_key=idempotency_key,
-                resources=(
-                    payload.resources.model_dump()
-                    if payload.resources is not None
-                    else None
-                ),
-                priority=payload.priority,
-            )
+            with bind_run_actor(principal):
+                record = jobs.submit(
+                    payload.tool,
+                    payload.arguments,
+                    idempotency_key=idempotency_key,
+                    resources=(
+                        payload.resources.model_dump()
+                        if payload.resources is not None
+                        else None
+                    ),
+                    priority=payload.priority,
+                )
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         await database.upsert_job(record)

@@ -49,6 +49,7 @@ class JobRow(Base):
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     trace_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    run_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class ProjectRow(Base):
@@ -112,6 +113,7 @@ def _row_values(record):
         'priority': int(record.get('priority', 0)),
         'trace_id': record.get('trace_id'),
         'request_id': record.get('request_id'),
+        'run_context': record.get('run_context'),
     }
 
 
@@ -145,7 +147,7 @@ def _public_row(row):
     }
     for field in (
         'started_at', 'finished_at', 'result', 'error', 'retry_of',
-        'trace_id', 'request_id',
+        'trace_id', 'request_id', 'run_context',
     ):
         value = getattr(row, field)
         if value is not None:
@@ -201,6 +203,7 @@ class Database:
             'priority': 'INTEGER NOT NULL DEFAULT 0',
             'trace_id': 'VARCHAR(128)',
             'request_id': 'VARCHAR(128)',
+            'run_context': 'JSON',
         }
         boolean_default = 'FALSE' if connection.dialect.name == 'postgresql' else '0'
         missing['cancel_requested'] = f'BOOLEAN NOT NULL DEFAULT {boolean_default}'

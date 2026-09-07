@@ -75,6 +75,7 @@ py-modules = [
   "file_storage",
   "fastapi_app",
   "observability",
+  "run_context",
   "import_bindingdb",
   "imaging_plugin",
   "job_manager",

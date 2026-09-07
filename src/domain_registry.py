@@ -31,6 +31,12 @@ try:
         enforce_plugin_boundary,
         enforce_plugin_import_boundary,
     )
+    from .run_context import (
+        bind_run_context,
+        build_run_context,
+        current_run_context,
+        derive_run_context,
+    )
 except ImportError:
     import agent as CADD_PLUGIN
     import imaging_plugin as IMAGING_PLUGIN
@@ -52,6 +58,12 @@ except ImportError:
         PluginSecurityError,
         enforce_plugin_boundary,
         enforce_plugin_import_boundary,
+    )
+    from run_context import (
+        bind_run_context,
+        build_run_context,
+        current_run_context,
+        derive_run_context,
     )
 
 
@@ -378,9 +390,24 @@ def run_tool(name, args=None):
     resolved = REGISTRY.resolve(name)
     domain = resolved[0] if resolved is not None else 'unknown'
     metric_tool = name if resolved is not None else 'unknown'
+    arguments, _ = _parse_tool_arguments(args)
+    arguments = arguments or {}
+    spec = (
+        next(
+            item for item in REGISTRY.tool_specs(domain)
+            if item['name'] == metric_tool
+        )
+        if resolved is not None else {'domain': domain}
+    )
+    parent_context = current_run_context()
+    execution_context = (
+        derive_run_context(parent_context, metric_tool, arguments, spec=spec)
+        if parent_context is not None
+        else build_run_context(metric_tool, arguments, spec=spec)
+    )
     started = perf_counter()
     TOOL_ACTIVE.labels(domain, metric_tool).inc()
-    with bind_context(tool=metric_tool, plugin=domain):
+    with bind_run_context(execution_context), bind_context(tool=metric_tool, plugin=domain):
         log_event('tool.execution.started')
         try:
             result = _run_tool(name, args)

@@ -96,6 +96,8 @@ class RedisJobManagerTests(unittest.TestCase):
             self.assertEqual(manager.list(1)[0]['job_id'], first['job_id'])
             stored = json.loads(redis.get(f'test:job:{first["job_id"]}'))
             self.assertEqual(stored['status'], 'completed')
+            self.assertEqual(stored['run_context']['job_id'], first['job_id'])
+            self.assertEqual(stored['run_context']['trace_id'], stored['trace_id'])
             self.assertNotIn('_created_score', completed)
             self.assertEqual(completed['attempts'], 1)
             metrics = generate_latest().decode('utf-8')
