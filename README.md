@@ -60,6 +60,19 @@ API 接受 `X-Request-ID`、`X-Trace-ID` 和 W3C `traceparent`，并在响应中
 
 Redis 模式下，Redis 负责任务队列和执行缓存，PostgreSQL 的 `job_records` 负责任务最终状态、结果和执行次数；Worker 通过数据库状态写入桥异步更新记录，API 查询优先读取 PostgreSQL。
 
+### 高安全部署
+
+高安全档会把所有科研工具执行转发到独立的插件沙箱容器。沙箱服务不接收数据库、Redis、JWT 或对象存储凭据，仅通过带 32 字符以上随机令牌的内部网络接受 Worker 请求；令牌由 Compose Secret 以只读文件分别授予 Worker 和沙箱，不进入容器环境变量。容器使用非 root 用户、只读根文件系统、`no-new-privileges`、移除全部 Linux capabilities，并限制 PID、CPU、内存和临时目录。它不会挂载 Docker Socket，也不能访问数据库网络。沙箱默认没有外网；需要联网的插件应通过单独的白名单出口代理接入，而不是把沙箱加入平台默认网络。
+
+上传文件在写入正式元数据或上传 S3 前依次经过 ClamAV `INSTREAM` 扫描、CDR 内容重构、重构后内容复检。CDR 会规范化科研文本和 VCF gzip，重新序列化 JSON/YAML，并把 HTML 转为无活动内容的纯文本；ClamAV 不可用、发现恶意内容或 CDR 失败时，高安全档会关闭式拒绝上传并清理隔离目录。ClamAV TCP 端口只存在于内部扫描网络，不发布到宿主机。
+
+```bash
+export PLUGIN_SANDBOX_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
+docker compose -f docker-compose.yml -f docker-compose.secure.yml up --build
+```
+
+ClamAV 特征库保存在 `clamav_signatures` 卷中。首次启动需要下载特征库并加载到内存，建议至少为 ClamAV 预留 4 GB；安全档默认把单文件限制收紧到 20 MB，避免超过 ClamAV 默认 `StreamMaxLength`。生产环境应把 `PLUGIN_SANDBOX_TOKEN` 放入 Secret 管理器，不要写入 Compose 文件或提交到仓库。Linux 主机可通过 `PLUGIN_SANDBOX_UID`、`PLUGIN_SANDBOX_GID` 与 `output` 目录所有者对齐，保持非 root 的同时允许插件写入结果。普通 `docker-compose.yml` 仍保持开发模式，不强制依赖 ClamAV 或沙箱服务。
+
 ```bash
 docker compose up --build
 curl http://127.0.0.1:8000/health

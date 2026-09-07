@@ -92,6 +92,30 @@ class ApiRuntimeTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 jobs.shutdown()
 
+    def test_required_file_security_builds_clamav_and_cdr_pipeline(self):
+        with tempfile.TemporaryDirectory(prefix='api_runtime_') as raw:
+            values = {
+                'STORAGE_BACKEND': 'local',
+                'UPLOAD_ROOT': str(Path(raw) / 'uploads'),
+                'FILE_SECURITY_MODE': 'required',
+                'FILE_CDR_MODE': 'normalize',
+                'CLAMAV_HOST': 'clamav',
+                'CLAMAV_PORT': '3310',
+            }
+            with patch.dict('os.environ', values, clear=False):
+                runtime = build_api_runtime(
+                    Path(raw),
+                    Path(raw) / 'output',
+                    job_manager=FakeJobs(),
+                    plugin_manager=object(),
+                    database=FakeDatabase(),
+                    audit_log=object(),
+                )
+        pipeline = runtime.storage.security_pipeline
+        self.assertTrue(pipeline.required)
+        self.assertEqual(pipeline.clamav.host, 'clamav')
+        self.assertIsNotNone(pipeline.cdr)
+
     async def test_owned_runtime_closes_resources_after_lifespan(self):
         jobs = FakeJobs()
         database = FakeDatabase()

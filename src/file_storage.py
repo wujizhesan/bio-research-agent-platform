@@ -53,6 +53,7 @@ class StoredFile:
     sha256: str
     path: Path
     storage_key: str | None = None
+    security: dict | None = None
 
 
 class LocalFileStorage:
@@ -66,6 +67,7 @@ class LocalFileStorage:
         max_decompressed_bytes: int = 200 * 1024 * 1024,
         max_compression_ratio: float = 100.0,
         allowed_extensions: frozenset[str] = DEFAULT_ALLOWED_EXTENSIONS,
+        security_pipeline=None,
     ):
         if max_bytes < 1:
             raise ValueError('max_bytes must be positive')
@@ -75,6 +77,7 @@ class LocalFileStorage:
         self.max_decompressed_bytes = max(int(max_decompressed_bytes), 1)
         self.max_compression_ratio = max(float(max_compression_ratio), 1.0)
         self.allowed_extensions = frozenset(item.lower() for item in allowed_extensions)
+        self.security_pipeline = security_pipeline
         self.root.mkdir(parents=True, exist_ok=True)
         self._quota_lock = asyncio.Lock()
 
@@ -214,6 +217,29 @@ class LocalFileStorage:
                 content_type = self._inspect_content(
                     target, filename, size_bytes
                 )
+                security = None
+                if self.security_pipeline is not None:
+                    scan_result = await asyncio.to_thread(
+                        self.security_pipeline.process, target, filename
+                    )
+                    security = scan_result.as_dict()
+                    size_bytes = target.stat().st_size
+                    if size_bytes > self.max_bytes:
+                        raise ValueError(
+                            'CDR output exceeds maximum upload size'
+                        )
+                    if (
+                        current_usage + size_bytes + METADATA_RESERVE_BYTES
+                        > self.total_quota_bytes
+                    ):
+                        raise ValueError('CDR output exceeds upload storage quota')
+                    content_type = self._inspect_content(
+                        target, filename, size_bytes
+                    )
+                    digest = hashlib.sha256()
+                    with target.open('rb') as source:
+                        for chunk in iter(lambda: source.read(CHUNK_SIZE), b''):
+                            digest.update(chunk)
                 stored = StoredFile(
                     file_id=file_id,
                     filename=filename,
@@ -221,6 +247,7 @@ class LocalFileStorage:
                     size_bytes=size_bytes,
                     sha256=digest.hexdigest(),
                     path=target,
+                    security=security,
                 )
                 metadata_path.write_text(json.dumps({
                     'file_id': stored.file_id,
@@ -229,6 +256,7 @@ class LocalFileStorage:
                     'size_bytes': stored.size_bytes,
                     'sha256': stored.sha256,
                     'storage_key': stored.storage_key,
+                    'security': stored.security,
                 }, ensure_ascii=False), encoding='utf-8')
                 return stored
             except Exception:
@@ -260,6 +288,7 @@ class LocalFileStorage:
                 sha256=str(payload['sha256']),
                 path=directory / filename,
                 storage_key=payload.get('storage_key'),
+                security=payload.get('security'),
             )
             path = self._resolve_file_path(stored)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -283,6 +312,7 @@ class LocalFileStorage:
             'path': tool_path,
             'download_url': download_url,
             'storage_key': stored.storage_key,
+            'security': stored.security,
         }
 
 
@@ -303,6 +333,7 @@ class S3FileStorage(LocalFileStorage):
         max_decompressed_bytes: int = 200 * 1024 * 1024,
         max_compression_ratio: float = 100.0,
         allowed_extensions: frozenset[str] = DEFAULT_ALLOWED_EXTENSIONS,
+        security_pipeline=None,
         client=None,
     ):
         super().__init__(
@@ -312,6 +343,7 @@ class S3FileStorage(LocalFileStorage):
             max_decompressed_bytes=max_decompressed_bytes,
             max_compression_ratio=max_compression_ratio,
             allowed_extensions=allowed_extensions,
+            security_pipeline=security_pipeline,
         )
         if not bucket or not bucket.strip():
             raise ValueError('S3_BUCKET is required when STORAGE_BACKEND=s3')
@@ -347,6 +379,9 @@ class S3FileStorage(LocalFileStorage):
                     'Metadata': {
                         'file-id': stored.file_id,
                         'sha256': stored.sha256,
+                        'security-status': str(
+                            (stored.security or {}).get('status', 'unscanned')
+                        ),
                     },
                 },
             )
@@ -398,6 +433,9 @@ class S3FileStorage(LocalFileStorage):
                 sha256=str((head.get('Metadata') or {}).get('sha256') or digest.hexdigest()),
                 path=target,
                 storage_key=storage_key,
+                security=(head.get('Metadata') or {}).get('security-status') and {
+                    'status': (head.get('Metadata') or {}).get('security-status')
+                },
             )
             (directory / 'metadata.json').write_text(json.dumps({
                 'file_id': stored.file_id,
@@ -406,6 +444,7 @@ class S3FileStorage(LocalFileStorage):
                 'size_bytes': stored.size_bytes,
                 'sha256': stored.sha256,
                 'storage_key': stored.storage_key,
+                'security': stored.security,
             }, ensure_ascii=False), encoding='utf-8')
             return stored
         except Exception:

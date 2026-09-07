@@ -7,6 +7,13 @@ import types
 import unittest
 from unittest import mock
 
+from src.file_security import (
+    ClamAVScanner,
+    ContentDisarmReconstructor,
+    FileSecurityError,
+    FileSecurityPipeline,
+    build_file_security_pipeline_from_env,
+)
 from src.file_storage import LocalFileStorage, S3FileStorage
 
 
@@ -69,6 +76,100 @@ class S3FileStorageTests(unittest.TestCase):
 
 
 class LocalFileStorageSecurityTests(unittest.TestCase):
+    def test_clamav_and_cdr_run_before_file_is_committed(self):
+        class Scanner:
+            def __init__(self):
+                self.samples = []
+
+            def scan(self, path):
+                self.samples.append(Path(path).read_bytes())
+                return 'clean'
+
+        scanner = Scanner()
+        pipeline = FileSecurityPipeline(
+            clamav=scanner,
+            cdr=ContentDisarmReconstructor(),
+            required=True,
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            storage = LocalFileStorage(
+                Path(raw) / 'uploads', security_pipeline=pipeline
+            )
+            stored = asyncio.run(storage.save(Upload(
+                b'<h1>Result</h1><script>steal()</script>',
+                'report.html',
+            )))
+            self.assertEqual(stored.path.read_text(encoding='utf-8'), 'Result\n')
+            self.assertEqual(stored.security, {
+                'status': 'clean',
+                'clamav': 'clean',
+                'cdr': 'reconstructed',
+                'scan_count': 2,
+            })
+            self.assertIn(b'<script>', scanner.samples[0])
+            self.assertNotIn(b'<script>', scanner.samples[1])
+
+    def test_scan_failure_removes_quarantined_upload(self):
+        class Scanner:
+            def scan(self, _path):
+                raise FileSecurityError('ClamAV detected malware: Test.Signature')
+
+        pipeline = FileSecurityPipeline(
+            clamav=Scanner(),
+            cdr=ContentDisarmReconstructor(),
+            required=True,
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            storage = LocalFileStorage(
+                Path(raw) / 'uploads', security_pipeline=pipeline
+            )
+            with self.assertRaisesRegex(FileSecurityError, 'Test.Signature'):
+                asyncio.run(storage.save(Upload(b'content', 'sample.txt')))
+            self.assertEqual(list(storage.root.iterdir()), [])
+
+    def test_required_security_configuration_fails_closed(self):
+        with mock.patch.dict('os.environ', {
+            'FILE_SECURITY_MODE': 'required',
+            'FILE_CDR_MODE': 'normalize',
+            'CLAMAV_HOST': '',
+        }, clear=False):
+            with self.assertRaisesRegex(ValueError, 'both ClamAV and CDR'):
+                build_file_security_pipeline_from_env()
+
+    def test_clamav_client_uses_framed_instream_protocol(self):
+        class Socket:
+            def __init__(self):
+                self.sent = []
+                self.replies = [b'stream: OK\0']
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def settimeout(self, _timeout):
+                return None
+
+            def sendall(self, data):
+                self.sent.append(data)
+
+            def recv(self, _size):
+                return self.replies.pop(0) if self.replies else b''
+
+        client = Socket()
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / 'sample.txt'
+            path.write_bytes(b'clean')
+            with mock.patch(
+                'src.file_security.socket.create_connection',
+                return_value=client,
+            ):
+                result = ClamAVScanner('clamav').scan(path)
+        self.assertEqual(result, 'clean')
+        self.assertEqual(client.sent[0], b'zINSTREAM\0')
+        self.assertEqual(client.sent[-1], b'\x00\x00\x00\x00')
+
     def test_rejects_archive_and_executable_content_with_safe_extensions(self):
         with tempfile.TemporaryDirectory() as raw:
             storage = LocalFileStorage(Path(raw) / 'uploads')

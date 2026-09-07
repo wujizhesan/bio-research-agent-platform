@@ -367,6 +367,12 @@ def build_tool_executor_from_env(default_mode='process', runner=None):
                 from domain_registry import run_tool
             runner = run_tool
         return InlineToolExecutor(runner)
+    if mode == 'container':
+        try:
+            from .plugin_container import container_tool_executor_from_env
+        except ImportError:
+            from plugin_container import container_tool_executor_from_env
+        return container_tool_executor_from_env()
     raise ValueError(f'unsupported JOB_EXECUTION_MODE: {mode}')
 
 

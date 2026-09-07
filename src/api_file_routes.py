@@ -94,6 +94,7 @@ def register_file_routes(
                 'filename': stored.filename,
                 'size_bytes': stored.size_bytes,
                 'sha256': stored.sha256,
+                'security': stored.security,
             },
         )
         if project_id:

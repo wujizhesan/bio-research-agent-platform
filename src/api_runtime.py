@@ -9,6 +9,7 @@ try:
     from .audit_log import AuditLogger
     from .auth import AuthService, LoginRateLimiter
     from .database import Database
+    from .file_security import build_file_security_pipeline_from_env
     from .file_storage import LocalFileStorage, S3FileStorage
     from .job_manager import JobManager
     from .job_execution import build_tool_executor_from_env, job_max_workers_from_env
@@ -18,6 +19,7 @@ except ImportError:
     from audit_log import AuditLogger
     from auth import AuthService, LoginRateLimiter
     from database import Database
+    from file_security import build_file_security_pipeline_from_env
     from file_storage import LocalFileStorage, S3FileStorage
     from job_manager import JobManager
     from job_execution import build_tool_executor_from_env, job_max_workers_from_env
@@ -99,6 +101,7 @@ def _build_storage(project_root, output_root, file_storage):
         'total_quota_bytes': total_quota_bytes,
         'max_decompressed_bytes': max_decompressed_bytes,
         'max_compression_ratio': max_compression_ratio,
+        'security_pipeline': build_file_security_pipeline_from_env(),
     }
     if configured_backend == 'local':
         storage = LocalFileStorage(upload_root, **storage_limits)
