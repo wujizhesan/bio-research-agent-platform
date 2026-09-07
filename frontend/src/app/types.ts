@@ -33,6 +33,8 @@ export type Job = {
   result?: Record<string, unknown>
   error?: string
   cancel_requested?: boolean
+  trace_id?: string
+  request_id?: string
 }
 
 export type EventItem = {

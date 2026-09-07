@@ -1,5 +1,6 @@
 """FastAPI service adapter for the pluggable research Agent platform."""
 import argparse
+import logging
 import os
 from datetime import datetime, timezone
 from importlib.util import find_spec
@@ -17,6 +18,7 @@ from starlette.responses import Response
 try:
     from .api_contracts import (
         A2A_PROTOCOL_VERSION,
+        FrontendErrorReport,
         PluginStateUpdate,
         ProjectCreate,
         ProjectMemberCreate,
@@ -30,6 +32,7 @@ try:
     from .domain_registry import active_tool_specs
     from .observability import (
         HTTP_ACTIVE,
+        FRONTEND_ERRORS,
         HTTP_LATENCY,
         HTTP_REQUESTS,
         bind_context,
@@ -42,6 +45,7 @@ try:
 except ImportError:
     from api_contracts import (
         A2A_PROTOCOL_VERSION,
+        FrontendErrorReport,
         PluginStateUpdate,
         ProjectCreate,
         ProjectMemberCreate,
@@ -55,6 +59,7 @@ except ImportError:
     from domain_registry import active_tool_specs
     from observability import (
         HTTP_ACTIVE,
+        FRONTEND_ERRORS,
         HTTP_LATENCY,
         HTTP_REQUESTS,
         bind_context,
@@ -179,6 +184,28 @@ def _register_core_routes(
     )
     async def metrics():
         return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+    @app.post('/api/v1/telemetry/frontend-errors', status_code=202, tags=['system'])
+    async def report_frontend_error(
+        payload: FrontendErrorReport,
+        request: Request,
+        principal: Principal = Depends(require_permission('telemetry:write')),
+    ):
+        with bind_context(job_id=payload.job_id, plugin=payload.plugin_id):
+            FRONTEND_ERRORS.inc()
+            log_event(
+                'frontend.error.captured',
+                level=logging.ERROR,
+                boundary_name=payload.boundary_name,
+                error_name=payload.error_name,
+                message=payload.message,
+                component_stack=payload.component_stack,
+                client_trace_id=payload.trace_id,
+                path=payload.path,
+                occurred_at=payload.occurred_at,
+                reporter_subject=principal.subject,
+            )
+        return {'status': 'accepted', 'trace_id': request.state.trace_id}
 
     @app.get(
         '/api/v1/plugins',

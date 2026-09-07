@@ -150,6 +150,46 @@ class FastApiAppTests(unittest.TestCase):
             finally:
                 self._close_app(app)
 
+    def test_frontend_error_is_correlated_and_logged(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_frontend_error_') as raw:
+            app = self._app(raw)
+            captured = []
+
+            def capture(event, *args, **fields):
+                if event == 'frontend.error.captured':
+                    captured.append((fields, fastapi_module.current_context()))
+
+            try:
+                with TestClient(app) as client, patch.object(
+                    fastapi_module, 'log_event', side_effect=capture,
+                ):
+                    response = client.post(
+                        '/api/v1/telemetry/frontend-errors',
+                        headers={'X-Trace-ID': 'frontend-trace-1'},
+                        json={
+                            'boundary_name': 'job-result',
+                            'error_name': 'TypeError',
+                            'message': 'render failed',
+                            'component_stack': 'at JobResultSummary',
+                            'trace_id': 'frontend-trace-1',
+                            'job_id': 'job-1',
+                            'plugin_id': 'sequence',
+                            'path': '/workspace',
+                            'occurred_at': '2026-09-07T00:00:00Z',
+                        },
+                    )
+                self.assertEqual(response.status_code, 202)
+                self.assertEqual(response.json()['trace_id'], 'frontend-trace-1')
+                self.assertEqual(len(captured), 1)
+                fields, context = captured[0]
+                self.assertEqual(fields['boundary_name'], 'job-result')
+                self.assertEqual(fields['error_name'], 'TypeError')
+                self.assertEqual(context['trace_id'], 'frontend-trace-1')
+                self.assertEqual(context['job_id'], 'job-1')
+                self.assertEqual(context['plugin'], 'sequence')
+            finally:
+                self._close_app(app)
+
     def test_project_workspace_and_members(self):
         with tempfile.TemporaryDirectory(prefix='fastapi_projects_') as raw:
             app = self._app(raw)

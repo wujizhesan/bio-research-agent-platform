@@ -87,6 +87,7 @@ jobs:
       RUN_EXTERNAL_SERVICE_TESTS: '1'
       DATABASE_URL: postgresql+asyncpg://bioagent:bioagent-ci-password@127.0.0.1:5432/bioagent_ci
       REDIS_URL: redis://127.0.0.1:6379/0
+      REDIS_NAMESPACE: bioagent-fullstack-${{ github.run_id }}
       CI_LEGACY_JOB_ID: ci-legacy-before-run-context
     steps:
       - name: Check out source
@@ -143,6 +144,71 @@ jobs:
           python -m alembic check
       - name: Test real PostgreSQL and Redis
         run: python -m pytest tests/integration/test_external_services.py -q
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend and browser dependencies
+        working-directory: frontend
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Start authenticated API and Redis worker
+        env:
+          APP_ENV: production
+          CADD_API_TOKEN: ''
+          CADD_JWT_SECRET: ci-fullstack-jwt-secret-at-least-32-characters
+          CORS_ORIGINS: http://127.0.0.1:4173
+          JOB_BACKEND: redis
+          JOB_EXECUTION_MODE: process
+          WORKER_METRICS_PORT: '0'
+        run: |
+          mkdir -p output
+          python - <<'PY' >> "$GITHUB_ENV"
+          import time
+          import jwt
+
+          now = int(time.time())
+          token = jwt.encode({
+              'sub': 'ci-fullstack',
+              'roles': ['admin'],
+              'iat': now,
+              'exp': now + 1800,
+              'iss': 'bio-research-agent',
+          }, 'ci-fullstack-jwt-secret-at-least-32-characters', algorithm='HS256')
+          print(f'VITE_API_TOKEN={token}')
+          print(f'FULLSTACK_API_TOKEN={token}')
+          PY
+          nohup python -m uvicorn src.fastapi_app:app --host 127.0.0.1 --port 8000 > output/ci-fullstack-api.log 2>&1 &
+          echo $! > output/ci-fullstack-api.pid
+          nohup python -m src.worker > output/ci-fullstack-worker.log 2>&1 &
+          echo $! > output/ci-fullstack-worker.pid
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8000/health > output/ci-fullstack-health.json; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat output/ci-fullstack-api.log
+          cat output/ci-fullstack-worker.log
+          exit 1
+      - name: Run real full-stack smoke test
+        working-directory: frontend
+        run: npm run test:e2e:fullstack
+      - name: Upload full-stack smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fullstack-smoke-diagnostics
+          retention-days: 14
+          path: |
+            output/ci-fullstack-*.log
+            output/ci-fullstack-health.json
+            frontend/playwright-report
+            frontend/test-results
+          if-no-files-found: ignore
 
   package:
     name: Build and install Python package
@@ -218,9 +284,41 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
-      - name: Test frontend
+      - name: Lint frontend
         working-directory: frontend
-        run: npm test
+        run: npm run lint
+      - name: Type-check frontend
+        working-directory: frontend
+        run: npm run typecheck
+      - name: Test frontend with coverage thresholds
+        working-directory: frontend
+        run: npm run test:coverage
+      - name: Upload frontend coverage report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-coverage
+          path: frontend/coverage
+          if-no-files-found: error
       - name: Build frontend
         working-directory: frontend
         run: npm run build
+      - name: Enforce frontend performance budget
+        working-directory: frontend
+        run: npm run budget:check
+      - name: Install Playwright Chromium
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+      - name: Run frontend smoke and accessibility tests
+        working-directory: frontend
+        run: npm run test:e2e
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-playwright-report
+          retention-days: 14
+          path: |
+            frontend/playwright-report
+            frontend/test-results
+          if-no-files-found: ignore

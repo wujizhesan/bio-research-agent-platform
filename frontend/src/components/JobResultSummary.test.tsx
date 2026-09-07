@@ -1,7 +1,9 @@
 import { fireEvent, render, screen, within } from '@testing-library/react'
+import { useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import type { Job } from '../app/types'
-import { JobResultSummary, ReportPreviewModal } from './JobResultSummary'
+import { JobResultSummary } from './JobResultSummary'
+import { ReportPreviewModal } from './ReportPreviewModal'
 
 function completedJob(tool: string, result: Record<string, unknown>): Job {
   return {
@@ -144,5 +146,36 @@ describe('ReportPreviewModal', () => {
 
     fireEvent.click(within(dialog).getByRole('button', { name: '关闭预览' }))
     expect(onClose).toHaveBeenCalledOnce()
+  })
+
+  it('锁定焦点、支持 Escape 并在关闭后恢复触发按钮焦点', () => {
+    function Harness() {
+      const [open, setOpen] = useState(false)
+      return <>
+        <button type="button" onClick={() => setOpen(true)}>打开报告</button>
+        {open && <ReportPreviewModal preview={{ url: 'blob:report', filename: 'result.html' }} onClose={() => setOpen(false)} />}
+      </>
+    }
+
+    render(<Harness />)
+    const trigger = screen.getByRole('button', { name: '打开报告' })
+    trigger.focus()
+    fireEvent.click(trigger)
+
+    const dialog = screen.getByRole('dialog', { name: 'HTML 报告预览' })
+    const closeButton = within(dialog).getByRole('button', { name: '关闭预览' })
+    const frame = within(dialog).getByTitle('HTML report preview result.html')
+    expect(closeButton).toHaveFocus()
+
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
+    expect(frame).toHaveFocus()
+    fireEvent.keyDown(document, { key: 'Tab' })
+    expect(closeButton).toHaveFocus()
+    trigger.focus()
+    expect(closeButton).toHaveFocus()
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(trigger).toHaveFocus()
   })
 })

@@ -1,4 +1,5 @@
 import type { Job, UploadedFile } from './types'
+import { recordResponseTrace } from './frontendObservability'
 
 const terminalJobStatuses = new Set<Job['status']>(['completed', 'failed', 'cancelled'])
 
@@ -11,6 +12,7 @@ export async function apiFetch<T>(base: string, token: string, path: string, ini
       ...(init.headers || {}),
     },
   })
+  recordResponseTrace(response)
   const payload = await response.json().catch(() => ({}))
   if (!response.ok) {
     throw new Error(payload.detail || payload.error || `请求失败: ${response.status}`)
@@ -26,6 +28,7 @@ export async function uploadFile(base: string, token: string, file: File, projec
     body,
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   })
+  recordResponseTrace(response)
   const payload = await response.json().catch(() => ({}))
   if (!response.ok) {
     throw new Error(payload.detail || payload.error || `文件上传失败: ${response.status}`)

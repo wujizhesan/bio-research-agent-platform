@@ -28,6 +28,12 @@ _SENSITIVE_KEY = re.compile(
     r'(authorization|cookie|password|passwd|secret|token|api[_-]?key|private[_-]?key)',
     re.IGNORECASE,
 )
+_BEARER_VALUE = re.compile(r'\bBearer\s+[A-Za-z0-9._~+/=-]+', re.IGNORECASE)
+_JWT_VALUE = re.compile(r'\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b')
+_SECRET_ASSIGNMENT = re.compile(
+    r'\b(token|api[_-]?key|password|passwd|secret)=([^&\s]+)',
+    re.IGNORECASE,
+)
 _CONTEXT = {
     'request_id': REQUEST_ID,
     'trace_id': TRACE_ID,
@@ -96,7 +102,10 @@ def sanitize(value, key=None, depth=0):
         return [sanitize(item, key, depth + 1) for item in list(value)[:50]]
     if isinstance(value, str):
         limit = _max_field_length()
-        return value if len(value) <= limit else value[:limit] + '...'
+        redacted = _BEARER_VALUE.sub('Bearer [REDACTED]', value)
+        redacted = _JWT_VALUE.sub('[REDACTED_JWT]', redacted)
+        redacted = _SECRET_ASSIGNMENT.sub(r'\1=[REDACTED]', redacted)
+        return redacted if len(redacted) <= limit else redacted[:limit] + '...'
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return sanitize(str(value), key, depth + 1)
@@ -202,6 +211,10 @@ HTTP_ACTIVE = Gauge(
     'bio_agent_http_active_requests',
     'HTTP requests currently being handled.',
     ['method'],
+)
+FRONTEND_ERRORS = Counter(
+    'bio_agent_frontend_errors_total',
+    'Frontend errors reported by authenticated workbench clients.',
 )
 JOB_SUBMISSIONS = Counter(
     'bio_agent_job_submissions_total',

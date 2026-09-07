@@ -2,11 +2,10 @@
 
 from datetime import datetime, timezone
 from contextlib import nullcontext
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import json
 import os
 from threading import Lock
-from time import sleep, time
+from time import time
 from uuid import uuid4
 
 try:
@@ -21,6 +20,7 @@ try:
         normalize_priority,
     )
     from .workflow_checkpoint import resumable_retry_arguments
+    from .redis_job_worker import RedisJobWorkerRuntime
     from .run_context import build_run_context, bind_run_context
     from .observability import (
         REDIS_JOB_DURATION,
@@ -30,7 +30,6 @@ try:
         REDIS_JOB_RETRIES,
         REDIS_PROCESSING_DEPTH,
         REDIS_QUEUE_DEPTH,
-        REDIS_RESULT_CACHE,
         REDIS_WORKER_ACTIVE,
         JOB_ACTIVE,
         JOB_DURATION,
@@ -51,6 +50,7 @@ except ImportError:
         normalize_priority,
     )
     from workflow_checkpoint import resumable_retry_arguments
+    from redis_job_worker import RedisJobWorkerRuntime
     from run_context import build_run_context, bind_run_context
     from observability import (
         REDIS_JOB_DURATION,
@@ -60,7 +60,6 @@ except ImportError:
         REDIS_JOB_RETRIES,
         REDIS_PROCESSING_DEPTH,
         REDIS_QUEUE_DEPTH,
-        REDIS_RESULT_CACHE,
         REDIS_WORKER_ACTIVE,
         JOB_ACTIVE,
         JOB_DURATION,
@@ -128,6 +127,7 @@ class RedisJobManager:
         except (TypeError, ValueError):
             self.max_concurrency = 2
         self._lock = Lock()
+        self._worker_runtime = RedisJobWorkerRuntime(self)
         self.redis.ping()
 
     def _key(self, job_id):
@@ -637,129 +637,16 @@ class RedisJobManager:
                 self.resource_pool.release(resources)
 
     def _execute_claimed_job(self, record, job_id):
-        self._claim(record)
-        cached = self._load_execution_result(record['_execution_key'])
-        if cached is not None:
-            REDIS_RESULT_CACHE.labels(record['tool'], 'hit').inc()
-            return self._finish(job_id, cached['result'])
-        REDIS_RESULT_CACHE.labels(record['tool'], 'miss').inc()
-        cancellation = {'checked_at': 0.0, 'requested': False}
-        heartbeat = {'renewed_at': time()}
-
-        def cancelled():
-            now = time()
-            if now - cancellation['checked_at'] < 0.5:
-                return cancellation['requested']
-            try:
-                current = self._load(str(job_id))
-            except Exception:
-                return cancellation['requested']
-            cancellation['checked_at'] = now
-            cancellation['requested'] = current is None or bool(current.get('_cancel_requested'))
-            return cancellation['requested']
-
-        def renew_lease():
-            now = time()
-            interval = max(min(self.lease_seconds / 3, 30), 0.2)
-            if now - heartbeat['renewed_at'] < interval:
-                return
-            try:
-                current = self._load(str(job_id))
-                if (
-                    current is not None
-                    and current.get('status') == 'running'
-                    and current.get('_worker_id') == self.worker_id
-                ):
-                    current['_lease_until'] = now + self.lease_seconds
-                    self._save(current)
-            except Exception:
-                return
-            heartbeat['renewed_at'] = now
-
-        try:
-            result = self._tool_executor.execute(
-                record['tool'],
-                record.get('_arguments', {}),
-                cancelled=cancelled,
-                heartbeat=renew_lease,
-            )
-            failed = isinstance(result, dict) and result.get('status') == 'error'
-            if not failed:
-                result = self._store_execution_result(record['_execution_key'], result)
-        except Exception as exc:
-            return self._finish(job_id, {'status': 'error', 'error': str(exc)}, failed=True)
-        return self._finish(job_id, result, failed=failed)
+        return self._worker_runtime.execute_claimed_job(record, job_id)
 
     def _next_job(self):
-        move = getattr(self.redis, 'rpoplpush', None)
-        for queue_key in self._queue_keys:
-            if move is not None:
-                item = move(queue_key, self._processing_key)
-            else:
-                item = self.redis.brpoplpush(
-                    queue_key,
-                    self._processing_key,
-                    timeout=0,
-                )
-            if item:
-                return item
-        return None
+        return self._worker_runtime.next_job()
 
     def _complete_queued_item(self, job_id, poll_timeout):
-        outcome = self.run_job(job_id)
-        record = self._load(job_id)
-        if record is None or record.get('status') in TERMINAL_STATUSES:
-            self._ack(job_id)
-        elif outcome and outcome.get('status') == 'queued':
-            self._ack(job_id)
-            self.redis.lpush(
-                self._queue_for_priority(int(record.get('priority', 0))),
-                job_id,
-            )
-            sleep(min(max(float(poll_timeout), 0.05), 1.0))
+        return self._worker_runtime.complete_queued_item(job_id, poll_timeout)
 
     def run_forever(self, poll_timeout=5):
-        self.recover_stale_jobs()
-        futures = set()
-        executor = ThreadPoolExecutor(
-            max_workers=self.max_concurrency,
-            thread_name_prefix='redis-job',
-        )
-        self._worker_executor = executor
-        try:
-            while True:
-                finished = {future for future in futures if future.done()}
-                for future in finished:
-                    futures.remove(future)
-                    try:
-                        future.result()
-                    except Exception as exc:
-                        log_event(
-                            'worker.job_handler_failed',
-                            worker_id=self.worker_id,
-                            error_type=type(exc).__name__,
-                        )
-                while len(futures) < self.max_concurrency:
-                    item = self._next_job()
-                    if not item:
-                        break
-                    job_id = item.decode('utf-8') if isinstance(item, bytes) else str(item)
-                    futures.add(executor.submit(
-                        self._complete_queued_item,
-                        job_id,
-                        poll_timeout,
-                    ))
-                if not futures:
-                    self.recover_stale_jobs()
-                    sleep(min(max(float(poll_timeout), 0.05), 1.0))
-                elif futures:
-                    wait(
-                        futures,
-                        timeout=min(max(float(poll_timeout), 0.05), 1.0),
-                        return_when=FIRST_COMPLETED,
-                    )
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+        return self._worker_runtime.run_forever(poll_timeout)
 
     def resource_status(self):
         return {

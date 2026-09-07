@@ -66,6 +66,10 @@ class ObservabilityTests(unittest.TestCase):
             'status': 'success',
             'api_key': 'secret-value',
             'nested': {'access_token': 'token-value'},
+            'message': (
+                'Bearer top-secret token=query-secret '
+                'eyJabcdefgh.ijklmnop.qrstuvwx'
+            ),
         }
         with bind_context(trace_id='trace-1', job_id='job-1'):
             payload = json.loads(JsonLogFormatter('test-service').format(record))
@@ -73,6 +77,9 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(payload['job_id'], 'job-1')
         self.assertEqual(payload['api_key'], '[REDACTED]')
         self.assertEqual(payload['nested']['access_token'], '[REDACTED]')
+        self.assertNotIn('top-secret', payload['message'])
+        self.assertNotIn('query-secret', payload['message'])
+        self.assertNotIn('eyJabcdefgh', payload['message'])
 
     def test_logger_uses_current_stderr_stream(self):
         logger = logging.getLogger('bio_agent')

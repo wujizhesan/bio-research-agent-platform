@@ -17,13 +17,14 @@ ROLE_PERMISSIONS = {
     'admin': frozenset({
         'catalog:read', 'files:read', 'files:write', 'jobs:read', 'jobs:write',
         'metrics:read', 'members:write', 'plugins:write', 'projects:read',
-        'projects:write', 'runs:read',
+        'projects:write', 'runs:read', 'telemetry:write',
     }),
     'researcher': frozenset({
         'catalog:read', 'files:read', 'files:write', 'jobs:read', 'jobs:write',
         'members:write', 'projects:read', 'projects:write', 'runs:read',
+        'telemetry:write',
     }),
-    'viewer': frozenset({'catalog:read', 'files:read', 'jobs:read', 'projects:read', 'runs:read'}),
+    'viewer': frozenset({'catalog:read', 'files:read', 'jobs:read', 'projects:read', 'runs:read', 'telemetry:write'}),
 }
 
 

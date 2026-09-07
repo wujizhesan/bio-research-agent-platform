@@ -43,6 +43,18 @@ class ProjectMemberCreate(BaseModel):
     role: Literal['owner', 'editor', 'viewer'] = 'viewer'
 
 
+class FrontendErrorReport(BaseModel):
+    boundary_name: str = Field(min_length=1, max_length=128)
+    error_name: str = Field(min_length=1, max_length=128)
+    message: str = Field(default='', max_length=1024)
+    component_stack: str = Field(default='', max_length=4096)
+    trace_id: str | None = Field(default=None, max_length=128)
+    job_id: str | None = Field(default=None, max_length=128)
+    plugin_id: str | None = Field(default=None, max_length=128)
+    path: str | None = Field(default=None, max_length=512)
+    occurred_at: str | None = Field(default=None, max_length=64)
+
+
 def iter_artifact_values(value):
     if isinstance(value, dict):
         for key, item in value.items():

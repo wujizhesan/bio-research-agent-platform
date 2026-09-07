@@ -23,7 +23,7 @@ export function QcStatusMetric({ label, value, className }: { label: string; val
 }
 
 export function PipelineMetric({ label, value }: { label: string; value: unknown }) {
-  return <div className="rounded-xl border border-white/[0.08] bg-[#071719]/70 px-3 py-2.5"><div className="font-mono text-[9px] tracking-[0.12em] text-[#63817b]">{label}</div><div className="mt-1 font-mono text-lg text-[#e4f1ed]">{String(value)}</div></div>
+  return <div className="rounded-xl border border-white/[0.08] bg-[#071719]/70 px-3 py-2.5"><div className="font-mono text-[9px] tracking-[0.12em] text-[#7fa49c]">{label}</div><div className="mt-1 font-mono text-lg text-[#e4f1ed]">{String(value)}</div></div>
 }
 
 export function StatusBadge({ status }: { status: string }) {
@@ -98,5 +98,5 @@ export function ResearchPlanCard({ plan, loading, onExecute }: { plan: ResearchP
 }
 
 export function EmptyStream() {
-  return <div className="flex flex-1 flex-col items-center justify-center text-center"><div className="grid size-14 place-items-center rounded-2xl border border-[#21443f] bg-[#102b2a] text-[#78cdaa]"><Radio size={23} /></div><div className="mt-4 text-sm font-medium text-[#b1cbc4]">等待任务流</div><div className="mt-2 max-w-[220px] text-xs leading-5 text-[#64827b]">提交任务后，这里会实时显示状态和可追溯事件。</div></div>
+  return <div className="flex flex-1 flex-col items-center justify-center text-center"><div className="grid size-14 place-items-center rounded-2xl border border-[#21443f] bg-[#102b2a] text-[#78cdaa]"><Radio size={23} /></div><div className="mt-4 text-sm font-medium text-[#b1cbc4]">等待任务流</div><div className="mt-2 max-w-[220px] text-xs leading-5 text-[#7fa49c]">提交任务后，这里会实时显示状态和可追溯事件。</div></div>
 }
