@@ -76,7 +76,9 @@ class ProjectMemberRow(Base):
 class JobProjectRow(Base):
     __tablename__ = 'job_projects'
 
-    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey('job_records.job_id', ondelete='CASCADE'), primary_key=True,
+    )
     project_id: Mapped[str] = mapped_column(
         String(64), ForeignKey('projects.project_id', ondelete='CASCADE'), nullable=False, index=True,
     )

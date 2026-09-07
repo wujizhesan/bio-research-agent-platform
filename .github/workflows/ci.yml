@@ -2,17 +2,58 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, platform-main]
   pull_request:
-    branches: [main]
+    branches: [main, platform-main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Test Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    env:
+      CADD_SKIP_ASSETS: '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install source and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -e . --no-deps
+          python -m pip install pytest pytest-asyncio coverage
+      - name: Run unit tests
+        run: |
+          coverage run --source=src -m pytest -q --ignore=tests/integration
+          coverage report
+      - name: Verify domain catalog and workflow dry-run
+        run: |
+          mkdir -p output
+          python -m src.domain_registry --domain all > output/ci_domains.json
+          python -m src.workflow_runner --workflow examples/workflows/bgi_research_demo.yaml --dry-run --out output/ci_workflow.json
+      - name: Evaluate deterministic research planning
+        run: python -m src.research_evaluator --out output/ci_research_eval.json
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+  services:
+    name: PostgreSQL, Redis and migrations
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -28,43 +69,127 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     env:
       CADD_SKIP_ASSETS: '1'
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ['3.11', '3.12']
+      AUTO_CREATE_SCHEMA: 'false'
+      RUN_EXTERNAL_SERVICE_TESTS: '1'
+      DATABASE_URL: postgresql+asyncpg://bioagent:bioagent-ci-password@127.0.0.1:5432/bioagent_ci
+      REDIS_URL: redis://127.0.0.1:6379/0
+      CI_LEGACY_JOB_ID: ci-legacy-before-run-context
     steps:
       - name: Check out source
         uses: actions/checkout@v6
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: '3.12'
           cache: pip
-      - name: Install dependencies
+      - name: Install integration dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m pip install -e . --no-deps
-          python -m pip install pytest pytest-asyncio coverage
-      - name: Run unit and integration tests
+          python -m pip install pytest pytest-asyncio
+      - name: Upgrade previous database revision
         run: |
-          coverage run --source=src -m pytest -q
-          coverage report
-      - name: Verify database migration
+          python -m alembic upgrade 0005_job_observability
+          python - <<'PY'
+          import asyncio
+          import os
+          import asyncpg
+
+          async def seed():
+              connection = await asyncpg.connect(
+                  os.environ['DATABASE_URL'].replace('postgresql+asyncpg://', 'postgresql://')
+              )
+              try:
+                  await connection.execute(
+                      '''
+                      INSERT INTO job_records (
+                          job_id, tool, status, created_at, arguments, attempts,
+                          cancel_requested, resources, priority, trace_id
+                      ) VALUES ($1, $2, $3, $4, $5::json, $6, $7, $8::json, $9, $10)
+                      ''',
+                      os.environ['CI_LEGACY_JOB_ID'],
+                      'research_catalog',
+                      'completed',
+                      '2026-09-07T00:00:00+00:00',
+                      '{}',
+                      1,
+                      False,
+                      '{}',
+                      0,
+                      'ci-legacy-trace',
+                  )
+              finally:
+                  await connection.close()
+
+          asyncio.run(seed())
+          PY
+          python -m alembic upgrade head
+          python -m alembic current --check-heads
+          python -m alembic check
+      - name: Test real PostgreSQL and Redis
+        run: python -m pytest tests/integration/test_external_services.py -q
+
+  package:
+    name: Build and install Python package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Build and validate distributions
         run: |
-          mkdir -p output
-          DATABASE_URL=sqlite+aiosqlite:///./output/ci.db alembic upgrade head
-          DATABASE_URL=postgresql+asyncpg://bioagent:bioagent-ci-password@127.0.0.1:5432/bioagent_ci alembic upgrade head
-      - name: Verify domain catalog and workflow dry-run
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+      - name: Install wheel in a clean environment
         run: |
-          python -m src.domain_registry --domain all > output/ci_domains.json
-          python -m src.workflow_runner --workflow examples/workflows/bgi_research_demo.yaml --dry-run --out output/ci_workflow.json
-      - name: Evaluate deterministic research planning
-        run: python -m src.research_evaluator --out output/ci_research_eval.json
-      - name: Validate Compose configuration
-        run: docker compose config --quiet
+          python -m venv .venv-package
+          .venv-package/bin/python -m pip install --upgrade pip
+          .venv-package/bin/python -m pip install dist/*.whl
+          .venv-package/bin/python -m pip check
+      - name: Smoke-test installed modules and entry points
+        run: |
+          mkdir -p /tmp/bio-agent-package-smoke
+          cd /tmp/bio-agent-package-smoke
+          "$GITHUB_WORKSPACE/.venv-package/bin/python" - <<'PY'
+          from importlib.metadata import version
+          from pathlib import Path
+          import database
+          import domain_registry
+          import fastapi_app
+          import redis_job_manager
+          import run_context
+
+          assert version('bio-research-agent-platform')
+          assert 'site-packages' in Path(run_context.__file__).as_posix()
+          assert domain_registry.active_tool_specs()
+          assert fastapi_app.app is not None
+          assert database.Database is not None
+          assert redis_job_manager.RedisJobManager is not None
+          PY
+          "$GITHUB_WORKSPACE/.venv-package/bin/bio-agent-domains" --domain all > installed_domains.json
+          "$GITHUB_WORKSPACE/.venv-package/bin/bio-agent-workflow" \
+            --workflow "$GITHUB_WORKSPACE/examples/workflows/bgi_research_demo.yaml" \
+            --dry-run \
+            --out installed_workflow.json
+          test -s installed_domains.json
+          test -s installed_workflow.json
 
   container:
     name: Build Docker image
