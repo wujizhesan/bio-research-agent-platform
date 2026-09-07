@@ -11,10 +11,12 @@ try:
     from .domain_registry import run_tool, active_tool_specs
     from .plugin_manager import PluginManager
     from .job_manager import JobManager
+    from .job_execution import build_tool_executor_from_env, job_max_workers_from_env
 except ImportError:
     from domain_registry import run_tool, active_tool_specs
     from plugin_manager import PluginManager
     from job_manager import JobManager
+    from job_execution import build_tool_executor_from_env, job_max_workers_from_env
 
 
 API_NAME = 'cadd-bio-agent-api'
@@ -28,12 +30,20 @@ PLUGIN_MANAGER = PluginManager(state_path=OUTPUT_ROOT / 'plugin_state.json')
 def _default_job_manager():
     global JOB_MANAGER
     if JOB_MANAGER is None:
-        JOB_MANAGER = JobManager(store_path=OUTPUT_ROOT / 'jobs.sqlite3')
+        JOB_MANAGER = JobManager(
+            max_workers=job_max_workers_from_env(),
+            store_path=OUTPUT_ROOT / 'jobs.sqlite3',
+            tool_executor=build_tool_executor_from_env(),
+        )
     return JOB_MANAGER
 
 
 def is_authorized(target, headers=None, api_token=None):
     path = urlparse(target).path.rstrip('/') or '/'
+    if os.environ.get('APP_ENV', 'development').strip().lower() in {
+        'production', 'prod'
+    }:
+        return path in {'/', '/health'}
     configured = api_token if api_token is not None else os.environ.get('CADD_API_TOKEN')
     if not configured or path in {'/', '/health'}:
         return True
@@ -126,6 +136,17 @@ def route_request(method, target, payload=None, output_root=None, job_manager=No
         return 200, {'status': 'ok', 'service': API_NAME, 'version': API_VERSION}
     if method == 'GET' and path == '/plugins':
         return 200, {'status': 'ok', 'plugins': plugins.list()}
+    if method == 'POST' and path == '/plugins/validate':
+        report = plugins.validate_candidate(payload or {})
+        return 200, {'status': 'ok', 'validation': report}
+    if method == 'POST' and path == '/plugins/health':
+        return 200, {'status': 'ok', 'plugins': plugins.check_health()}
+    if method == 'POST' and path.startswith('/plugins/') and path.endswith('/health'):
+        domain = unquote(path[len('/plugins/'): -len('/health')].rstrip('/'))
+        try:
+            return 200, {'status': 'ok', 'plugin': plugins.check_health(domain)}
+        except ValueError as exc:
+            return 400, {'status': 'error', 'error': str(exc)}
     if method == 'GET' and path.startswith('/plugins/'):
         domain = unquote(path[len('/plugins/'):])
         item = plugins.get(domain)
@@ -178,6 +199,11 @@ def route_request(method, target, payload=None, output_root=None, job_manager=No
     if method == 'GET' and path == '/jobs':
         limit = parse_qs(parsed.query).get('limit', ['20'])[0]
         return 200, {'status': 'ok', 'jobs': get_jobs().list(limit)}
+    if method == 'GET' and path == '/scheduler/resources':
+        status_reader = getattr(get_jobs(), 'resource_status', None)
+        if status_reader is None:
+            return 501, {'status': 'error', 'error': 'scheduler resource status is unavailable'}
+        return 200, {'status': 'ok', 'scheduler': status_reader()}
     if method == 'GET' and path.startswith('/jobs/'):
         job_id = unquote(path[len('/jobs/'):])
         record = get_jobs().get(job_id)
@@ -189,7 +215,13 @@ def route_request(method, target, payload=None, output_root=None, job_manager=No
         try:
             name = body.get('tool')
             arguments = body.get('arguments', body.get('args', {}))
-            record = get_jobs().submit(name, arguments, idempotency_key=body.get('idempotency_key'))
+            record = get_jobs().submit(
+                name,
+                arguments,
+                idempotency_key=body.get('idempotency_key'),
+                resources=body.get('resources'),
+                priority=body.get('priority', 0),
+            )
         except (TypeError, ValueError) as exc:
             return 400, {'status': 'error', 'error': str(exc)}
         return 202, {'status': 'deduplicated' if record.get('deduplicated') else 'accepted', 'job': record}
@@ -256,6 +288,12 @@ class BioAPIHandler(BaseHTTPRequestHandler):
 
 
 def main(argv=None):
+    if os.environ.get('APP_ENV', 'development').strip().lower() in {
+        'production', 'prod'
+    }:
+        raise SystemExit(
+            'legacy api_server is disabled in production; use fastapi_app'
+        )
     parser = argparse.ArgumentParser(description='Run the local bioinformatics HTTP API')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8765)

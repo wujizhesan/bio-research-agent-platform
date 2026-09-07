@@ -9,10 +9,12 @@ from threading import RLock
 
 try:
     from .config_loader import PROJECT_ROOT
-    from .domain_registry import domain_catalog
+    from .plugin_health import assess_plugin_health, validate_candidate
+    from .observability import PLUGIN_HEALTH, log_event
 except ImportError:
     from config_loader import PROJECT_ROOT
-    from domain_registry import domain_catalog
+    from plugin_health import assess_plugin_health, validate_candidate
+    from observability import PLUGIN_HEALTH, log_event
 
 
 _STATE_THREAD_LOCK = RLock()
@@ -49,10 +51,36 @@ STATE_VERSION = 1
 DEFAULT_STATE_PATH = PROJECT_ROOT / 'output' / 'plugin_state.json'
 
 
+def _default_catalog_loader():
+    try:
+        from .domain_registry import domain_catalog
+    except ImportError:
+        from domain_registry import domain_catalog
+    return domain_catalog()
+
+
+def _default_source_loader(domain):
+    try:
+        from .domain_registry import REGISTRY
+    except ImportError:
+        from domain_registry import REGISTRY
+    registered = REGISTRY.domains.get(domain)
+    return registered.source if registered else None
+
+
 class PluginManager:
-    def __init__(self, state_path=None, catalog_loader=None):
+    def __init__(self, state_path=None, catalog_loader=None, source_loader=None,
+                 failure_threshold=None):
         self.state_path = Path(state_path or DEFAULT_STATE_PATH)
-        self.catalog_loader = catalog_loader or domain_catalog
+        self.catalog_loader = catalog_loader or _default_catalog_loader
+        self.source_loader = source_loader or _default_source_loader
+        configured_threshold = failure_threshold or os.environ.get(
+            'PLUGIN_HEALTH_FAILURE_THRESHOLD', '3'
+        )
+        try:
+            self.failure_threshold = max(int(configured_threshold), 1)
+        except (TypeError, ValueError):
+            self.failure_threshold = 3
 
     def _read_state(self):
         if not self.state_path.exists():
@@ -97,14 +125,30 @@ class PluginManager:
         for item in self.catalog_loader():
             domain = item['domain']
             record = state['plugins'].get(domain, {})
-            enabled = bool(record.get('enabled', True)) and item.get('status') == 'available'
+            quarantined = bool(record.get('quarantined', False))
+            enabled = (
+                bool(record.get('enabled', True))
+                and not quarantined
+                and item.get('status') == 'available'
+            )
+            if item.get('status') != 'available':
+                activation = 'unavailable'
+            elif quarantined:
+                activation = 'quarantined'
+            elif enabled:
+                activation = 'enabled'
+            else:
+                activation = 'disabled'
             current = dict(item)
             current.update({
                 'enabled': enabled,
-                'activation': 'enabled' if enabled and item.get('status') == 'available' else 'disabled',
+                'activation': activation,
+                'failure_count': int(record.get('failure_count', 0)),
             })
             if record.get('updated_at'):
                 current['state_updated_at'] = record['updated_at']
+            if record.get('health'):
+                current['health'] = dict(record['health'])
             result.append(current)
         return result
 
@@ -120,20 +164,114 @@ class PluginManager:
             raise ValueError(f'unknown plugin domain: {domain}')
         if enabled and item.get('status') != 'available':
             raise ValueError(f'plugin is unavailable: {domain}')
+        health = None
+        if enabled:
+            health = assess_plugin_health(
+                domain,
+                self.source_loader(domain),
+                item.get('manifest', {
+                    'status': item.get('status'),
+                    'requirements': [],
+                }),
+            )
+            if not health['healthy']:
+                raise ValueError(
+                    f"plugin health check failed: {domain}: {health.get('reason', 'unhealthy')}"
+                )
         with _state_guard(self.state_path):
             state = self._read_state()
-            state['plugins'][domain] = {
+            previous = state['plugins'].get(domain, {})
+            record = {
+                **previous,
                 'enabled': bool(enabled),
+                'quarantined': False,
+                'failure_count': 0 if enabled else int(previous.get('failure_count', 0)),
                 'updated_at': datetime.now(timezone.utc).isoformat(),
             }
+            if health:
+                record['health'] = health
+            state['plugins'][domain] = record
             self._write_state(state)
-        return self.get(domain)
+        current = self.get(domain)
+        log_event(
+            'plugin.state.changed',
+            plugin=domain,
+            activation=current.get('activation') if current else None,
+        )
+        return current
 
     def enable(self, domain):
         return self.set_enabled(domain, True)
 
     def disable(self, domain):
         return self.set_enabled(domain, False)
+
+    def validate_candidate(self, manifest):
+        return validate_candidate(manifest)
+
+    def _record_health(self, domain, health, auto_disable):
+        with _state_guard(self.state_path):
+            state = self._read_state()
+            previous = state['plugins'].get(domain, {})
+            failures = 0 if health['healthy'] else int(previous.get('failure_count', 0)) + 1
+            quarantined = bool(previous.get('quarantined', False))
+            enabled = bool(previous.get('enabled', True))
+            if auto_disable and failures >= self.failure_threshold:
+                quarantined = True
+                enabled = False
+            state['plugins'][domain] = {
+                **previous,
+                'enabled': enabled,
+                'quarantined': quarantined,
+                'failure_count': failures,
+                'health': health,
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+            }
+            self._write_state(state)
+        current = self.get(domain)
+        PLUGIN_HEALTH.labels(domain).set(1 if health['healthy'] else 0)
+        log_event(
+            'plugin.health.checked',
+            plugin=domain,
+            status=health.get('status'),
+            healthy=health.get('healthy'),
+            source=health.get('source'),
+            quarantined=current.get('activation') == 'quarantined' if current else None,
+        )
+        return current
+
+    def check_health(self, domain=None, auto_disable=True):
+        catalog = self._catalog_map()
+        if domain is not None and domain not in catalog:
+            raise ValueError(f'unknown plugin domain: {domain}')
+        selected = [domain] if domain is not None else list(catalog)
+        results = []
+        for key in selected:
+            item = catalog[key]
+            health = assess_plugin_health(
+                key,
+                self.source_loader(key),
+                item.get('manifest', {
+                    'status': item.get('status'),
+                    'requirements': [],
+                }),
+            )
+            results.append(self._record_health(key, health, auto_disable))
+        return results[0] if domain is not None else results
+
+    def record_contract_failure(self, domain, reason):
+        item = self._catalog_map().get(domain)
+        if item is None:
+            raise ValueError(f'unknown plugin domain: {domain}')
+        health = {
+            'domain': domain,
+            'status': 'unhealthy',
+            'healthy': False,
+            'reason': str(reason),
+            'checked_at': datetime.now(timezone.utc).isoformat(),
+            'source': 'runtime_contract',
+        }
+        return self._record_health(domain, health, True)
 
 
 def is_domain_enabled(domain, state_path=None, catalog_loader=None):

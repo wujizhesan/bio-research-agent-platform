@@ -18,6 +18,16 @@ class ApiServerTests(unittest.TestCase):
             self.assertFalse(is_authorized('/jobs', {'Authorization': 'Bearer wrong'}))
             self.assertTrue(is_authorized('/jobs', {'Authorization': 'Bearer secret-token'}))
 
+    def test_legacy_server_denies_non_health_routes_in_production(self):
+        with patch.dict('os.environ', {
+            'APP_ENV': 'production',
+            'CADD_API_TOKEN': 'legacy',
+        }, clear=False):
+            self.assertTrue(is_authorized('/health', {}))
+            self.assertFalse(is_authorized(
+                '/jobs', {'Authorization': 'Bearer legacy'}
+            ))
+
     def test_health_and_plugin_catalog(self):
         status, health = route_request('GET', '/health')
         self.assertEqual(status, 200)

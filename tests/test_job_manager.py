@@ -7,10 +7,51 @@ from pathlib import Path
 from threading import Event
 from unittest.mock import patch
 
+from src.job_execution import InlineToolExecutor
 from src.job_manager import JobManager
 
 
 class JobManagerPersistenceTests(unittest.TestCase):
+    def test_retry_enables_workflow_checkpoint_resume(self):
+        with tempfile.TemporaryDirectory(prefix='job_workflow_resume_') as raw:
+            checkpoint = Path(raw) / 'manifest.json'
+            calls = []
+
+            def run(_tool, arguments):
+                calls.append(dict(arguments))
+                if len(calls) == 1:
+                    checkpoint.write_text(
+                        json.dumps({'checkpoint_version': 1, 'steps': []}),
+                        encoding='utf-8',
+                    )
+                    return {'status': 'error', 'error': 'interrupted'}
+                return {'status': 'ok'}
+
+            manager = JobManager(
+                max_workers=1,
+                tool_executor=InlineToolExecutor(run),
+            )
+            try:
+                submitted = manager.submit('research_execute', {
+                    'workflow': {'steps': []},
+                    'output_path': str(checkpoint),
+                    'resume': False,
+                })
+                for _ in range(200):
+                    current = manager.get(submitted['job_id'])
+                    if current['status'] == 'failed':
+                        break
+                    time.sleep(0.01)
+                retried = manager.retry(submitted['job_id'])
+                for _ in range(200):
+                    current = manager.get(retried['job_id'])
+                    if current['status'] == 'completed':
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(calls[1]['resume'])
+            finally:
+                manager.shutdown()
+
     def test_idempotency_key_reuses_matching_job(self):
         manager = JobManager(max_workers=1)
         try:

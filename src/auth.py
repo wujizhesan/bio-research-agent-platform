@@ -31,6 +31,24 @@ class AuthenticationError(ValueError):
     pass
 
 
+def _read_secret(name: str, file_name: str) -> str | None:
+    direct = os.environ.get(name, '').strip()
+    path_value = os.environ.get(file_name, '').strip()
+    if direct and path_value:
+        raise ValueError(f'configure only one of {name} or {file_name}')
+    if not path_value:
+        return direct or None
+    path = os.path.abspath(path_value)
+    try:
+        with open(path, encoding='utf-8') as handle:
+            value = handle.read(65537)
+    except OSError as exc:
+        raise ValueError(f'unable to read {file_name}') from exc
+    if len(value) > 65536:
+        raise ValueError(f'{file_name} exceeds 65536 bytes')
+    return value.strip() or None
+
+
 class LoginRateLimiter:
     def __init__(self, max_attempts=5, window_seconds=60):
         self.max_attempts = max(int(max_attempts), 1)
@@ -106,13 +124,29 @@ class AuthService:
 
     @classmethod
     def from_env(cls):
-        raw_users = os.environ.get('CADD_AUTH_USERS_JSON', '')
+        production = os.environ.get('APP_ENV', 'development').strip().lower() in {
+            'production', 'prod'
+        }
+        legacy_token = os.environ.get('CADD_API_TOKEN', '').strip() or None
+        if production and legacy_token:
+            raise ValueError('CADD_API_TOKEN is forbidden in production')
+        jwt_secret = _read_secret('CADD_JWT_SECRET', 'CADD_JWT_SECRET_FILE')
+        if production and not jwt_secret:
+            raise ValueError('JWT secret is required in production')
+        raw_users = _read_secret(
+            'CADD_AUTH_USERS_JSON', 'CADD_AUTH_USERS_FILE'
+        ) or ''
         users = json.loads(raw_users) if raw_users else {}
         if not isinstance(users, dict):
             raise ValueError('CADD_AUTH_USERS_JSON must be a JSON object')
+        if production and any(
+            isinstance(record, dict) and record.get('password')
+            for record in users.values()
+        ):
+            raise ValueError('plaintext passwords are forbidden in production')
         return cls(
-            legacy_token=os.environ.get('CADD_API_TOKEN'),
-            jwt_secret=os.environ.get('CADD_JWT_SECRET'),
+            legacy_token=None if production else legacy_token,
+            jwt_secret=jwt_secret,
             users=users,
             ttl_seconds=int(os.environ.get('AUTH_TOKEN_TTL_SECONDS', '3600')),
             issuer=os.environ.get('CADD_JWT_ISSUER', 'bio-research-agent'),

@@ -56,6 +56,16 @@ class DatabaseStateTests(unittest.TestCase):
                 '_cancel_requested': False,
                 '_worker_id': 'worker-1',
                 '_lease_until': 123.5,
+                'resources': {
+                    'cpu_cores': 2,
+                    'memory_mb': 4096,
+                    'gpu_count': 1,
+                    'gpu_memory_mb': 12000,
+                    'labels': ['cuda'],
+                },
+                'priority': 50,
+                'trace_id': 'trace-worker-1',
+                'request_id': 'request-worker-1',
             }
             with patch.dict(os.environ, {'AUTO_CREATE_SCHEMA': 'true'}, clear=False):
                 writer = DatabaseStateWriter(url)
@@ -69,6 +79,10 @@ class DatabaseStateTests(unittest.TestCase):
                 asyncio.run(database.close())
             self.assertEqual(stored['status'], 'running')
             self.assertEqual(stored['attempts'], 2)
+            self.assertEqual(stored['resources']['gpu_count'], 1)
+            self.assertEqual(stored['priority'], 50)
+            self.assertEqual(stored['trace_id'], 'trace-worker-1')
+            self.assertEqual(stored['request_id'], 'request-worker-1')
 
 
 if __name__ == '__main__':

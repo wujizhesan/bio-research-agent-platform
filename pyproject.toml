@@ -20,6 +20,7 @@ dependencies = [
   "matplotlib>=3.8",
   "PyYAML>=6.0",
   "jsonschema>=4.20",
+  "packaging>=24.0",
   "fastapi>=0.115",
   "PyJWT>=2.8",
   "redis>=5.0",
@@ -41,6 +42,7 @@ chainlit = ["chainlit==2.11.1"]
 [project.scripts]
 bio-agent-domains = "domain_registry:main"
 bio-agent-workflow = "workflow_runner:main"
+bio-agent-reproduce = "reproducibility:main"
 bio-agent-mcp = "mcp_server:main"
 bio-agent-api = "fastapi_app:main"
 bio-agent-eval = "research_evaluator:main"
@@ -49,6 +51,12 @@ bio-agent-eval = "research_evaluator:main"
 package-dir = {"" = "src"}
 py-modules = [
   "agent",
+  "api_a2a_routes",
+  "api_contracts",
+  "api_dependencies",
+  "api_file_routes",
+  "api_job_routes",
+  "api_runtime",
   "api_server",
   "audit_external_overlap",
   "build_hard_decoy_benchmark",
@@ -70,6 +78,8 @@ py-modules = [
   "import_bindingdb",
   "imaging_plugin",
   "job_manager",
+  "job_execution",
+  "job_subprocess",
   "knowledge_plugin",
   "literature_plugin",
   "library_data",
@@ -80,12 +90,17 @@ py-modules = [
   "plugin_loader",
   "plugin_manager",
   "plugin_manifest",
+  "plugin_health",
+  "plugin_registry",
+  "plugin_security",
   "prepare_receptor",
   "qa_verify",
   "report",
+  "reproducibility",
   "research_agent",
   "research_evaluator",
   "research_planner",
+  "resource_scheduling",
   "resplit_external",
   "run_benchmark_replicates",
   "sequence_plugin",
@@ -96,4 +111,5 @@ py-modules = [
   "job_state_store",
   "worker",
   "workflow_runner",
+  "workflow_checkpoint",
 ]

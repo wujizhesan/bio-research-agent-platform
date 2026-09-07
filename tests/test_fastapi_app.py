@@ -1,5 +1,6 @@
 import os
 import asyncio
+import gzip
 import json
 import shutil
 import tempfile
@@ -110,13 +111,42 @@ class FastApiAppTests(unittest.TestCase):
             app = self._app(raw)
             try:
                 with TestClient(app) as client:
-                    health = client.get('/health', headers={'X-Request-ID': 'interview-trace-001'})
+                    health = client.get('/health', headers={
+                        'X-Request-ID': 'interview-trace-001',
+                        'traceparent': '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01',
+                    })
                     self.assertEqual(health.status_code, 200)
                     self.assertEqual(health.json()['database'], 'ok')
                     self.assertEqual(health.json()['storage_backend'], 'local')
                     self.assertEqual(health.headers['x-request-id'], 'interview-trace-001')
+                    self.assertEqual(
+                        health.headers['x-trace-id'],
+                        '0123456789abcdef0123456789abcdef',
+                    )
+                    self.assertEqual(
+                        health.json()['observability']['trace_id'],
+                        '0123456789abcdef0123456789abcdef',
+                    )
                     self.assertIn('/api/v1/jobs', client.get('/openapi.json').json()['paths'])
                     self.assertIn('bio_agent_http_requests_total', client.get('/metrics').text)
+                    client.get('/missing/high-cardinality-value')
+                    metrics = client.get('/metrics').text
+                    self.assertIn('/_unmatched', metrics)
+                    self.assertNotIn('/missing/high-cardinality-value', metrics)
+                    submitted = client.post(
+                        '/api/v1/jobs',
+                        json={'tool': 'research_catalog', 'arguments': {}},
+                        headers={
+                            'X-Request-ID': 'job-request-001',
+                            'X-Trace-ID': 'job-trace-001',
+                        },
+                    )
+                    self.assertEqual(submitted.status_code, 202)
+                    job = submitted.json()['job']
+                    self.assertEqual(job['trace_id'], 'job-trace-001')
+                    self.assertEqual(job['request_id'], 'job-request-001')
+                    completed = self._wait_for_job(client, job['job_id'])
+                    self.assertEqual(completed['trace_id'], 'job-trace-001')
             finally:
                 self._close_app(app)
 
@@ -361,6 +391,40 @@ class FastApiAppTests(unittest.TestCase):
             finally:
                 self._close_app(app)
 
+    def test_job_resource_request_and_scheduler_capacity_are_exposed(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_resources_') as raw:
+            app = self._app(raw)
+            try:
+                with TestClient(app) as client:
+                    scheduler = client.get('/api/v1/scheduler/resources')
+                    self.assertEqual(scheduler.status_code, 200)
+                    self.assertIn('capacity', scheduler.json()['scheduler'])
+                    submitted = client.post('/api/v1/jobs', json={
+                        'tool': 'research_catalog',
+                        'arguments': {},
+                        'priority': 25,
+                        'resources': {
+                            'cpu_cores': 1,
+                            'memory_mb': 512,
+                            'gpu_count': 0,
+                            'gpu_memory_mb': 0,
+                            'labels': [],
+                        },
+                    })
+                    self.assertEqual(submitted.status_code, 202)
+                    job = submitted.json()['job']
+                    self.assertEqual(job['priority'], 25)
+                    self.assertEqual(job['resources']['memory_mb'], 512)
+                    rejected = client.post('/api/v1/jobs', json={
+                        'tool': 'research_catalog',
+                        'arguments': {},
+                        'resources': {'gpu_count': 1},
+                    })
+                    self.assertEqual(rejected.status_code, 400)
+                    self.assertIn('gpu_count', rejected.json()['detail'])
+            finally:
+                self._close_app(app)
+
     def test_research_plan_execute_and_artifact_download_close_the_loop(self):
         with tempfile.TemporaryDirectory(prefix='fastapi_research_loop_') as raw:
             app = self._app(raw)
@@ -464,6 +528,10 @@ class FastApiAppTests(unittest.TestCase):
                             client.post('/api/v1/plugins/cadd/state', json={'enabled': False}, headers=alice_headers).status_code,
                             403,
                         )
+                        self.assertEqual(
+                            client.post('/api/v1/plugins/cadd/health', headers=alice_headers).status_code,
+                            403,
+                        )
 
                         admin_response = client.post('/api/v1/auth/token', data={'username': 'admin', 'password': 'admin-secret'})
                         self.assertEqual(admin_response.status_code, 200)
@@ -471,12 +539,22 @@ class FastApiAppTests(unittest.TestCase):
                         changed = client.post('/api/v1/plugins/cadd/state', json={'enabled': False}, headers=admin_headers)
                         self.assertEqual(changed.status_code, 200)
                         client.post('/api/v1/plugins/cadd/state', json={'enabled': True}, headers=admin_headers)
+                        manifest = client.get('/api/v1/plugins', headers=admin_headers).json()['plugins'][0]['manifest']
+                        validation = client.post('/api/v1/plugins/validate', json=manifest, headers=admin_headers)
+                        self.assertEqual(validation.status_code, 200)
+                        self.assertTrue(validation.json()['validation']['compatible'])
+                        health = client.post('/api/v1/plugins/cadd/health', headers=admin_headers)
+                        self.assertEqual(health.status_code, 200)
+                        self.assertTrue(health.json()['plugin']['health']['healthy'])
 
                         events = [json.loads(line) for line in (Path(raw) / 'audit.jsonl').read_text(encoding='utf-8').splitlines()]
                         self.assertIn('auth.login', {event['action'] for event in events})
                         self.assertIn('plugin.state_change', {event['action'] for event in events})
+                        self.assertIn('plugin.validate', {event['action'] for event in events})
+                        self.assertIn('plugin.health_check', {event['action'] for event in events})
                         self.assertIn('admin', {event['actor'] for event in events})
                         self.assertTrue(all(event['request_id'] for event in events))
+                        self.assertTrue(all(event['trace_id'] for event in events))
                 finally:
                     self._close_app(app)
 
@@ -668,7 +746,10 @@ class FastApiAppTests(unittest.TestCase):
                 with TestClient(app) as client:
                     for filename, content in (
                         ('variants.vcf', b'##fileformat=VCFv4.3\n'),
-                        ('variants.vcf.gz', b'compressed-vcf-fixture'),
+                        (
+                            'variants.vcf.gz',
+                            gzip.compress(b'##fileformat=VCFv4.3\n#CHROM\tPOS\n'),
+                        ),
                     ):
                         response = client.post(
                             '/api/v1/files',

@@ -3,7 +3,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from src.domain_registry import _discover_external_domains, domain_catalog
-from src.plugin_manifest import build_manifest, validate_manifest
+from src.plugin_manifest import (
+    build_manifest,
+    validate_install_candidate,
+    validate_manifest,
+)
 
 
 class PluginManifestTests(unittest.TestCase):
@@ -63,6 +67,58 @@ class PluginManifestTests(unittest.TestCase):
         self.assertEqual(manifest['version'], '2.0.0')
         self.assertEqual(manifest['entrypoint'], 'test.plugin')
         self.assertEqual(manifest['capabilities'], ['test.run'])
+        self.assertEqual(manifest['tool_contracts']['run']['input'], {})
+        self.assertEqual(len(manifest['contract_digest']), 64)
+
+    def test_candidate_validation_reports_missing_requirement(self):
+        plugin = SimpleNamespace(
+            PLUGIN_NAME='Test plugin',
+            PLUGIN_VERSION='1.0.0',
+            PLUGIN_API_VERSION=1,
+            PLUGIN_REQUIREMENTS=('package-that-cannot-exist-bio-agent>=99',),
+        )
+        manifest = build_manifest(
+            'test',
+            plugin,
+            {'run': {'description': 'run', 'parameters': {}, 'function': lambda: None}},
+            kind='external',
+        )
+        report = validate_install_candidate(manifest)
+        self.assertFalse(report['compatible'])
+        self.assertIn('missing requirements', report['errors'][0])
+
+    def test_available_plugin_requires_semantic_version(self):
+        plugin = SimpleNamespace(
+            PLUGIN_NAME='Test plugin',
+            PLUGIN_VERSION='latest',
+            PLUGIN_API_VERSION=1,
+        )
+        with self.assertRaisesRegex(ValueError, 'semantic versioning'):
+            build_manifest(
+                'test',
+                plugin,
+                {'run': {'description': 'run', 'parameters': {}, 'function': lambda: None}},
+                kind='external',
+            )
+
+    def test_incompatible_external_plugin_is_quarantined(self):
+        external = SimpleNamespace(
+            PLUGIN_NAME='Future plugin',
+            PLUGIN_VERSION='1.0.0',
+            PLUGIN_API_VERSION=2,
+            TOOLS={'run': {'description': 'run', 'parameters': {}, 'function': lambda: None}},
+        )
+        entry_point = SimpleNamespace(
+            name='future_plugin',
+            value='future.plugin',
+            load=lambda: external,
+        )
+        with patch('src.domain_registry.entry_points', return_value=[entry_point]):
+            discovered, sources, errors = _discover_external_domains(reserved_domains=set())
+        self.assertEqual(discovered, {})
+        self.assertEqual(sources, {})
+        self.assertEqual(errors['future_plugin']['status'], 'error')
+        self.assertIn('API version', errors['future_plugin']['reason'])
 
     def test_manifest_rejects_incompatible_api(self):
         with self.assertRaises(ValueError):
@@ -80,6 +136,11 @@ class PluginManifestTests(unittest.TestCase):
                 'tools': ['run'],
                 'tool_count': 1,
             })
+
+    def test_manifest_rejects_legacy_contract_version(self):
+        report = validate_install_candidate({'manifest_version': 1})
+        self.assertFalse(report['compatible'])
+        self.assertIn('unsupported plugin manifest version', report['errors'][0])
 
 
 if __name__ == '__main__':

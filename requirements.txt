@@ -12,6 +12,7 @@ PyYAML>=6.0
 streamlit>=1.40
 mcp>=1.28
 jsonschema>=4.20
+packaging>=24.0
 fastapi>=0.115
 PyJWT>=2.8
 redis>=5.0

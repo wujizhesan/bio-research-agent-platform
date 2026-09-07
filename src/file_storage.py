@@ -3,6 +3,7 @@
 import asyncio
 from dataclasses import dataclass
 from dataclasses import replace
+import gzip
 import hashlib
 import json
 import os
@@ -18,6 +19,29 @@ DEFAULT_ALLOWED_EXTENSIONS = frozenset({
 })
 FILE_ID_PATTERN = re.compile(r'^[a-f0-9]{32}$')
 CHUNK_SIZE = 1024 * 1024
+SNIFF_BYTES = 64 * 1024
+METADATA_RESERVE_BYTES = 1024
+ARCHIVE_SIGNATURES = (
+    b'PK\x03\x04', b'PK\x05\x06', b'PK\x07\x08', b'Rar!\x1a\x07',
+    b'7z\xbc\xaf\x27\x1c',
+)
+EXECUTABLE_SIGNATURES = (
+    b'MZ', b'\x7fELF', b'\xfe\xed\xfa\xce', b'\xfe\xed\xfa\xcf',
+    b'\xce\xfa\xed\xfe', b'\xcf\xfa\xed\xfe',
+)
+MALWARE_MARKERS = (
+    b'X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR',
+)
+CONTENT_TYPES = {
+    '.csv': 'text/csv',
+    '.html': 'text/plain',
+    '.htm': 'text/plain',
+    '.json': 'application/json',
+    '.md': 'text/markdown',
+    '.tsv': 'text/tab-separated-values',
+    '.yaml': 'application/yaml',
+    '.yml': 'application/yaml',
+}
 
 
 @dataclass(frozen=True)
@@ -38,14 +62,21 @@ class LocalFileStorage:
         self,
         root: str | Path,
         max_bytes: int = 50 * 1024 * 1024,
+        total_quota_bytes: int = 10 * 1024 * 1024 * 1024,
+        max_decompressed_bytes: int = 200 * 1024 * 1024,
+        max_compression_ratio: float = 100.0,
         allowed_extensions: frozenset[str] = DEFAULT_ALLOWED_EXTENSIONS,
     ):
         if max_bytes < 1:
             raise ValueError('max_bytes must be positive')
         self.root = Path(root).resolve()
         self.max_bytes = max_bytes
+        self.total_quota_bytes = max(int(total_quota_bytes), 1)
+        self.max_decompressed_bytes = max(int(max_decompressed_bytes), 1)
+        self.max_compression_ratio = max(float(max_compression_ratio), 1.0)
         self.allowed_extensions = frozenset(item.lower() for item in allowed_extensions)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._quota_lock = asyncio.Lock()
 
     @staticmethod
     def _safe_filename(filename: str | None) -> str:
@@ -65,6 +96,78 @@ class LocalFileStorage:
             raise ValueError('stored file is outside storage root') from exc
         return path
 
+    def _storage_usage(self) -> int:
+        total = 0
+        for directory, _names, filenames in os.walk(self.root):
+            for filename in filenames:
+                try:
+                    total += (Path(directory) / filename).stat().st_size
+                except OSError:
+                    continue
+        return total
+
+    @staticmethod
+    def _validate_text(content: bytes) -> str:
+        if any(content.startswith(signature) for signature in ARCHIVE_SIGNATURES):
+            raise ValueError('archive uploads are not allowed')
+        if any(content.startswith(signature) for signature in EXECUTABLE_SIGNATURES):
+            raise ValueError('executable content is not allowed')
+        if any(marker in content for marker in MALWARE_MARKERS):
+            raise ValueError('known malicious test signature detected')
+        if b'\x00' in content:
+            raise ValueError('binary content does not match the file extension')
+        try:
+            return content.decode('utf-8-sig')
+        except UnicodeDecodeError as exc:
+            raise ValueError('uploaded research files must be UTF-8 text') from exc
+
+    def _inspect_gzip(self, target: Path, compressed_size: int) -> str:
+        total = 0
+        sample = bytearray()
+        scan_tail = b''
+        try:
+            with gzip.open(target, 'rb') as handle:
+                while True:
+                    chunk = handle.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > self.max_decompressed_bytes:
+                        raise ValueError(
+                            'compressed file exceeds decompressed size limit'
+                        )
+                    if total > compressed_size * self.max_compression_ratio:
+                        raise ValueError('compressed file exceeds compression ratio limit')
+                    scanned = scan_tail + chunk
+                    if any(marker in scanned for marker in MALWARE_MARKERS):
+                        raise ValueError('known malicious test signature detected')
+                    scan_tail = scanned[-64:]
+                    if len(sample) < SNIFF_BYTES:
+                        sample.extend(chunk[:SNIFF_BYTES - len(sample)])
+        except (gzip.BadGzipFile, EOFError, OSError) as exc:
+            raise ValueError('invalid gzip content') from exc
+        text = self._validate_text(bytes(sample))
+        if not text.lstrip().startswith(('##fileformat=VCF', '#CHROM')):
+            raise ValueError('gzip content does not match .vcf.gz')
+        return 'application/gzip'
+
+    def _inspect_content(self, target: Path, filename: str, size_bytes: int) -> str:
+        with target.open('rb') as handle:
+            sample = handle.read(SNIFF_BYTES)
+        if filename.lower().endswith('.vcf.gz'):
+            if not sample.startswith(b'\x1f\x8b'):
+                raise ValueError('content does not match .vcf.gz')
+            return self._inspect_gzip(target, size_bytes)
+        if sample.startswith(b'\x1f\x8b'):
+            raise ValueError('compressed content does not match the file extension')
+        text = self._validate_text(sample)
+        extension = Path(filename).suffix.lower()
+        if extension == '.vcf' and not text.lstrip().startswith(
+            ('##fileformat=VCF', '#CHROM')
+        ):
+            raise ValueError('content does not match .vcf')
+        return CONTENT_TYPES.get(extension, 'text/plain')
+
     async def save(self, upload: Any) -> StoredFile:
         filename = self._safe_filename(getattr(upload, 'filename', None))
         extension = Path(filename).suffix.lower()
@@ -73,50 +176,67 @@ class LocalFileStorage:
             allowed = ', '.join(sorted(self.allowed_extensions | {'.vcf.gz'}))
             raise ValueError(f'unsupported file type: {extension or "none"}; allowed: {allowed}')
 
-        file_id = uuid4().hex
-        directory = self.root / file_id
-        directory.mkdir(parents=False, exist_ok=False)
-        target = directory / filename
-        metadata_path = directory / 'metadata.json'
-        size_bytes = 0
-        digest = hashlib.sha256()
+        async with self._quota_lock:
+            current_usage = self._storage_usage()
+            file_id = uuid4().hex
+            directory = self.root / file_id
+            directory.mkdir(parents=False, exist_ok=False)
+            target = directory / filename
+            metadata_path = directory / 'metadata.json'
+            size_bytes = 0
+            digest = hashlib.sha256()
+            scan_tail = b''
 
-        try:
-            with target.open('wb') as output:
-                while True:
-                    chunk = await upload.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    size_bytes += len(chunk)
-                    if size_bytes > self.max_bytes:
-                        raise ValueError(f'file exceeds maximum size of {self.max_bytes} bytes')
-                    output.write(chunk)
-                    digest.update(chunk)
-            if size_bytes == 0:
-                raise ValueError('empty files are not allowed')
-            stored = StoredFile(
-                file_id=file_id,
-                filename=filename,
-                content_type=getattr(upload, 'content_type', None) or 'application/octet-stream',
-                size_bytes=size_bytes,
-                sha256=digest.hexdigest(),
-                path=target,
-            )
-            metadata_path.write_text(json.dumps({
-                'file_id': stored.file_id,
-                'filename': stored.filename,
-                'content_type': stored.content_type,
-                'size_bytes': stored.size_bytes,
-                'sha256': stored.sha256,
-                'storage_key': stored.storage_key,
-            }, ensure_ascii=False), encoding='utf-8')
-            return stored
-        except Exception:
-            if directory.exists():
-                for child in directory.iterdir():
-                    child.unlink(missing_ok=True)
-                directory.rmdir()
-            raise
+            try:
+                with target.open('wb') as output:
+                    while True:
+                        chunk = await upload.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        size_bytes += len(chunk)
+                        if size_bytes > self.max_bytes:
+                            raise ValueError(
+                                f'file exceeds maximum size of {self.max_bytes} bytes'
+                            )
+                        if (
+                            current_usage + size_bytes + METADATA_RESERVE_BYTES
+                            > self.total_quota_bytes
+                        ):
+                            raise ValueError('upload storage quota exceeded')
+                        scanned = scan_tail + chunk
+                        if any(marker in scanned for marker in MALWARE_MARKERS):
+                            raise ValueError('known malicious test signature detected')
+                        scan_tail = scanned[-64:]
+                        output.write(chunk)
+                        digest.update(chunk)
+                if size_bytes == 0:
+                    raise ValueError('empty files are not allowed')
+                content_type = self._inspect_content(
+                    target, filename, size_bytes
+                )
+                stored = StoredFile(
+                    file_id=file_id,
+                    filename=filename,
+                    content_type=content_type,
+                    size_bytes=size_bytes,
+                    sha256=digest.hexdigest(),
+                    path=target,
+                )
+                metadata_path.write_text(json.dumps({
+                    'file_id': stored.file_id,
+                    'filename': stored.filename,
+                    'content_type': stored.content_type,
+                    'size_bytes': stored.size_bytes,
+                    'sha256': stored.sha256,
+                    'storage_key': stored.storage_key,
+                }, ensure_ascii=False), encoding='utf-8')
+                return stored
+            except Exception:
+                if directory.exists():
+                    for child in directory.iterdir():
+                        child.unlink(missing_ok=True)
+                    directory.rmdir()
+                raise
 
     def get(self, file_id: str) -> StoredFile:
         if not FILE_ID_PATTERN.fullmatch(file_id):
@@ -179,10 +299,20 @@ class S3FileStorage(LocalFileStorage):
         access_key_id: str | None = None,
         secret_access_key: str | None = None,
         max_bytes: int = 50 * 1024 * 1024,
+        total_quota_bytes: int = 10 * 1024 * 1024 * 1024,
+        max_decompressed_bytes: int = 200 * 1024 * 1024,
+        max_compression_ratio: float = 100.0,
         allowed_extensions: frozenset[str] = DEFAULT_ALLOWED_EXTENSIONS,
         client=None,
     ):
-        super().__init__(root, max_bytes=max_bytes, allowed_extensions=allowed_extensions)
+        super().__init__(
+            root,
+            max_bytes=max_bytes,
+            total_quota_bytes=total_quota_bytes,
+            max_decompressed_bytes=max_decompressed_bytes,
+            max_compression_ratio=max_compression_ratio,
+            allowed_extensions=allowed_extensions,
+        )
         if not bucket or not bucket.strip():
             raise ValueError('S3_BUCKET is required when STORAGE_BACKEND=s3')
         try:

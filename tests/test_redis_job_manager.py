@@ -1,11 +1,14 @@
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import json
+from threading import Event
 from time import time
 import unittest
 from unittest.mock import patch
 from prometheus_client import generate_latest
 
 from src.redis_job_manager import RedisJobManager
+from src.resource_scheduling import ResourceCapacity
 
 
 class InMemoryRedis:
@@ -142,6 +145,143 @@ class RedisJobManagerTests(unittest.TestCase):
             run_tool.assert_not_called()
             self.assertTrue(redis.get(f"test:jobs:execution:{record['_execution_key']}"))
         finally:
+            manager.shutdown()
+
+    def test_priority_queues_select_high_before_normal_and_low(self):
+        redis = InMemoryRedis()
+        manager = RedisJobManager(redis_client=redis, namespace='test')
+        try:
+            low = manager.submit('research_catalog', {}, priority=-5)
+            normal = manager.submit('research_catalog', {}, priority=0)
+            high = manager.submit('research_catalog', {}, priority=50)
+            self.assertEqual(manager._next_job(), high['job_id'])
+            manager._ack(high['job_id'])
+            self.assertEqual(manager._next_job(), normal['job_id'])
+            manager._ack(normal['job_id'])
+            self.assertEqual(manager._next_job(), low['job_id'])
+        finally:
+            manager.shutdown()
+
+    def test_worker_defers_job_requiring_incompatible_resources(self):
+        redis = InMemoryRedis()
+        manager = RedisJobManager(
+            redis_client=redis,
+            namespace='test',
+            resource_capacity=ResourceCapacity(4, 8192, 0, 0, ('cpu',)),
+            enforce_capacity=True,
+        )
+        try:
+            submitted = manager.submit(
+                'research_catalog',
+                {},
+                resources={'gpu_count': 1, 'labels': ['cuda']},
+            )
+            deferred = manager.run_job(submitted['job_id'])
+            self.assertEqual(deferred['status'], 'queued')
+            self.assertEqual(
+                deferred['scheduling']['status'],
+                'waiting_for_compatible_worker',
+            )
+            self.assertIn('gpu_count', deferred['scheduling']['reason'])
+        finally:
+            manager.shutdown()
+
+    def test_failed_execution_is_moved_to_dead_letter_queue(self):
+        class FailingExecutor:
+            def execute(self, *_args, **_kwargs):
+                return {'status': 'error', 'error': 'tool failed'}
+
+        redis = InMemoryRedis()
+        manager = RedisJobManager(
+            redis_client=redis,
+            namespace='test',
+            tool_executor=FailingExecutor(),
+        )
+        try:
+            submitted = manager.submit('research_catalog', {})
+            failed = manager.run_job(submitted['job_id'])
+            self.assertEqual(failed['status'], 'failed')
+            self.assertEqual(failed['dead_letter_reason'], 'execution_failed')
+            self.assertEqual(
+                redis.lists['test:jobs:dead-letter'], [submitted['job_id']]
+            )
+        finally:
+            manager.shutdown()
+
+    def test_stale_job_exceeding_attempt_limit_is_dead_lettered(self):
+        redis = InMemoryRedis()
+        manager = RedisJobManager(
+            redis_client=redis,
+            namespace='test',
+            max_attempts=2,
+        )
+        try:
+            submitted = manager.submit('research_catalog', {})
+            job_id = redis.brpoplpush(
+                'test:jobs:queue', 'test:jobs:processing'
+            )
+            record = manager._load(job_id)
+            record.update({
+                'status': 'running',
+                '_attempts': 2,
+                '_worker_id': 'dead-worker',
+                '_lease_until': time() - 1,
+            })
+            manager._save(record)
+            manager.recover_stale_jobs()
+            failed = manager.get(submitted['job_id'])
+            self.assertEqual(failed['status'], 'failed')
+            self.assertEqual(
+                failed['dead_letter_reason'], 'max_attempts_exceeded'
+            )
+            self.assertEqual(redis.lists['test:jobs:queue'], [])
+        finally:
+            manager.shutdown()
+
+    def test_concurrent_jobs_reserve_worker_resources(self):
+        started = Event()
+        release = Event()
+
+        class BlockingExecutor:
+            def execute(self, *_args, **_kwargs):
+                started.set()
+                release.wait(5)
+                return {'status': 'ok'}
+
+        redis = InMemoryRedis()
+        manager = RedisJobManager(
+            redis_client=redis,
+            namespace='test',
+            tool_executor=BlockingExecutor(),
+            resource_capacity=ResourceCapacity(1, 1024, 0, 0, ()),
+            enforce_capacity=True,
+            max_concurrency=2,
+        )
+        try:
+            first = manager.submit(
+                'research_catalog', {}, resources={'cpu_cores': 1}
+            )
+            second = manager.submit(
+                'research_catalog', {}, resources={'cpu_cores': 1}
+            )
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(manager.run_job, first['job_id'])
+                self.assertTrue(started.wait(2))
+                deferred = manager.run_job(second['job_id'])
+                self.assertEqual(deferred['status'], 'queued')
+                self.assertEqual(
+                    deferred['scheduling']['status'],
+                    'waiting_for_worker_capacity',
+                )
+                release.set()
+                self.assertEqual(future.result()['status'], 'completed')
+            self.assertEqual(manager.max_concurrency, 2)
+            self.assertEqual(
+                manager.resource_status()['resources']['available']['cpu_cores'],
+                1,
+            )
+        finally:
+            release.set()
             manager.shutdown()
 
 

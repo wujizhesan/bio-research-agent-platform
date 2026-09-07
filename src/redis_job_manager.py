@@ -2,35 +2,76 @@
 
 from datetime import datetime, timezone
 from contextlib import nullcontext
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import json
 import os
 from threading import Lock
-from time import time
+from time import sleep, time
 from uuid import uuid4
 
 try:
     from .domain_registry import active_tool_specs, run_tool, tool_specs
+    from .job_execution import InlineToolExecutor
     from .job_manager import TERMINAL_STATUSES
+    from .resource_scheduling import (
+        ResourceCapacity,
+        ResourcePool,
+        ResourceRequest,
+        merge_requests,
+        normalize_priority,
+    )
+    from .workflow_checkpoint import resumable_retry_arguments
     from .observability import (
         REDIS_JOB_DURATION,
+        REDIS_DEAD_LETTER_DEPTH,
+        REDIS_DEAD_LETTERS,
         REDIS_JOB_EXECUTIONS,
         REDIS_JOB_RETRIES,
         REDIS_PROCESSING_DEPTH,
         REDIS_QUEUE_DEPTH,
         REDIS_RESULT_CACHE,
         REDIS_WORKER_ACTIVE,
+        JOB_ACTIVE,
+        JOB_DURATION,
+        JOB_EXECUTIONS,
+        JOB_QUEUE_DURATION,
+        JOB_TRANSITIONS,
+        bind_context,
+        current_context,
+        log_event,
+        trace_id as make_trace_id,
     )
 except ImportError:
     from domain_registry import active_tool_specs, run_tool, tool_specs
+    from job_execution import InlineToolExecutor
     from job_manager import TERMINAL_STATUSES
+    from resource_scheduling import (
+        ResourceCapacity,
+        ResourcePool,
+        ResourceRequest,
+        merge_requests,
+        normalize_priority,
+    )
+    from workflow_checkpoint import resumable_retry_arguments
     from observability import (
         REDIS_JOB_DURATION,
+        REDIS_DEAD_LETTER_DEPTH,
+        REDIS_DEAD_LETTERS,
         REDIS_JOB_EXECUTIONS,
         REDIS_JOB_RETRIES,
         REDIS_PROCESSING_DEPTH,
         REDIS_QUEUE_DEPTH,
         REDIS_RESULT_CACHE,
         REDIS_WORKER_ACTIVE,
+        JOB_ACTIVE,
+        JOB_DURATION,
+        JOB_EXECUTIONS,
+        JOB_QUEUE_DURATION,
+        JOB_TRANSITIONS,
+        bind_context,
+        current_context,
+        log_event,
+        trace_id as make_trace_id,
     )
 
 
@@ -41,7 +82,7 @@ def _now():
 class RedisJobManager:
     backend = 'redis'
 
-    def __init__(self, redis_url=None, namespace=None, redis_client=None, lease_seconds=None, worker_id=None, result_ttl_seconds=None, state_store=None, redis_socket_timeout=None):
+    def __init__(self, redis_url=None, namespace=None, redis_client=None, lease_seconds=None, worker_id=None, result_ttl_seconds=None, state_store=None, redis_socket_timeout=None, tool_executor=None, resource_capacity=None, enforce_capacity=False, max_attempts=None, max_concurrency=None):
         if redis_client is None:
             try:
                 import redis
@@ -71,6 +112,25 @@ class RedisJobManager:
             self.result_ttl_seconds = 86400
         self.worker_id = worker_id or f'worker-{uuid4().hex}'
         self.state_store = state_store
+        self._tool_executor = tool_executor or InlineToolExecutor(
+            lambda tool, arguments: run_tool(tool, arguments)
+        )
+        self.resource_capacity = resource_capacity or ResourceCapacity.from_env()
+        self.enforce_capacity = bool(enforce_capacity)
+        self.resource_pool = ResourcePool(self.resource_capacity)
+        self._worker_executor = None
+        try:
+            self.max_attempts = max(int(
+                max_attempts or os.environ.get('JOB_MAX_ATTEMPTS', '3')
+            ), 1)
+        except (TypeError, ValueError):
+            self.max_attempts = 3
+        try:
+            self.max_concurrency = max(int(
+                max_concurrency or os.environ.get('WORKER_MAX_CONCURRENCY', '2')
+            ), 1)
+        except (TypeError, ValueError):
+            self.max_concurrency = 2
         self._lock = Lock()
         self.redis.ping()
 
@@ -86,8 +146,31 @@ class RedisJobManager:
         return f'{self.namespace}:jobs:queue'
 
     @property
+    def _high_queue_key(self):
+        return f'{self.namespace}:jobs:queue:high'
+
+    @property
+    def _low_queue_key(self):
+        return f'{self.namespace}:jobs:queue:low'
+
+    @property
+    def _queue_keys(self):
+        return (self._high_queue_key, self._queue_key, self._low_queue_key)
+
+    def _queue_for_priority(self, priority):
+        if priority >= 10:
+            return self._high_queue_key
+        if priority < 0:
+            return self._low_queue_key
+        return self._queue_key
+
+    @property
     def _processing_key(self):
         return f'{self.namespace}:jobs:processing'
+
+    @property
+    def _dead_letter_key(self):
+        return f'{self.namespace}:jobs:dead-letter'
 
     def _idempotency_key(self, value):
         return f'{self.namespace}:jobs:idempotency:{value}'
@@ -139,14 +222,18 @@ class RedisJobManager:
 
     @staticmethod
     def _validate_tool_state(tool):
-        known = {spec['name'] for spec in tool_specs()}
+        known = {spec['name']: spec for spec in tool_specs()}
         if tool not in known:
             raise ValueError(f'unknown tool: {tool}')
-        if tool not in {spec['name'] for spec in active_tool_specs()}:
+        active = {spec['name']: spec for spec in active_tool_specs()}
+        if tool not in active:
             raise ValueError(f'plugin domain is disabled for tool: {tool}')
+        return active[tool]
 
-    def _create_job(self, tool, arguments, retry_of=None, idempotency_key=None):
+    def _create_job(self, tool, arguments, resources, priority, retry_of=None,
+                    idempotency_key=None):
         job_id = uuid4().hex
+        context = current_context()
         record = {
             'job_id': job_id,
             'tool': tool,
@@ -156,18 +243,32 @@ class RedisJobManager:
             '_cancel_requested': False,
             '_created_score': time(),
             '_execution_key': uuid4().hex,
+            'resources': resources.as_dict(),
+            'priority': priority,
+            'trace_id': context.get('trace_id') or make_trace_id(),
         }
+        if context.get('request_id'):
+            record['request_id'] = context['request_id']
         if retry_of:
             record['retry_of'] = retry_of
         if idempotency_key:
             record['idempotency_key'] = idempotency_key
             self.redis.set(self._idempotency_key(idempotency_key), job_id)
         self._save(record)
-        self.redis.lpush(self._queue_key, job_id)
+        self.redis.lpush(self._queue_for_priority(priority), job_id)
         self._refresh_queue_metrics()
+        JOB_TRANSITIONS.labels(self.backend, tool, 'queued').inc()
+        log_event(
+            'job.queued',
+            backend=self.backend,
+            job_id=job_id,
+            tool=tool,
+            priority=priority,
+        )
         return self._public_record(record)
 
-    def submit(self, tool, arguments, idempotency_key=None):
+    def submit(self, tool, arguments, idempotency_key=None, resources=None,
+               priority=0):
         if not isinstance(tool, str) or not tool:
             raise ValueError('tool is required')
         if not isinstance(arguments, dict):
@@ -178,7 +279,9 @@ class RedisJobManager:
             idempotency_key = idempotency_key.strip()
             if len(idempotency_key) > 128:
                 raise ValueError('idempotency key is too long')
-        self._validate_tool_state(tool)
+        spec = self._validate_tool_state(tool)
+        request = merge_requests(spec.get('resources'), resources)
+        priority = normalize_priority(priority)
         distributed_lock = getattr(self.redis, 'lock', None)
         guard = distributed_lock(f'{self.namespace}:jobs:submit-lock', timeout=10, blocking_timeout=10) if distributed_lock else nullcontext()
         with self._lock, guard:
@@ -187,12 +290,23 @@ class RedisJobManager:
                 if existing_id:
                     existing = self._load(existing_id)
                     if existing is not None:
-                        if existing.get('tool') != tool or existing.get('_arguments') != arguments:
+                        if (
+                            existing.get('tool') != tool
+                            or existing.get('_arguments') != arguments
+                            or existing.get('resources') != request.as_dict()
+                            or existing.get('priority', 0) != priority
+                        ):
                             raise ValueError('idempotency key already used with different job payload')
                         output = self._public_record(existing)
                         output['deduplicated'] = True
                         return output
-            return self._create_job(tool, arguments, idempotency_key=idempotency_key)
+            return self._create_job(
+                tool,
+                arguments,
+                request,
+                priority,
+                idempotency_key=idempotency_key,
+            )
 
     def get(self, job_id):
         record = self._load(str(job_id))
@@ -238,8 +352,15 @@ class RedisJobManager:
         arguments = record.get('_arguments')
         if arguments is None:
             raise ValueError('job arguments are unavailable')
-        self._validate_tool_state(record['tool'])
-        return self._create_job(record['tool'], arguments, retry_of=record['job_id'])
+        spec = self._validate_tool_state(record['tool'])
+        arguments = resumable_retry_arguments(arguments, spec)
+        return self._create_job(
+            record['tool'],
+            arguments,
+            ResourceRequest.from_mapping(record.get('resources')),
+            int(record.get('priority', 0)),
+            retry_of=record['job_id'],
+        )
 
     @staticmethod
     def _lease_active(record, now=None):
@@ -252,6 +373,7 @@ class RedisJobManager:
             return False
 
     def _claim(self, record):
+        record.pop('scheduling', None)
         record.update({
             'status': 'running',
             'started_at': _now(),
@@ -264,6 +386,19 @@ class RedisJobManager:
         if record['_attempts'] > 1 or record.get('retry_of'):
             REDIS_JOB_RETRIES.labels(record['tool']).inc()
         REDIS_WORKER_ACTIVE.labels(self.namespace).inc()
+        try:
+            queued_seconds = (
+                datetime.now(timezone.utc)
+                - datetime.fromisoformat(record['created_at'])
+            ).total_seconds()
+            JOB_QUEUE_DURATION.labels(self.backend, record['tool']).observe(
+                max(queued_seconds, 0)
+            )
+        except (KeyError, TypeError, ValueError):
+            pass
+        JOB_ACTIVE.labels(self.backend, record['tool']).inc()
+        JOB_TRANSITIONS.labels(self.backend, record['tool'], 'running').inc()
+        log_event('job.started', backend=self.backend, worker_id=self.worker_id)
 
     def _ack(self, job_id):
         self.redis.lrem(self._processing_key, 0, str(job_id))
@@ -271,12 +406,42 @@ class RedisJobManager:
 
     def _refresh_queue_metrics(self):
         try:
-            queue_size = self.redis.llen(self._queue_key)
+            queue_size = sum(self.redis.llen(key) for key in self._queue_keys)
             processing_size = self.redis.llen(self._processing_key)
+            dead_letter_size = self.redis.llen(self._dead_letter_key)
         except Exception:
             return
         REDIS_QUEUE_DEPTH.labels(self.namespace).set(queue_size)
         REDIS_PROCESSING_DEPTH.labels(self.namespace).set(processing_size)
+        REDIS_DEAD_LETTER_DEPTH.labels(self.namespace).set(dead_letter_size)
+
+    def _dead_letter(self, record, reason):
+        job_id = str(record['job_id'])
+        record.update({
+            'status': 'failed',
+            'finished_at': _now(),
+            'dead_lettered_at': _now(),
+            'dead_letter_reason': reason,
+            'error': record.get('error') or reason,
+        })
+        record.pop('_worker_id', None)
+        record.pop('_lease_until', None)
+        record.pop('_started_epoch', None)
+        self._save(record)
+        self.redis.lrem(self._dead_letter_key, 0, job_id)
+        self.redis.lpush(self._dead_letter_key, job_id)
+        self._ack(job_id)
+        REDIS_DEAD_LETTERS.labels(self.namespace, reason).inc()
+        JOB_TRANSITIONS.labels(self.backend, record['tool'], 'failed').inc()
+        log_event(
+            'job.dead_lettered',
+            backend=self.backend,
+            worker_id=self.worker_id,
+            reason=reason,
+            attempts=int(record.get('_attempts', 0)),
+        )
+        self._refresh_queue_metrics()
+        return self._public_record(record)
 
     def _load_execution_result(self, execution_key):
         payload = self.redis.get(self._execution_result_key(execution_key))
@@ -319,16 +484,47 @@ class RedisJobManager:
             update = {'status': 'cancelled', 'finished_at': _now(), 'error': 'job cancelled by user'}
         current.update(update)
         started_epoch = current.pop('_started_epoch', None)
+        elapsed = None
         if started_epoch is not None:
             try:
-                REDIS_JOB_DURATION.labels(current['tool']).observe(max(time() - float(started_epoch), 0))
+                elapsed = max(time() - float(started_epoch), 0)
+                REDIS_JOB_DURATION.labels(current['tool']).observe(elapsed)
             except (TypeError, ValueError):
                 pass
         current.pop('_worker_id', None)
         current.pop('_lease_until', None)
         self._save(current)
+        if current['status'] == 'failed':
+            current['dead_lettered_at'] = _now()
+            current['dead_letter_reason'] = 'execution_failed'
+            self._save(current)
+            self.redis.lrem(self._dead_letter_key, 0, str(job_id))
+            self.redis.lpush(self._dead_letter_key, str(job_id))
+            REDIS_DEAD_LETTERS.labels(
+                self.namespace, 'execution_failed'
+            ).inc()
+            log_event(
+                'job.dead_lettered',
+                backend=self.backend,
+                worker_id=self.worker_id,
+                reason='execution_failed',
+                attempts=int(current.get('_attempts', 0)),
+            )
         REDIS_JOB_EXECUTIONS.labels(current['tool'], current['status']).inc()
         REDIS_WORKER_ACTIVE.labels(self.namespace).dec()
+        if elapsed is not None:
+            JOB_DURATION.labels(self.backend, current['tool']).observe(elapsed)
+        JOB_EXECUTIONS.labels(self.backend, current['tool'], current['status']).inc()
+        JOB_TRANSITIONS.labels(self.backend, current['tool'], current['status']).inc()
+        JOB_ACTIVE.labels(self.backend, current['tool']).dec()
+        log_event(
+            'job.completed',
+            backend=self.backend,
+            worker_id=self.worker_id,
+            status=current['status'],
+            duration_seconds=elapsed,
+        )
+        self._refresh_queue_metrics()
         return self._public_record(current)
 
     def recover_stale_jobs(self):
@@ -351,6 +547,10 @@ class RedisJobManager:
                         continue
                     if self._lease_active(record, now):
                         continue
+                    if int(record.get('_attempts', 0)) >= self.max_attempts:
+                        self._dead_letter(record, 'max_attempts_exceeded')
+                        recovered.append(job_id)
+                        continue
                     record.pop('started_at', None)
                     record.pop('error', None)
                     record.pop('_worker_id', None)
@@ -358,7 +558,10 @@ class RedisJobManager:
                     record.pop('_started_epoch', None)
                     record.update({'status': 'queued', 'recovered_at': _now()})
                     self._save(record)
-                    self.redis.lpush(self._queue_key, job_id)
+                    self.redis.lpush(
+                        self._queue_for_priority(int(record.get('priority', 0))),
+                        job_id,
+                    )
                     self._ack(job_id)
                     recovered.append(job_id)
             except Exception:
@@ -368,26 +571,97 @@ class RedisJobManager:
 
     def run_job(self, job_id):
         record = self._load(str(job_id))
+        if record is None:
+            return None
+        with bind_context(
+            trace_id=record.get('trace_id') or make_trace_id(),
+            request_id=record.get('request_id'),
+            job_id=record.get('job_id'),
+            tool=record.get('tool'),
+        ):
+            return self._run_job(job_id)
+
+    def _run_job(self, job_id):
+        record = self._load(str(job_id))
         if record is None or record.get('status') in TERMINAL_STATUSES:
             return self.get(job_id)
-        if (
-            record.get('status') == 'running'
-            and record.get('_worker_id') not in (None, self.worker_id)
-            and self._lease_active(record)
-        ):
+        if record.get('status') == 'running' and self._lease_active(record):
             return self._public_record(record)
         if record.get('_cancel_requested'):
             record.update({'status': 'cancelled', 'finished_at': _now(), 'error': 'job cancelled by user'})
             self._save(record)
             return self.get(job_id)
+        resources = ResourceRequest.from_mapping(record.get('resources'))
+        if self.enforce_capacity and not self.resource_capacity.fits(resources):
+            record['scheduling'] = {
+                'status': 'waiting_for_compatible_worker',
+                'worker_id': self.worker_id,
+                'reason': self.resource_capacity.rejection_reason(resources),
+            }
+            self._save(record)
+            return self._public_record(record)
+        acquired = not self.enforce_capacity or self.resource_pool.try_acquire(resources)
+        if not acquired:
+            record['scheduling'] = {
+                'status': 'waiting_for_worker_capacity',
+                'worker_id': self.worker_id,
+                'reason': 'compatible worker resources are currently reserved',
+            }
+            self._save(record)
+            return self._public_record(record)
+        try:
+            return self._execute_claimed_job(record, job_id)
+        finally:
+            if self.enforce_capacity:
+                self.resource_pool.release(resources)
+
+    def _execute_claimed_job(self, record, job_id):
         self._claim(record)
         cached = self._load_execution_result(record['_execution_key'])
         if cached is not None:
             REDIS_RESULT_CACHE.labels(record['tool'], 'hit').inc()
             return self._finish(job_id, cached['result'])
         REDIS_RESULT_CACHE.labels(record['tool'], 'miss').inc()
+        cancellation = {'checked_at': 0.0, 'requested': False}
+        heartbeat = {'renewed_at': time()}
+
+        def cancelled():
+            now = time()
+            if now - cancellation['checked_at'] < 0.5:
+                return cancellation['requested']
+            try:
+                current = self._load(str(job_id))
+            except Exception:
+                return cancellation['requested']
+            cancellation['checked_at'] = now
+            cancellation['requested'] = current is None or bool(current.get('_cancel_requested'))
+            return cancellation['requested']
+
+        def renew_lease():
+            now = time()
+            interval = max(min(self.lease_seconds / 3, 30), 0.2)
+            if now - heartbeat['renewed_at'] < interval:
+                return
+            try:
+                current = self._load(str(job_id))
+                if (
+                    current is not None
+                    and current.get('status') == 'running'
+                    and current.get('_worker_id') == self.worker_id
+                ):
+                    current['_lease_until'] = now + self.lease_seconds
+                    self._save(current)
+            except Exception:
+                return
+            heartbeat['renewed_at'] = now
+
         try:
-            result = run_tool(record['tool'], record.get('_arguments', {}))
+            result = self._tool_executor.execute(
+                record['tool'],
+                record.get('_arguments', {}),
+                cancelled=cancelled,
+                heartbeat=renew_lease,
+            )
             failed = isinstance(result, dict) and result.get('status') == 'error'
             if not failed:
                 result = self._store_execution_result(record['_execution_key'], result)
@@ -395,20 +669,99 @@ class RedisJobManager:
             return self._finish(job_id, {'status': 'error', 'error': str(exc)}, failed=True)
         return self._finish(job_id, result, failed=failed)
 
+    def _next_job(self):
+        move = getattr(self.redis, 'rpoplpush', None)
+        for queue_key in self._queue_keys:
+            if move is not None:
+                item = move(queue_key, self._processing_key)
+            else:
+                item = self.redis.brpoplpush(
+                    queue_key,
+                    self._processing_key,
+                    timeout=0,
+                )
+            if item:
+                return item
+        return None
+
+    def _complete_queued_item(self, job_id, poll_timeout):
+        outcome = self.run_job(job_id)
+        record = self._load(job_id)
+        if record is None or record.get('status') in TERMINAL_STATUSES:
+            self._ack(job_id)
+        elif outcome and outcome.get('status') == 'queued':
+            self._ack(job_id)
+            self.redis.lpush(
+                self._queue_for_priority(int(record.get('priority', 0))),
+                job_id,
+            )
+            sleep(min(max(float(poll_timeout), 0.05), 1.0))
+
     def run_forever(self, poll_timeout=5):
         self.recover_stale_jobs()
-        while True:
-            item = self.redis.brpoplpush(self._queue_key, self._processing_key, timeout=poll_timeout)
-            if not item:
-                self.recover_stale_jobs()
-                continue
-            job_id = item.decode('utf-8') if isinstance(item, bytes) else str(item)
-            self.run_job(job_id)
-            record = self._load(job_id)
-            if record is None or record.get('status') in TERMINAL_STATUSES:
-                self._ack(job_id)
+        futures = set()
+        executor = ThreadPoolExecutor(
+            max_workers=self.max_concurrency,
+            thread_name_prefix='redis-job',
+        )
+        self._worker_executor = executor
+        try:
+            while True:
+                finished = {future for future in futures if future.done()}
+                for future in finished:
+                    futures.remove(future)
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        log_event(
+                            'worker.job_handler_failed',
+                            worker_id=self.worker_id,
+                            error_type=type(exc).__name__,
+                        )
+                while len(futures) < self.max_concurrency:
+                    item = self._next_job()
+                    if not item:
+                        break
+                    job_id = item.decode('utf-8') if isinstance(item, bytes) else str(item)
+                    futures.add(executor.submit(
+                        self._complete_queued_item,
+                        job_id,
+                        poll_timeout,
+                    ))
+                if not futures:
+                    self.recover_stale_jobs()
+                    sleep(min(max(float(poll_timeout), 0.05), 1.0))
+                elif futures:
+                    wait(
+                        futures,
+                        timeout=min(max(float(poll_timeout), 0.05), 1.0),
+                        return_when=FIRST_COMPLETED,
+                    )
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def resource_status(self):
+        return {
+            'capacity': self.resource_capacity.as_dict(),
+            'enforced': self.enforce_capacity,
+            'max_concurrency': self.max_concurrency,
+            'max_attempts': self.max_attempts,
+            'resources': self.resource_pool.snapshot(),
+            'queues': {
+                'high': self.redis.llen(self._high_queue_key),
+                'normal': self.redis.llen(self._queue_key),
+                'low': self.redis.llen(self._low_queue_key),
+                'dead_letter': self.redis.llen(self._dead_letter_key),
+            },
+        }
 
     def shutdown(self):
+        shutdown = getattr(self._tool_executor, 'shutdown', None)
+        if shutdown:
+            shutdown()
+        if self._worker_executor is not None:
+            self._worker_executor.shutdown(wait=True, cancel_futures=True)
+            self._worker_executor = None
         close = getattr(self.redis, 'close', None)
         if close:
             close()
