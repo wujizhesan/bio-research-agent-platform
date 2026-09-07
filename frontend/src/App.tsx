@@ -10,147 +10,60 @@ import {
   ChevronRight,
   CircleDot,
   Clock3,
-  Database,
   Dna,
   Download,
-  FlaskConical,
   GitBranch,
   LayoutDashboard,
   LockKeyhole,
   Play,
   Radio,
   RefreshCw,
-  Server,
   ShieldCheck,
   Sparkles,
   Terminal,
-  Upload,
   Workflow,
   XCircle,
 } from 'lucide-react'
-
-type Plugin = {
-  domain: string
-  name: string
-  status: string
-  tool_count: number
-  tools: string[]
-  version?: string
-}
-
-type CapabilityInterface = {
-  status: string
-  protocol: string
-  docs?: string
-  openapi?: string
-  endpoint?: string
-  transport?: string
-  entrypoint?: string
-  tool_count?: number
-}
-
-type Capabilities = {
-  tool_count: number
-  interfaces: Record<string, CapabilityInterface>
-}
-
-type Job = {
-  job_id: string
-  tool: string
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
-  created_at: string
-  started_at?: string
-  finished_at?: string
-  result?: Record<string, unknown>
-  error?: string
-  cancel_requested?: boolean
-}
-
-type EventItem = {
-  at: string
-  type: string
-  status: string
-  detail: string
-}
-
-type SequenceCheck = {
-  name: string
-  passed: boolean
-  detail?: string
-}
-
-type SequenceMolecule = 'linear' | 'circ' | 'sa'
-type SequenceMethod = 'greedy' | 'vaxpress'
-type SequenceBenchmarkRow = {
-  method: string
-  mrna?: string
-  metrics: Record<string, unknown>
-  verdict?: string
-}
-
-const luciferaseDemoProtein = 'MEDAKNIKKGPAPFYPLEDGTAGEQLHKAMKRYALVPGTIAFTDAHIEVNITYAEYFEMSVRLAEAMKRYGLNTNHRIVVCSENSLQFFMPVLGALFIGVAVAPANDIYNERELLNSMNISQPTVVFVSKKGLQKILNVQKKLPIIQKIIIMDSKTDYQGFQSMYTFVTSHLPPGFNEYDFVPESFDRDKTIALIMNSSGSTGLPKGVALPHRTACVRFSHARDPIFGNQIIPDTAILSVVPFHHGFGMFTTLGYLICGFRVVLMYRFEEELFLRSLQDYKIQSALLVPTLFSFFAKSTLIDKYDLSNLHEIASGGAPLSKEVGEAVAKRFHLPGIRQGYGLTETTSAILITPEGDDKPGAVGKVVPFFEAKVVDLDTGKTLGVNQRGELCVRGPMIMSGYVNNPEATNALIDKDGWLHSGDIAYWDEDEHFFIVDRLKSLIKYKGYQVAPAELESILLQHPNIFDAGVAGLPDDDAGELPAAVVVLEHGKTMTEKEIVDYVASQVTTAKKLRGGVVFVDEVPKGLTGKLDARKIREILIKAKKGGKSKL'
-
-type CaddHit = {
-  mol_name: string
-  tag: string
-  affinity: number
-}
-
-type ResearchPlanExecution = {
-  ready: boolean
-  missing_inputs: string[]
-  evidence_provider: string
-  selected_tools: string[]
-  rationale: string[]
-  workflow?: Record<string, unknown> | null
-  workflow_preview?: Record<string, unknown> | null
-}
-
-type ResearchPlan = {
-  status: string
-  task: string
-  selected_domains: string[]
-  capabilities: string[]
-  required_inputs: Array<{ name: string; description: string }>
-  evidence_provider: string
-  planner?: { backend: string; mode: string; model?: string | null; fallback_reason?: string }
-  execution: ResearchPlanExecution
-}
-
-type ResearchFileSlot = 'expression' | 'metadata' | 'gene_sets' | 'vcf' | 'annotation' | 'receptor' | 'ligand_library'
-
-type RnaFileSlot = 'fastq_r1' | 'fastq_r2' | 'reference_fasta' | 'annotation_gtf' | 'metadata' | 'gene_sets'
-
-type UploadedFile = {
-  file_id: string
-  filename: string
-  content_type: string
-  size_bytes: number
-  sha256: string
-  path: string
-  download_url: string
-}
-
-type Project = {
-  project_id: string
-  name: string
-  description?: string | null
-  owner_subject: string
-  created_at: string
-}
-
-type RnaPreflightItem = {
-  label: string
-  detail: string
-  ready: boolean
-  required: boolean
-}
-
-type View = 'workspace' | 'domains'
-type RunMode = 'research' | 'rnaseq' | 'variant' | 'sequence' | 'cadd'
-type ResearchPreset = 'custom' | 'bgi_multiomics' | 'online_evidence'
-type RnaInputMode = 'fixture' | 'upload'
-type PlannerMode = 'auto' | 'deterministic' | 'llm'
+import { apiFetch, followJob, uploadFile } from './app/api'
+import { luciferaseDemoProtein, providerLabels, rnaseqFixture, statusLabels } from './app/constants'
+import type {
+  Capabilities,
+  CaddHit,
+  EventItem,
+  Job,
+  PlannerMode,
+  Plugin,
+  Project,
+  ResearchFileSlot,
+  ResearchPlan,
+  ResearchPreset,
+  RnaFileSlot,
+  RnaInputMode,
+  RnaPreflightItem,
+  RunMode,
+  SequenceBenchmarkRow,
+  SequenceCheck,
+  SequenceMethod,
+  SequenceMolecule,
+  UploadedFile,
+  View,
+} from './app/types'
+import { DomainsView } from './components/DomainsView'
+import { SequenceDesignInput } from './components/SequenceDesignInput'
+import {
+  CapabilityStrip,
+  EmptyStream,
+  Metric,
+  PipelineMetric,
+  QcStatusMetric,
+  ResearchFileField,
+  ResearchPlanCard,
+  RnaFileField,
+  RnaPreflightCard,
+  StatusBadge,
+} from './components/WorkspaceStatus'
+import { useManagedJobStream } from './hooks/useManagedJobStream'
+import { useReportPreview } from './hooks/useReportPreview'
 
 const runtimeApiBase = new URLSearchParams(window.location.search).get('api') || ''
 const defaultApiBase = runtimeApiBase || import.meta.env.VITE_API_BASE_URL || (
@@ -158,65 +71,9 @@ const defaultApiBase = runtimeApiBase || import.meta.env.VITE_API_BASE_URL || (
     ? 'http://127.0.0.1:8000'
     : ''
 )
-const statusLabels: Record<string, string> = {
-  queued: '排队中',
-  running: '执行中',
-  completed: '已完成',
-  failed: '失败',
-}
-
-const providerLabels: Record<string, string> = {
-  local: '本地证据',
-  kegg: 'KEGG',
-  ncbi_gene: 'NCBI Gene',
-  pubmed: 'PubMed',
-  uniprot: 'UniProt',
-  ucsc: 'UCSC',
-  gencode: 'GENCODE',
-}
-
-const domainLabels: Record<string, string> = {
-  cadd: 'CADD',
-  omics: '组学',
-  sequence: 'mRNA / 序列',
-  literature: '文献',
-  knowledge: '知识库',
-  imaging: '成像 / 多模态',
-  research: '研究编排',
-}
-
-const pluginDescriptions: Record<string, string> = {
-  cadd: '计算机辅助药物设计',
-  omics: '组学分析与质量控制',
-  research: '生物信息学研究代理',
-  literature: '文献与证据检索',
-  knowledge: '本地科研知识检索',
-  imaging: '显微成像与图像质控',
-  sequence: 'mRNA-Forge 序列设计',
-}
-
-const rnaseqFixture = {
-  fastqPaths: [
-    'examples/omics/rnaseq_fastq_fixture/A1.fastq',
-    'examples/omics/rnaseq_fastq_fixture/A2.fastq',
-    'examples/omics/rnaseq_fastq_fixture/A3.fastq',
-    'examples/omics/rnaseq_fastq_fixture/B1.fastq',
-    'examples/omics/rnaseq_fastq_fixture/B2.fastq',
-    'examples/omics/rnaseq_fastq_fixture/B3.fastq',
-  ],
-  fastqR2Paths: [
-    'examples/omics/rnaseq_paired_fixture/A1_R2.fastq',
-    'examples/omics/rnaseq_paired_fixture/A2_R2.fastq',
-    'examples/omics/rnaseq_paired_fixture/A3_R2.fastq',
-    'examples/omics/rnaseq_paired_fixture/B1_R2.fastq',
-    'examples/omics/rnaseq_paired_fixture/B2_R2.fastq',
-    'examples/omics/rnaseq_paired_fixture/B3_R2.fastq',
-  ],
-  referenceFasta: 'examples/omics/rnaseq_fastq_fixture/reference.fa',
-  annotationGtf: 'examples/omics/rnaseq_fastq_fixture/genes.gtf',
-  metadataCsv: 'examples/omics/rnaseq_fastq_fixture/metadata.csv',
-  geneSetsCsv: 'examples/omics/rnaseq_fastq_fixture/gene_sets.csv',
-}
+const localDevelopmentToken = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  ? 'change-me-in-development'
+  : ''
 
 const terminalJobStatuses = new Set<Job['status']>(['completed', 'failed', 'cancelled'])
 
@@ -228,128 +85,6 @@ function mergeJobState(previous: Job | undefined, next: Job) {
 function mergeJobList(current: Job[], incoming: Job[]) {
   const currentById = new Map(current.map((job) => [job.job_id, job]))
   return incoming.map((job) => mergeJobState(currentById.get(job.job_id), job))
-}
-
-const domainIcons: Record<string, typeof Beaker> = {
-  cadd: Beaker,
-  omics: Activity,
-  sequence: Dna,
-  literature: FlaskConical,
-  knowledge: Database,
-  imaging: FlaskConical,
-  research: Workflow,
-}
-
-async function apiFetch<T>(base: string, token: string, path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(`${base}${path}`, {
-    ...init,
-    headers: {
-      ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(init.headers || {}),
-    },
-  })
-  const payload = await response.json().catch(() => ({}))
-  if (!response.ok) {
-    throw new Error(payload.detail || payload.error || `请求失败: ${response.status}`)
-  }
-  return payload as T
-}
-
-async function uploadFile(base: string, token: string, file: File, projectId = ''): Promise<UploadedFile> {
-  const body = new FormData()
-  body.append('upload', file)
-  if (projectId) body.append('project_id', projectId)
-  const response = await fetch(`${base}/api/v1/files`, {
-    method: 'POST',
-    body,
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  })
-  const payload = await response.json().catch(() => ({}))
-  if (!response.ok) {
-    throw new Error(payload.detail || payload.error || `文件上传失败: ${response.status}`)
-  }
-  return payload.file as UploadedFile
-}
-
-type JobEventPayload = { job?: Job; status?: string; error?: string }
-
-type EventTicketPayload = { ticket: string; expires_in: number }
-
-async function readJobStream(
-  base: string,
-  token: string,
-  jobId: string,
-  onEvent: (type: string, payload: JobEventPayload) => void,
-  signal?: AbortSignal,
-) {
-  const ticketPayload = await apiFetch<EventTicketPayload>(base, token, `/api/v1/jobs/${jobId}/events/ticket`, {
-    method: 'POST',
-    signal,
-  })
-  await new Promise<void>((resolve, reject) => {
-    const source = new EventSource(`${base}/api/v1/jobs/${jobId}/events?ticket=${encodeURIComponent(ticketPayload.ticket)}&interval_seconds=0.15&timeout_seconds=300`)
-    let settled = false
-    const cleanup = () => {
-      source.close()
-      signal?.removeEventListener('abort', handleAbort)
-    }
-    const finish = (callback: () => void) => {
-      if (settled) return
-      settled = true
-      cleanup()
-      callback()
-    }
-    const handleAbort = () => {
-      const error = new Error('任务流已取消')
-      error.name = 'AbortError'
-      finish(() => reject(error))
-    }
-    const handleJob = (event: MessageEvent<string>) => {
-      try {
-        const payload = JSON.parse(event.data) as JobEventPayload
-        onEvent('job', payload)
-        if (payload.job && terminalJobStatuses.has(payload.job.status)) finish(resolve)
-      } catch {
-        finish(() => reject(new Error('任务流消息格式无效')))
-      }
-    }
-    const handleError = () => {
-      if (settled) return
-      const error = new Error('任务 SSE 连接断开')
-      finish(() => reject(error))
-    }
-    signal?.addEventListener('abort', handleAbort, { once: true })
-    source.addEventListener('job', handleJob)
-    source.onerror = handleError
-  })
-}
-
-async function followJob(
-  base: string,
-  token: string,
-  jobId: string,
-  onEvent: (type: string, payload: JobEventPayload) => void,
-  signal?: AbortSignal,
-) {
-  let retries = 0
-  let lastEvent = ''
-  while (true) {
-    try {
-      await readJobStream(base, token, jobId, (type, payload) => {
-        const signature = `${type}:${JSON.stringify(payload)}`
-        if (signature === lastEvent) return
-        lastEvent = signature
-        retries = 0
-        onEvent(type, payload)
-      }, signal)
-      return
-    } catch (error) {
-      if (signal?.aborted || retries >= 2) throw error
-      retries += 1
-      await new Promise((resolve) => window.setTimeout(resolve, 500 * retries))
-    }
-  }
 }
 
 function formatTime(value?: string) {
@@ -367,7 +102,7 @@ function App() {
   const [researchPreset, setResearchPreset] = useState<ResearchPreset>('custom')
   const [plannerMode, setPlannerMode] = useState<PlannerMode>('auto')
   const [apiBase] = useState(defaultApiBase)
-  const [token, setToken] = useState(() => localStorage.getItem('bio-agent-token') || import.meta.env.VITE_API_TOKEN || '')
+  const [token, setToken] = useState(() => localStorage.getItem('bio-agent-token') || import.meta.env.VITE_API_TOKEN || localDevelopmentToken)
   const [tokenDraft, setTokenDraft] = useState(() => token)
   const [projects, setProjects] = useState<Project[]>([])
   const [selectedProjectId, setSelectedProjectId] = useState('')
@@ -398,21 +133,9 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState('')
-  const [reportPreview, setReportPreview] = useState<{ url: string; filename: string } | null>(null)
-  const streamController = useRef<AbortController | null>(null)
-  const reportPreviewUrl = useRef<string | null>(null)
   const sequenceDemoStarted = useRef(false)
-
-  function beginJobStream() {
-    streamController.current?.abort()
-    const controller = new AbortController()
-    streamController.current = controller
-    return controller
-  }
-
-  function isCurrentStream(controller: AbortController) {
-    return streamController.current === controller
-  }
+  const { beginJobStream, isCurrentStream, finishJobStream } = useManagedJobStream()
+  const { reportPreview, showReportPreview, closeReportPreview } = useReportPreview()
 
   const refresh = useCallback(async (authToken = token) => {
     setError('')
@@ -452,9 +175,6 @@ function App() {
     void submitSequenceDemo()
   }, [mode])
 
-  useEffect(() => () => {
-    if (reportPreviewUrl.current) window.URL.revokeObjectURL(reportPreviewUrl.current)
-  }, [])
 
   const activeDomains = useMemo(() => plugins.filter((plugin) => plugin.status === 'available').length, [plugins])
   const toolCount = useMemo(() => plugins.reduce((total, plugin) => total + (plugin.tool_count || 0), 0), [plugins])
@@ -679,7 +399,7 @@ function App() {
       setError(err instanceof Error ? err.message : '任务提交失败')
     } finally {
       if (isCurrentStream(controller)) {
-        streamController.current = null
+        finishJobStream(controller)
         setLoading(false)
         void refresh()
       }
@@ -841,7 +561,7 @@ function App() {
       setError(err instanceof Error ? err.message : '任务重试失败')
     } finally {
       if (isCurrentStream(controller)) {
-        streamController.current = null
+        finishJobStream(controller)
         setLoading(false)
         void refresh()
       }
@@ -883,19 +603,10 @@ function App() {
     setError('')
     try {
       const { blob, filename } = await fetchJobArtifact(jobId, artifactPath)
-      const url = window.URL.createObjectURL(blob)
-      if (reportPreviewUrl.current) window.URL.revokeObjectURL(reportPreviewUrl.current)
-      reportPreviewUrl.current = url
-      setReportPreview({ url, filename })
+      showReportPreview(blob, filename)
     } catch (err) {
       setError(err instanceof Error ? err.message : '报告预览失败')
     }
-  }
-
-  function closeReportPreview() {
-    if (reportPreviewUrl.current) window.URL.revokeObjectURL(reportPreviewUrl.current)
-    reportPreviewUrl.current = null
-    setReportPreview(null)
   }
 
   return (
@@ -1034,163 +745,7 @@ function App() {
   )
 }
 
-function CapabilityStrip({ capabilities }: { capabilities: Capabilities | null }) {
-  if (!capabilities) return null
-  const cards = [
-    { key: 'rest', label: 'REST / OpenAPI', icon: Server, detail: capabilities.interfaces.rest?.openapi || '/openapi.json' },
-    { key: 'sse', label: 'SSE 事件流', icon: Radio, detail: capabilities.interfaces.sse?.endpoint || '任务事件流' },
-    { key: 'mcp', label: 'MCP / STDIO', icon: Terminal, detail: `${capabilities.interfaces.mcp?.tool_count || capabilities.tool_count} 个工具` },
-    { key: 'embedded', label: '嵌入式调用', icon: Boxes, detail: capabilities.interfaces.embedded?.entrypoint || 'run_tool' },
-    { key: 'a2a', label: 'A2A / JSON-RPC', icon: GitBranch, detail: capabilities.interfaces.a2a?.endpoint || '/a2a' },
-  ]
-  return <section className="mb-5" aria-label="集成能力"><div className="mb-2 flex items-center justify-between"><div className="eyebrow">集成能力</div><div className="font-mono text-[10px] text-[#66857e]">{capabilities.tool_count} 个工具契约</div></div><div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">{cards.map((card) => { const capability = capabilities.interfaces[card.key]; const Icon = card.icon; const available = capability?.status === 'available'; return <div key={card.key} className="rounded-xl border border-white/[0.08] bg-white/[0.035] px-3 py-3"><div className="flex items-center justify-between gap-2"><div className="flex items-center gap-2 text-xs font-medium text-[#c9e5dc]"><Icon size={14} className="text-[#8fe5c1]" />{card.label}</div><span className={`status-badge ${available ? 'status-ok' : 'status-failed'}`}>{available ? '就绪' : capability?.status || '未知'}</span></div><div className="mt-2 truncate font-mono text-[9px] text-[#66857e]" title={card.detail}>{card.detail}</div></div> })}</div></section>
-}
 
-function Metric({ label, value, icon }: { label: string; value: string; icon: React.ReactNode }) {
-  return <div className="rounded-2xl border border-white/10 bg-white/[0.035] p-3 sm:p-4"><div className="flex items-center gap-2 text-[#6d9189]">{icon}<span className="font-mono text-[9px] tracking-[0.12em]">{label}</span></div><div className="mt-3 font-mono text-2xl text-[#d9f3eb]">{value}</div></div>
-}
-
-function QcStatusMetric({ label, value, className }: { label: string; value: unknown; className: string }) {
-  return <div className={`rounded-xl border border-white/[0.08] bg-[#071719]/70 px-3 py-2 ${className}`}><div className="font-mono text-[9px] tracking-[0.12em]">{label}</div><div className="mt-1 font-mono text-lg text-[#e4f1ed]">{typeof value === 'number' ? value : String(value ?? 0)}</div></div>
-}
-
-function PipelineMetric({ label, value }: { label: string; value: unknown }) {
-  return <div className="rounded-xl border border-white/[0.08] bg-[#071719]/70 px-3 py-2.5"><div className="font-mono text-[9px] tracking-[0.12em] text-[#63817b]">{label}</div><div className="mt-1 font-mono text-lg text-[#e4f1ed]">{String(value)}</div></div>
-}
-
-function StatusBadge({ status }: { status: string }) {
-  const style = status === 'completed' ? 'status-ok' : status === 'failed' || status === 'cancelled' ? 'status-failed' : status === 'running' ? 'status-running' : 'status-queued'
-  return <span className={`status-badge ${style}`}><span className="size-1.5 rounded-full bg-current" />{status === 'cancelled' ? '已取消' : statusLabels[status] || status}</span>
-}
-
-function ResearchFileField({ id, label, accept = '.csv,.tsv,text/csv,text/tab-separated-values', file, uploading, onChange }: { id: string; label: string; accept?: string; file: UploadedFile | null; uploading: boolean; onChange: (file?: File) => void }) {
-  return <div>
-    <div className="field-label">{label}</div>
-    <label htmlFor={id} className="flex min-h-[76px] cursor-pointer items-center justify-between gap-3 rounded-xl border border-dashed border-[#315d55] bg-[#071719]/70 px-3 py-3 transition hover:border-[#71cba7] hover:bg-[#102b2a]">
-      <input id={id} type="file" accept={accept} className="sr-only" onChange={(event) => { onChange(event.target.files?.[0]); event.currentTarget.value = '' }} />
-      <div className="min-w-0"><div className="truncate text-xs font-medium text-[#b8d8ce]">{uploading ? '上传中…' : file?.filename || '选择输入文件'}</div><div className="mt-1 truncate font-mono text-[9px] text-[#668983]">{file ? `${file.size_bytes} 字节 · ${file.sha256.slice(0, 12)}` : '服务端安全存储'}</div></div>
-      {uploading ? <RefreshCw size={15} className="shrink-0 animate-spin text-[#8fe5c1]" /> : <Upload size={15} className="shrink-0 text-[#78cdaa]" />}
-    </label>
-  </div>
-}
-
-function RnaFileField({ id, label, accept, files, fixture, multiple = false, uploading, onChange }: { id: string; label: string; accept?: string; files: UploadedFile[]; fixture?: string; multiple?: boolean; uploading: boolean; onChange: (files: FileList | null) => void }) {
-  const fixtureActive = Boolean(fixture) && files.length === 0
-  return <div>
-    <div className="field-label">{label}</div>
-    <label htmlFor={id} className="flex min-h-[88px] cursor-pointer items-center justify-between gap-3 rounded-xl border border-dashed border-[#315d55] bg-[#071719]/70 px-3 py-3 transition hover:border-[#71cba7] hover:bg-[#102b2a]">
-      <input id={id} type="file" accept={accept} multiple={multiple} className="sr-only" onChange={(event) => { onChange(event.target.files); event.currentTarget.value = '' }} />
-      <div className="min-w-0"><div className="truncate text-xs font-medium text-[#b8d8ce]">{uploading ? '上传中…' : fixtureActive ? fixture : files.length ? `${files.length} 个文件已选择` : '选择输入文件'}</div><div className="mt-1 truncate font-mono text-[9px] text-[#668983]">{fixtureActive ? '使用仓库样例，可切换为自定义上传' : files.length ? files.map((file) => file.filename).join(', ') : '服务端安全存储并计算 SHA-256'}</div></div>
-      {uploading ? <RefreshCw size={15} className="shrink-0 animate-spin text-[#8fe5c1]" /> : <Upload size={15} className="shrink-0 text-[#78cdaa]" />}
-    </label>
-  </div>
-}
-
-function RnaPreflightCard({ items, pairMismatch }: { items: RnaPreflightItem[]; pairMismatch: boolean }) {
-  const requiredCount = items.filter((item) => item.required).length
-  const readyRequiredCount = items.filter((item) => item.required && item.ready).length
-  const allRequiredReady = !pairMismatch && readyRequiredCount === requiredCount
-  return <div className="mt-5 rounded-xl border border-[#244b45] bg-[#0a211f]/75 p-4" role="status" aria-live="polite">
-    <div className="flex flex-wrap items-center justify-between gap-2"><div><div className="field-label">运行前检查</div><div className="mt-1 text-xs text-[#9bc3b8]">{readyRequiredCount}/{requiredCount} 个任务必需输入已满足</div></div><span className={`status-badge ${pairMismatch ? 'status-failed' : allRequiredReady ? 'status-ok' : 'status-running'}`}><span className="size-1.5 rounded-full bg-current" />{pairMismatch ? '配对数量不一致' : allRequiredReady ? '输入已就绪' : '待补齐输入'}</span></div>
-    <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{items.map((item) => <div key={item.label} className="flex min-w-0 items-start gap-2 rounded-lg border border-white/[0.06] bg-[#071719]/70 px-2.5 py-2"><div className={`mt-0.5 shrink-0 ${item.ready ? 'text-[#70e3ad]' : item.required ? 'text-[#e6c875]' : 'text-[#6d8d86]'}`}>{item.ready ? <Check size={13} /> : <XCircle size={13} />}</div><div className="min-w-0"><div className="truncate text-[11px] font-medium text-[#b8d8ce]">{item.label}{item.required ? <span className="ml-1 text-[#e6c875]">必需</span> : <span className="ml-1 text-[#688983]">可选</span>}</div><div className="mt-0.5 truncate text-[10px] text-[#6f9189]">{item.detail}</div></div></div>)}</div>
-  </div>
-}
-
-function ResearchPlanCard({ plan, loading, onExecute }: { plan: ResearchPlan | null; loading: boolean; onExecute: () => void }) {
-  const execution = plan?.execution
-  if (!plan && !loading) return null
-  return <section className="panel mt-5 overflow-hidden" aria-live="polite">
-    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-5 py-5 sm:px-6">
-      <div><div className="eyebrow">02B / 计划检查</div><h2 className="mt-2 text-xl font-semibold">执行前计划检查</h2></div>
-      <div className="flex items-center gap-2 rounded-full border border-[#28524b] bg-[#102b2a] px-2.5 py-1 font-mono text-[10px] text-[#8fe5c1]"><Workflow size={12} />人工确认</div>
-    </div>
-    {!plan ? <div className="flex items-center gap-4 px-5 py-8 text-sm text-[#789791] sm:px-6"><div className="grid size-10 place-items-center rounded-xl border border-[#21443f] bg-[#102b2a] text-[#78cdaa]">{loading ? <RefreshCw size={17} className="animate-spin" /> : <Sparkles size={17} />}</div><div><div className="font-medium text-[#b7d3ca]">{loading ? '规划器正在检查任务…' : '提交科研问题后，这里会出现执行计划。'}</div><div className="mt-1 text-xs text-[#66857e]">计划会先展示领域、证据源、工具链和输入门槛。</div></div></div> : <div className="space-y-5 px-5 py-5 sm:px-6">
-      <div className="flex flex-wrap items-center gap-2">
-        {plan.selected_domains.map((domain) => <span key={domain} className="status-badge status-ok"><span className="size-1.5 rounded-full bg-current" />{domainLabels[domain] || domain}</span>)}
-        <span className="status-badge status-running">证据：{providerLabels[execution?.evidence_provider || plan.evidence_provider] || execution?.evidence_provider}</span>
-        {plan.planner && <span className="status-badge">规划器：{plan.planner.backend === 'llm' ? 'LLM' : plan.planner.backend === 'deterministic' ? 'Deterministic' : plan.planner.backend}</span>}
-        {plan.planner?.model && <span className="status-badge">模型：{plan.planner.model}</span>}
-      </div>
-      <div className="grid gap-4 lg:grid-cols-[0.7fr_1.3fr]">
-        <div className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-4">
-          <div className="field-label">输入门槛</div>
-          {execution?.ready ? <div className="flex items-center gap-2 text-sm text-[#9be6c5]"><Check size={15} />输入已满足，可执行</div> : <div className="text-sm text-[#efb19f]">缺少必要输入</div>}
-          {!execution?.ready && <div className="mt-3 flex flex-wrap gap-1.5">{(execution?.missing_inputs || []).map((item) => <span key={item} className="rounded-md border border-[#70483f] bg-[#2b1b1b] px-2 py-1 font-mono text-[10px] text-[#e9a694]">{item}</span>)}</div>}
-          {execution?.rationale?.length ? <div className="mt-4 space-y-2 text-xs leading-5 text-[#789791]">{execution.rationale.map((item) => <div key={item} className="flex gap-2"><span className="mt-2 size-1 rounded-full bg-[#78cdaa]" />{item}</div>)}</div> : null}
-          {plan.planner?.fallback_reason && <div className="mt-4 rounded-lg border border-[#705b35] bg-[#251f15] px-3 py-2 text-xs leading-5 text-[#d8c18a]">规划器回退：{plan.planner.fallback_reason}</div>}
-        </div>
-        <div className="rounded-xl border border-white/[0.08] bg-[#071719]/70 p-4">
-          <div className="field-label">已选工具链</div>
-          <div className="flex flex-wrap gap-2">{(execution?.selected_tools || []).map((tool, index) => <div key={`${tool}-${index}`} className="inline-flex items-center gap-2 rounded-lg border border-[#28524b] bg-[#102b2a] px-2.5 py-2 font-mono text-[10px] text-[#b9e6d5]"><span className="grid size-4 place-items-center rounded-full bg-[#8fe5c1] text-[9px] font-bold text-[#092521]">{index + 1}</span>{tool}</div>)}</div>
-        </div>
-      </div>
-      <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/[0.08] pt-4"><div className="text-xs text-[#66857e]">规划任务：<span className="text-[#aac8bf]">{plan.task}</span></div><button onClick={onExecute} disabled={loading || !execution?.ready} className="inline-flex items-center gap-2 rounded-xl bg-[#a8f0d2] px-4 py-2.5 text-sm font-semibold text-[#092521] transition hover:bg-[#c6f8e1] disabled:cursor-not-allowed disabled:opacity-40"><Check size={15} />确认并执行</button></div>
-    </div>}
-  </section>
-}
-
-function EmptyStream() {
-  return <div className="flex flex-1 flex-col items-center justify-center text-center"><div className="grid size-14 place-items-center rounded-2xl border border-[#21443f] bg-[#102b2a] text-[#78cdaa]"><Radio size={23} /></div><div className="mt-4 text-sm font-medium text-[#b1cbc4]">等待任务流</div><div className="mt-2 max-w-[220px] text-xs leading-5 text-[#64827b]">提交任务后，这里会实时显示状态和可追溯事件。</div></div>
-}
-
-type SequenceDesignInputProps = {
-  protein: string
-  molecule: SequenceMolecule
-  method: SequenceMethod
-  useVaxpress: boolean
-  structureId: string
-  onProteinChange: (value: string) => void
-  onMoleculeChange: (value: SequenceMolecule) => void
-  onMethodChange: (value: SequenceMethod) => void
-  onUseVaxpressChange: (value: boolean) => void
-  onStructureChange: (value: string) => void
-}
-
-function SequenceDesignInput({ protein, molecule, method, useVaxpress, structureId, onProteinChange, onMoleculeChange, onMethodChange, onUseVaxpressChange, onStructureChange }: SequenceDesignInputProps) {
-  const moleculeOptions: Array<{ value: SequenceMolecule; label: string; name: string; detail: string }> = [
-    { value: 'linear', label: '线性 mRNA', name: '线性 mRNA', detail: '常规翻译模板' },
-    { value: 'circ', label: '环状 RNA', name: '环状 RNA', detail: '保留环状分子上下文' },
-    { value: 'sa', label: '自扩增 RNA', name: '自扩增 RNA', detail: '记录分子类型' },
-  ]
-  const methodOptions: Array<{ value: SequenceMethod; label: string; detail: string }> = [
-    { value: 'greedy', label: '确定性贪心', detail: '内置规则，结果可复现' },
-    { value: 'vaxpress', label: 'VaxPress 适配器', detail: '外部后端可用时接入' },
-  ]
-  const steps = [
-    { number: '01', label: '输入', detail: '蛋白序列' },
-    { number: '02', label: '优化', detail: '密码子策略' },
-    { number: '03', label: '验证', detail: '翻译回译' },
-    { number: '04', label: '基准比较', detail: '基线比较' },
-  ]
-  return <div className="mt-6 space-y-4">
-    <section className="rounded-2xl border border-[#28524b] bg-[linear-gradient(135deg,rgba(16,43,42,.82),rgba(7,23,25,.92))] p-4" aria-label="mRNA 设计流程">
-      <div className="flex flex-wrap items-start justify-between gap-3"><div><div className="field-label mb-0 text-[#8fe5c1]">mRNA-Forge / 序列优化工作区</div><h3 className="mt-1 text-base font-semibold text-[#e4f8ef]">从蛋白序列生成可验证 mRNA</h3><p className="mt-1 text-xs leading-5 text-[#82a79e]">保留独立项目的确定性计算、质量画像和报告能力，并接入统一任务闭环。</p></div><div className="flex flex-wrap items-center gap-1.5"><span className="status-badge status-ok">可审计</span><span className="status-badge status-queued">可复现</span></div></div>
-      <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">{steps.map((step, index) => <div key={step.number} className={`rounded-xl border px-3 py-2.5 ${index === 0 ? 'border-[#4c9c7d] bg-[#123631]' : 'border-white/[0.07] bg-[#071719]/60'}`}><div className="font-mono text-[10px] text-[#8fe5c1]">{step.number}</div><div className="mt-1 text-[11px] font-medium text-[#c9e5dc]">{step.label}</div><div className="mt-0.5 text-[10px] text-[#6f9189]">{step.detail}</div></div>)}</div>
-    </section>
-
-    <section className="rounded-2xl border border-white/[0.08] bg-[#071719]/70 p-4">
-      <div className="flex flex-wrap items-center justify-between gap-2"><div><div className="field-label mb-0">01 / 目标蛋白</div><div className="mt-1 text-sm font-medium text-[#cfe9df]">目标氨基酸序列</div></div><div className="flex items-center gap-3"><span className="font-mono text-[10px] text-[#6f9189]">{protein.length} aa</span><button type="button" onClick={() => onProteinChange(luciferaseDemoProtein)} className="rounded-lg border border-white/[0.1] px-2.5 py-1.5 text-[10px] text-[#9fc4b8] transition hover:border-[#71cba7] hover:text-[#e8fff5]">加载荧光素酶示例（550 aa）</button></div></div>
-      <textarea aria-label="目标蛋白序列" value={protein} onChange={(event) => onProteinChange(event.target.value.toUpperCase())} rows={3} className="input-area mt-3 font-mono tracking-[0.16em]" placeholder="例如 MKT..." />
-      <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[10px] leading-5 text-[#6f9189]"><span>支持标准单字母氨基酸符号；后端会在运行前校验序列。</span><span className="font-mono">蛋白质 → mRNA</span></div>
-    </section>
-
-    <section className="rounded-2xl border border-white/[0.08] bg-[#071719]/70 p-4">
-      <div className="field-label mb-0">01B / 分子形式</div><div className="mt-1 text-sm font-medium text-[#cfe9df]">选择分子类型</div>
-      <div className="mt-3 grid gap-2 sm:grid-cols-3" role="radiogroup" aria-label="分子类型">{moleculeOptions.map((option) => <button key={option.value} type="button" role="radio" aria-checked={molecule === option.value} onClick={() => onMoleculeChange(option.value)} className={`rounded-xl border p-3 text-left transition ${molecule === option.value ? 'border-[#4c9c7d] bg-[#123631] shadow-[0_0_0_1px_rgba(143,229,193,.12)]' : 'border-white/[0.08] bg-[#0a211f]/60 hover:border-[#376b5d]'}`}><div className="flex items-center justify-between gap-2"><span className="text-xs font-medium text-[#d1eee2]">{option.name}</span>{molecule === option.value && <Check size={14} className="text-[#8fe5c1]" />}</div><div className="mt-1 font-mono text-[10px] text-[#6f9189]">{option.label}</div><div className="mt-2 text-[10px] text-[#86aaa0]">{option.detail}</div></button>)}</div>
-    </section>
-
-    <section className="rounded-2xl border border-white/[0.08] bg-[#071719]/70 p-4">
-      <div className="field-label mb-0">02 / 优化策略</div><div className="mt-1 text-sm font-medium text-[#cfe9df]">选择优化后端</div>
-      <div className="mt-3 grid gap-2 sm:grid-cols-2" role="radiogroup" aria-label="优化策略">{methodOptions.map((option) => <button key={option.value} type="button" role="radio" aria-checked={method === option.value} onClick={() => onMethodChange(option.value)} className={`rounded-xl border p-3 text-left transition ${method === option.value ? 'border-[#4c9c7d] bg-[#123631]' : 'border-white/[0.08] bg-[#0a211f]/60 hover:border-[#376b5d]'}`}><div className="flex items-center justify-between gap-2"><span className="text-xs font-medium text-[#d1eee2]">{option.label}</span>{method === option.value && <span className="status-badge status-ok">已选</span>}</div><div className="mt-2 text-[10px] leading-5 text-[#86aaa0]">{option.detail}</div></button>)}</div>
-    </section>
-
-    <details className="rounded-xl border border-white/[0.08] bg-[#071719]/55">
-      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 text-xs text-[#aac8bf] outline-none focus-visible:ring-2 focus-visible:ring-[#8fe5c1] focus-visible:ring-inset"><span>高级上下文 / 结构与外部适配器</span><span className="font-mono text-[10px] text-[#6f9189]">可选</span></summary>
-      <div className="border-t border-white/[0.07] p-4"><div className="grid gap-4 sm:grid-cols-2"><div><label className="field-label" htmlFor="sequence-structure-id">可选 PDB ID</label><input id="sequence-structure-id" value={structureId} onChange={(event) => onStructureChange(event.target.value.toUpperCase().replace(/[^0-9A-Z]/g, '').slice(0, 4))} className="input-control font-mono uppercase" placeholder="例如 1LCI" /><span className="mt-2 block text-[10px] leading-5 text-[#6f9189]">仅在结构与目标蛋白匹配时加载 Mol* 上下文。</span></div><label className="flex items-start gap-3 rounded-xl border border-white/[0.08] bg-[#0a211f]/60 px-3 py-3 text-xs text-[#a9c8be]"><input type="checkbox" checked={useVaxpress} onChange={(event) => onUseVaxpressChange(event.target.checked)} className="mt-0.5 accent-[#8fe5c1]" /><span><span className="block font-medium text-[#d1eee2]">纳入 VaxPress 基准比较</span><span className="mt-1 block text-[10px] leading-5 text-[#6f9189]">未配置外部 mRNA-Forge 时记录回退，不会把确定性结果伪装成模型结果。</span></span></label></div></div>
-    </details>
-    <div className="flex items-start gap-2 rounded-xl border border-[#705b35] bg-[#251f15]/70 px-3 py-3 text-[10px] leading-5 text-[#d8c18a]"><Sparkles size={13} className="mt-0.5 shrink-0" /><span>这些指标是可追溯的规则质量信号，不是经过实验数据校准的表达量预测。最终序列仍需结合宿主、UTR、修饰和实验验证。</span></div>
-  </div>
-}
 
 function metricNumber(metrics: Record<string, unknown>, keys: string[]) {
   for (const key of keys) {
@@ -1630,8 +1185,5 @@ function JobResultSummary({ job, structureId, onDownload, onOpenReport }: { job:
   </section>
 }
 
-function DomainsView({ plugins }: { plugins: Plugin[] }) {
-  return <section className="py-9"><div className="max-w-3xl"><div className="eyebrow">插件目录 / 能力发现</div><h1 className="mt-3 text-4xl font-semibold tracking-[-0.04em] sm:text-5xl">领域是能力，<span className="text-[#8fe5c1]">插件是边界。</span></h1><p className="mt-5 text-sm leading-7 text-[#88a6a0] sm:text-base">每个领域通过统一工具契约接入，状态、版本与能力在运行时可发现。研究代理只编排能力，不把业务逻辑写死在对话层。</p></div><div className="mt-10 grid gap-4 md:grid-cols-2 xl:grid-cols-3">{plugins.map((plugin) => { const Icon = domainIcons[plugin.domain] || Boxes; return <div key={plugin.domain} className="panel group p-5 transition hover:-translate-y-0.5 hover:border-[#3e786a]"><div className="flex items-start justify-between"><div className="grid size-11 place-items-center rounded-xl border border-[#28524b] bg-[#102b2a] text-[#8fe5c1]"><Icon size={20} /></div><span className={`status-badge ${plugin.status === 'available' ? 'status-ok' : 'status-failed'}`}>{plugin.status === 'available' ? '可用' : plugin.status.toUpperCase()}</span></div><h2 className="mt-6 text-lg font-semibold capitalize">{domainLabels[plugin.domain] || plugin.domain}</h2><p className="mt-1 min-h-10 text-xs leading-5 text-[#6e8b85]">{pluginDescriptions[plugin.domain] || plugin.name}</p><div className="mt-5 flex items-end justify-between border-t border-white/[0.07] pt-4"><div><div className="font-mono text-2xl text-[#d7f1e8]">{String(plugin.tool_count).padStart(2, '0')}</div><div className="mt-1 font-mono text-[9px] tracking-[0.15em] text-[#5f7d77]">工具</div></div><div className="text-right font-mono text-[10px] text-[#63837b]">v{plugin.version || 'builtin'}</div></div></div> })}</div></section>
-}
 
 export default App
