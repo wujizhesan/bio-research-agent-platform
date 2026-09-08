@@ -414,6 +414,24 @@ class RedisJobManager:
         self.redis.lrem(self._processing_key, 0, str(job_id))
         self._refresh_queue_metrics()
 
+    def _queue_contains(self, job_id):
+        job_id = str(job_id)
+        locate = getattr(self.redis, 'lpos', None)
+        if locate is not None:
+            return any(
+                locate(queue_key, job_id) is not None
+                for queue_key in self._queue_keys
+            )
+        for queue_key in self._queue_keys:
+            queued = self.redis.lrange(queue_key, 0, -1)
+            if any(
+                (item.decode('utf-8') if isinstance(item, bytes) else str(item))
+                == job_id
+                for item in queued
+            ):
+                return True
+        return False
+
     def _refresh_queue_metrics(self):
         try:
             queue_size = sum(self.redis.llen(key) for key in self._queue_keys)
@@ -553,6 +571,19 @@ class RedisJobManager:
                 with self._lock, guard:
                     record = self._load(job_id)
                     if record is None or record.get('status') in TERMINAL_STATUSES:
+                        self._ack(job_id)
+                        continue
+                    if record.get('status') == 'queued':
+                        if not self._queue_contains(job_id):
+                            record['recovered_at'] = _now()
+                            self._save(record)
+                            self.redis.lpush(
+                                self._queue_for_priority(
+                                    int(record.get('priority', 0))
+                                ),
+                                job_id,
+                            )
+                            recovered.append(job_id)
                         self._ack(job_id)
                         continue
                     if self._lease_active(record, now):

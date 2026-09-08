@@ -41,7 +41,7 @@ jobs:
       - name: Run unit tests
         run: |
           coverage run --source=src -m pytest -q --ignore=tests/integration
-          coverage report
+          coverage report --fail-under=65
       - name: Verify domain catalog and workflow dry-run
         run: |
           mkdir -p output
