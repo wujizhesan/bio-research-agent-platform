@@ -242,8 +242,15 @@ jobs:
           import database
           import domain_registry
           import fastapi_app
+          import omics_protocol
           import redis_job_manager
+          import redis_job_worker
+          import research_domain_workflows
+          import research_omics_workflow
+          import research_protocol
+          import research_workflow_builder
           import run_context
+          import tool_contracts
 
           assert version('bio-research-agent-platform')
           assert 'site-packages' in Path(run_context.__file__).as_posix()
@@ -251,6 +258,11 @@ jobs:
           assert fastapi_app.app is not None
           assert database.Database is not None
           assert redis_job_manager.RedisJobManager is not None
+          assert redis_job_worker.RedisJobWorkerRuntime is not None
+          assert omics_protocol.build_omics_tools is not None
+          assert research_protocol.build_research_tools is not None
+          assert research_workflow_builder._build_workflow is not None
+          assert tool_contracts.bind_tool_contracts is not None
           PY
           "$GITHUB_WORKSPACE/.venv-package/bin/bio-agent-domains" --domain all > installed_domains.json
           "$GITHUB_WORKSPACE/.venv-package/bin/bio-agent-workflow" \
