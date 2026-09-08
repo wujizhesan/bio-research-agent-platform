@@ -1,13 +1,10 @@
 """RNA-seq domain adapter with structured tools and reproducible outputs."""
 import argparse
-import gzip
 import hashlib
 import json
 import os
-import re
 import shutil
 import subprocess
-import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -19,8 +16,6 @@ try:
         build_omics_manifest,
         differential_expression_result,
         pathway_enrichment_result,
-        specialist_workflow_result,
-        variant_annotation_result,
         write_omics_manifest,
         write_omics_report,
     )
@@ -30,12 +25,10 @@ try:
         infer_qc_type as _infer_qc_type,
         load_expression_matrix,
         normalize_alignment_paths as _normalize_alignment_paths,
-        normalize_fastq_paths as _normalize_fastq_paths,
-        normalize_qc_paths as _normalize_qc_paths,
         require_columns as _require_columns,
-        resolve_qc_type as _resolve_qc_type,
     )
     from .omics_protocol import build_omics_tools
+    from .omics_fastq_qc import execute_fastq_qc, execute_genomics_qc
     from .omics_qc_executors import (
         run_metagenomics_qc,
         run_single_cell_10x_qc,
@@ -50,13 +43,16 @@ try:
         execute_variant_calling,
         execute_variant_normalization,
     )
+    from .omics_variant_annotation import (
+        VARIANT_ANNOTATION_BACKENDS,
+        execute_variant_annotation,
+    )
+    from .omics_workbenches import run_rnaseq_workbench, run_variant_workbench
 except ImportError:
     from omics_results import (
         build_omics_manifest,
         differential_expression_result,
         pathway_enrichment_result,
-        specialist_workflow_result,
-        variant_annotation_result,
         write_omics_manifest,
         write_omics_report,
     )
@@ -66,12 +62,10 @@ except ImportError:
         infer_qc_type as _infer_qc_type,
         load_expression_matrix,
         normalize_alignment_paths as _normalize_alignment_paths,
-        normalize_fastq_paths as _normalize_fastq_paths,
-        normalize_qc_paths as _normalize_qc_paths,
         require_columns as _require_columns,
-        resolve_qc_type as _resolve_qc_type,
     )
     from omics_protocol import build_omics_tools
+    from omics_fastq_qc import execute_fastq_qc, execute_genomics_qc
     from omics_qc_executors import (
         run_metagenomics_qc,
         run_single_cell_10x_qc,
@@ -86,6 +80,11 @@ except ImportError:
         execute_variant_calling,
         execute_variant_normalization,
     )
+    from omics_variant_annotation import (
+        VARIANT_ANNOTATION_BACKENDS,
+        execute_variant_annotation,
+    )
+    from omics_workbenches import run_rnaseq_workbench, run_variant_workbench
 
 PLUGIN_NAME = 'RNA-seq and omics domain'
 PLUGIN_VERSION = '0.7.0'
@@ -109,7 +108,6 @@ PLUGIN_CAPABILITIES = (
     'omics.metagenomics_qc',
 )
 STATISTICS_BACKENDS = ('auto', 'scipy', 'deseq2')
-VARIANT_ANNOTATION_BACKENDS = ('auto', 'local', 'vcf_ann', 'gencode_gtf')
 TOOLCHAIN_EXECUTABLES = {
     'gatk': 'gatk',
     'samtools': 'samtools',
@@ -408,6 +406,7 @@ def _external_tool_dependencies():
         sha256=_file_sha256,
         version=_external_tool_version,
         run_command=_run_variant_command,
+        capture_command=_run_external_qc,
     )
 
 
@@ -473,76 +472,6 @@ def run_feature_counts(alignment_paths, annotation_gtf, output_dir, output_csv=N
     )
 
 
-def _fastq_file_stats(path):
-    opener = gzip.open if path.name.lower().endswith('.gz') else open
-    reads = 0
-    bases = 0
-    quality_sum = 0
-    min_length = None
-    max_length = 0
-    with opener(path, 'rt', encoding='utf-8', errors='replace') as handle:
-        while True:
-            header = handle.readline()
-            if not header:
-                break
-            sequence = handle.readline().rstrip('\r\n')
-            separator = handle.readline().rstrip('\r\n')
-            quality = handle.readline().rstrip('\r\n')
-            if not sequence or not header.startswith('@') or not separator.startswith('+'):
-                raise ValueError(f'invalid FASTQ record in: {path}')
-            if len(sequence) != len(quality):
-                raise ValueError(f'FASTQ sequence/quality length mismatch in: {path}')
-            length = len(sequence)
-            reads += 1
-            bases += length
-            quality_sum += sum(max(0, ord(char) - 33) for char in quality)
-            min_length = length if min_length is None else min(min_length, length)
-            max_length = max(max_length, length)
-    return {
-        'path': str(path),
-        'reads': reads,
-        'bases': bases,
-        'min_read_length': min_length or 0,
-        'max_read_length': max_length,
-        'mean_read_length': round(bases / reads, 3) if reads else 0.0,
-        'mean_quality': round(quality_sum / bases, 3) if bases else 0.0,
-    }
-
-
-def _write_qc_manifest(output_dir, payload):
-    manifest_path = Path(output_dir) / 'genomics_qc.json'
-    payload['manifest_path'] = str(manifest_path)
-    manifest_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
-        encoding='utf-8',
-    )
-    return payload
-
-
-def _write_variant_manifest(output_dir, payload):
-    return _write_omics_manifest(output_dir, 'variant_normalization.json', payload)
-
-
-def _write_omics_manifest(output_dir, filename, payload):
-    manifest_path = Path(output_dir) / filename
-    payload['manifest_path'] = str(manifest_path)
-    manifest_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
-        encoding='utf-8',
-    )
-    return payload
-
-
-def _parse_stat_value(text, label):
-    for line in str(text or '').splitlines():
-        fields = line.split('\t')
-        if len(fields) >= 3 and fields[0] == 'SN' and label in fields[2]:
-            return fields[3] if len(fields) > 3 else None
-        if len(fields) >= 2 and fields[0] == 'SN' and label in fields[1]:
-            return fields[2] if len(fields) > 2 else None
-    return None
-
-
 def _run_external_qc(command, output_path, timeout):
     try:
         completed = subprocess.run(
@@ -576,534 +505,36 @@ def _run_external_qc(command, output_path, timeout):
 
 
 def run_genomics_qc(input_path, output_dir, input_type='auto', timeout=300):
-    paths = _normalize_qc_paths(input_path)
-    resolved_type = _resolve_qc_type(paths, input_type)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    timeout = max(1, min(int(timeout), 3600))
-    if resolved_type == 'fastq':
-        file_metrics = [_fastq_file_stats(path) for path in paths]
-        totals = {
-            'files': len(file_metrics),
-            'reads': sum(item['reads'] for item in file_metrics),
-            'bases': sum(item['bases'] for item in file_metrics),
-        }
-        total_bases = totals['bases']
-        totals.update({
-            'min_read_length': min(
-                (item['min_read_length'] for item in file_metrics if item['reads']),
-                default=0,
-            ),
-            'max_read_length': max(
-                (item['max_read_length'] for item in file_metrics),
-                default=0,
-            ),
-            'mean_read_length': round(
-                totals['bases'] / totals['reads'], 3
-            ) if totals['reads'] else 0.0,
-            'mean_quality': round(
-                sum(item['mean_quality'] * item['bases'] for item in file_metrics) / total_bases,
-                3,
-            ) if total_bases else 0.0,
-        })
-        return _write_qc_manifest(output_dir, {
-            'status': 'completed',
-            'input_type': resolved_type,
-            'tool': 'python-fastq-parser',
-            'inputs': [str(path) for path in paths],
-            'metrics': totals,
-            'files': file_metrics,
-        })
-    if len(paths) != 1:
-        raise ValueError(f'{resolved_type} QC accepts exactly one input file')
-    input_file = paths[0]
-    tool_name = 'samtools' if resolved_type == 'bam' else 'bcftools'
-    executable = shutil.which(tool_name)
-    if not executable:
-        return _write_qc_manifest(output_dir, {
-            'status': 'unavailable',
-            'input_type': resolved_type,
-            'tool': tool_name,
-            'inputs': [str(input_file)],
-            'reason': f'{tool_name} not found in PATH',
-        })
-    if resolved_type == 'bam':
-        quickcheck = _run_external_qc(
-            [executable, 'quickcheck', '-v', str(input_file)],
-            output_dir / 'samtools_quickcheck.txt',
-            timeout,
-        )
-        if quickcheck['status'] != 'completed':
-            return _write_qc_manifest(output_dir, {
-                'status': 'failed',
-                'input_type': resolved_type,
-                'tool': tool_name,
-                'inputs': [str(input_file)],
-                'quickcheck': quickcheck,
-            })
-        flagstat = _run_external_qc(
-            [executable, 'flagstat', str(input_file)],
-            output_dir / 'samtools_flagstat.txt',
-            timeout,
-        )
-        return _write_qc_manifest(output_dir, {
-            'status': flagstat['status'],
-            'input_type': resolved_type,
-            'tool': tool_name,
-            'inputs': [str(input_file)],
-            'quickcheck': {'status': 'completed'},
-            'flagstat': {
-                key: value for key, value in flagstat.items() if key != 'stdout'
-            },
-            'total_reads': _parse_flagstat_total(flagstat.get('stdout', '')),
-        })
-    stats = _run_external_qc(
-        [executable, 'stats', str(input_file)],
-        output_dir / 'bcftools_stats.txt',
-        timeout,
+    return execute_genomics_qc(
+        input_path,
+        output_dir,
+        input_type=input_type,
+        timeout=timeout,
+        dependencies=_external_tool_dependencies(),
     )
-    return _write_qc_manifest(output_dir, {
-        'status': stats['status'],
-        'input_type': resolved_type,
-        'tool': tool_name,
-        'inputs': [str(input_file)],
-        'stats': {
-            key: value for key, value in stats.items() if key != 'stdout'
-        },
-        'number_of_records': _parse_stat_value(stats.get('stdout', ''), 'number of records'),
-    })
-
-
-def _parse_fastqc_summary(zip_path):
-    with zipfile.ZipFile(zip_path) as archive:
-        summary_name = next(
-            (name for name in archive.namelist() if name.endswith('/summary.txt')),
-            None,
-        )
-        if not summary_name:
-            return []
-        text = archive.read(summary_name).decode('utf-8', errors='replace')
-    records = []
-    for line in text.splitlines():
-        fields = line.split('\t', 2)
-        if len(fields) == 3:
-            records.append({
-                'status': fields[0].lower(),
-                'module': fields[1],
-                'details': fields[2],
-            })
-    return records
-
-
-def _fastqc_reports(output_dir):
-    reports = []
-    summaries = []
-    for zip_path in sorted(output_dir.glob('*_fastqc.zip')):
-        try:
-            summary = _parse_fastqc_summary(zip_path)
-        except (OSError, zipfile.BadZipFile) as exc:
-            summary = [{'status': 'error', 'module': 'summary', 'details': str(exc)}]
-        summaries.append({
-            'archive': str(zip_path),
-            'summary': summary,
-        })
-        reports.append(str(zip_path))
-    reports.extend(str(path) for path in sorted(output_dir.glob('*_fastqc.html')))
-    return reports, summaries
 
 
 def run_fastq_qc(fastq_paths, output_dir, fastq_r2_paths=None, threads=1,
                  timeout=900):
-    paths = _normalize_fastq_paths(fastq_paths)
-    mate_paths = _normalize_fastq_paths(fastq_r2_paths) if fastq_r2_paths is not None else []
-    if mate_paths and len(paths) != len(mate_paths):
-        raise ValueError('fastq_r2_paths must match the number of FASTQ R1 inputs')
-    all_paths = paths + mate_paths
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    fastqc_dir = output_dir / 'fastqc'
-    fastqc_dir.mkdir(parents=True, exist_ok=True)
-    threads = max(1, min(int(threads), 64))
-    timeout = max(1, min(int(timeout), 3600))
-    provenance = {
-        'inputs': [
-            {'path': str(path), 'sha256': _file_sha256(path)} for path in all_paths
-        ],
-        'parameters': {
-            'threads': threads,
-            'layout': 'paired_end' if mate_paths else 'single_end',
-        },
-        'tools': {},
-    }
-    fastqc = shutil.which('fastqc')
-    multiqc = shutil.which('multiqc')
-    missing_tools = [name for name, path in (('fastqc', fastqc), ('multiqc', multiqc)) if not path]
-    if missing_tools:
-        return _write_omics_manifest(output_dir, 'fastq_qc.json', {
-            'status': 'unavailable',
-            'workflow': 'fastq_quality_control',
-            'inputs': [str(path) for path in all_paths],
-            'missing_tools': missing_tools,
-            'reason': 'install FastQC and MultiQC in the execution environment',
-            'provenance': provenance,
-        })
-    provenance['tools'] = {
-        'fastqc': {'path': fastqc, **_external_tool_version(fastqc)},
-        'multiqc': {'path': multiqc, **_external_tool_version(multiqc)},
-    }
-    fastqc_command = [
-        fastqc, '--quiet', '--threads', str(threads),
-        '--outdir', str(fastqc_dir),
-        *[str(path) for path in all_paths],
-    ]
-    fastqc_result = _run_variant_command(
-        fastqc_command, timeout, output_dir / 'fastqc.log'
+    return execute_fastq_qc(
+        fastq_paths,
+        output_dir,
+        fastq_r2_paths=fastq_r2_paths,
+        threads=threads,
+        timeout=timeout,
+        dependencies=_external_tool_dependencies(),
     )
-    if fastqc_result['status'] != 'completed':
-        return _write_omics_manifest(output_dir, 'fastq_qc.json', {
-            'status': 'failed',
-            'workflow': 'fastq_quality_control',
-            'inputs': [str(path) for path in all_paths],
-            'fastqc': fastqc_result,
-            'command': fastqc_command,
-            'provenance': provenance,
-        })
-    multiqc_command = [
-        multiqc, '--force', '--outdir', str(output_dir),
-        '--filename', 'multiqc_report.html', str(fastqc_dir),
-    ]
-    multiqc_result = _run_variant_command(
-        multiqc_command, timeout, output_dir / 'multiqc.log'
-    )
-    reports, summaries = _fastqc_reports(fastqc_dir)
-    module_status_counts = {}
-    for report in summaries:
-        for record in report['summary']:
-            status = record['status']
-            module_status_counts[status] = module_status_counts.get(status, 0) + 1
-    if (output_dir / 'multiqc_report.html').is_file():
-        reports.append(str(output_dir / 'multiqc_report.html'))
-    return _write_omics_manifest(output_dir, 'fastq_qc.json', {
-        'status': 'completed' if multiqc_result['status'] == 'completed' else 'failed',
-        'workflow': 'fastq_quality_control',
-        'inputs': [str(path) for path in all_paths],
-        'reports': reports,
-        'fastqc_summaries': summaries,
-        'module_status_counts': module_status_counts,
-        'fastqc': fastqc_result,
-        'multiqc': multiqc_result,
-        'commands': {
-            'fastqc': fastqc_command,
-            'multiqc': multiqc_command,
-        },
-        'provenance': provenance,
-    })
-
-
-def _parse_flagstat_total(text):
-    match = re.search(r'^(\d+)\s*\+\s*(\d+)\s+in total', str(text or ''), re.MULTILINE)
-    if not match:
-        return None
-    return int(match.group(1)) + int(match.group(2))
-
-
-
-
-
-
-def _open_vcf(path):
-    path = Path(path)
-    if path.suffix.lower() == '.gz':
-        return gzip.open(path, 'rt', encoding='utf-8')
-    return path.open('r', encoding='utf-8')
-
-
-def _parse_info(raw):
-    values = {}
-    if raw in {'', '.'}:
-        return values
-    for item in raw.split(';'):
-        if '=' in item:
-            key, value = item.split('=', 1)
-            values[key] = value
-        else:
-            values[item] = True
-    return values
-
-
-def _parse_ann(info, alt):
-    records = info.get('ANN')
-    if not isinstance(records, str):
-        return None
-    for record in records.split(','):
-        fields = record.split('|')
-        if not fields or fields[0] != alt:
-            continue
-        return {
-            'gene_id': fields[4] if len(fields) > 4 else '',
-            'gene_name': fields[3] if len(fields) > 3 else '',
-            'effect': fields[1] if len(fields) > 1 else '',
-            'impact': fields[2] if len(fields) > 2 else '',
-        }
-    return None
-
-
-def _normalize_chrom(value):
-    value = str(value).strip().lower()
-    return value[3:] if value.startswith('chr') else value
-
-
-def _load_variant_annotations(annotation_csv):
-    if not annotation_csv:
-        return None
-    annotation = pd.read_csv(annotation_csv)
-    _require_columns(annotation, {'chrom', 'start', 'end', 'gene_id'}, 'variant annotation table')
-    if annotation.empty:
-        raise ValueError('variant annotation table is empty')
-    annotation = annotation.copy()
-    annotation['chrom'] = annotation['chrom'].map(_normalize_chrom)
-    annotation['start'] = pd.to_numeric(annotation['start'], errors='raise').astype(int)
-    annotation['end'] = pd.to_numeric(annotation['end'], errors='raise').astype(int)
-    if (annotation['start'] > annotation['end']).any():
-        raise ValueError('variant annotation start must be less than or equal to end')
-    if annotation['gene_id'].isna().any():
-        raise ValueError('variant annotation gene_id must be non-empty')
-    return annotation
-
-
-def _parse_gtf_attributes(text):
-    attributes = {}
-    for item in str(text or '').strip().strip(';').split(';'):
-        item = item.strip()
-        if not item:
-            continue
-        if '=' in item and ' ' not in item.split('=', 1)[0]:
-            key, value = item.split('=', 1)
-        else:
-            parts = item.split(None, 1)
-            if len(parts) != 2:
-                continue
-            key, value = parts
-        attributes[key.strip()] = value.strip().strip('"')
-    return attributes
-
-
-def _load_gencode_annotations(annotation_gtf):
-    annotation_gtf = Path(annotation_gtf)
-    if not annotation_gtf.is_file():
-        raise ValueError(f'GTF annotation does not exist: {annotation_gtf}')
-    opener = gzip.open if annotation_gtf.suffix.lower() == '.gz' else open
-    gene_rows = []
-    transcript_rows = []
-    with opener(annotation_gtf, 'rt', encoding='utf-8', errors='replace') as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            line = raw_line.rstrip('\n\r')
-            if not line or line.startswith('#'):
-                continue
-            fields = line.split('\t')
-            if len(fields) != 9:
-                raise ValueError(f'GTF row {line_number} must contain 9 columns')
-            feature = fields[2].lower()
-            if feature not in {'gene', 'transcript'}:
-                continue
-            try:
-                start = int(fields[3])
-                end = int(fields[4])
-            except ValueError as exc:
-                raise ValueError(f'GTF row {line_number} has invalid coordinates') from exc
-            attributes = _parse_gtf_attributes(fields[8])
-            gene_id = attributes.get('gene_id') or attributes.get('gene') or attributes.get('ID')
-            if not gene_id:
-                continue
-            row = {
-                'chrom': fields[0],
-                'start': start,
-                'end': end,
-                'gene_id': gene_id,
-                'gene_name': attributes.get('gene_name') or attributes.get('Name', ''),
-                'gene_type': attributes.get('gene_type') or attributes.get('gene_biotype', ''),
-                'transcript_id': attributes.get('transcript_id') or attributes.get('transcript', ''),
-            }
-            (gene_rows if feature == 'gene' else transcript_rows).append(row)
-    rows = gene_rows or transcript_rows
-    if not rows:
-        raise ValueError('GTF annotation has no gene or transcript records with gene identifiers')
-    annotation = pd.DataFrame(rows)
-    annotation['chrom'] = annotation['chrom'].map(_normalize_chrom)
-    annotation['start'] = pd.to_numeric(annotation['start'], errors='raise').astype(int)
-    annotation['end'] = pd.to_numeric(annotation['end'], errors='raise').astype(int)
-    return annotation
-
-
-def _local_variant_matches(annotation, chrom, position):
-    if annotation is None:
-        return []
-    matches = annotation.loc[
-        (annotation['chrom'] == _normalize_chrom(chrom))
-        & (annotation['start'] <= position)
-        & (annotation['end'] >= position)
-    ]
-    return matches.to_dict('records')
 
 
 def annotate_variants(vcf_path, output_csv, annotation_csv=None,
                       annotation_backend='auto', annotation_gtf=None):
-    requested = str(annotation_backend or 'auto').lower()
-    if requested not in VARIANT_ANNOTATION_BACKENDS:
-        raise ValueError(f'unknown variant annotation backend: {requested}')
-    if annotation_csv and annotation_gtf:
-        raise ValueError('provide only one of annotation_csv and annotation_gtf')
-    if annotation_gtf:
-        if requested == 'auto':
-            requested = 'gencode_gtf'
-        annotation = _load_gencode_annotations(annotation_gtf)
-    elif requested == 'gencode_gtf':
-        raise ValueError('gencode_gtf annotation requires annotation_gtf')
-    else:
-        annotation = _load_variant_annotations(annotation_csv)
-    if requested == 'local' and annotation is None:
-        raise ValueError('local variant annotation requires annotation_csv')
-    rows = []
-    n_variants = 0
-    n_alleles = 0
-    sources = set()
-    with _open_vcf(vcf_path) as handle:
-        header = None
-        for line_number, raw_line in enumerate(handle, start=1):
-            line = raw_line.rstrip('\n\r')
-            if not line:
-                continue
-            if line.startswith('##'):
-                continue
-            if line.startswith('#CHROM'):
-                header = line.lstrip('#').split('\t')
-                continue
-            if line.startswith('#'):
-                continue
-            if header is None:
-                raise ValueError('VCF header is missing')
-            fields = line.split('\t')
-            if len(fields) < 8:
-                raise ValueError(f'VCF row {line_number} has fewer than 8 columns')
-            record = dict(zip(header, fields))
-            chrom = record.get('#CHROM') or record.get('CHROM')
-            if not chrom:
-                raise ValueError('VCF header must include CHROM')
-            try:
-                position = int(record['POS'])
-            except (KeyError, ValueError) as exc:
-                raise ValueError(f'VCF row {line_number} has an invalid POS') from exc
-            ref = record.get('REF', '')
-            alternatives = [item for item in record.get('ALT', '').split(',') if item and item != '.']
-            if not ref or not alternatives:
-                raise ValueError(f'VCF row {line_number} has invalid REF or ALT')
-            n_variants += 1
-            n_alleles += len(alternatives)
-            info = _parse_info(record.get('INFO', '.'))
-            base_id = record.get('ID') or '.'
-            for alt in alternatives:
-                variant_id = base_id if base_id != '.' else f'{chrom}:{position}:{ref}>{alt}'
-                ann = _parse_ann(info, alt) if requested in {'auto', 'vcf_ann'} else None
-                matches = _local_variant_matches(annotation, chrom, position)
-                if ann:
-                    sources.add('vcf_ann')
-                    rows.append({
-                        'variant_id': variant_id,
-                        'chrom': chrom,
-                        'pos': position,
-                        'ref': ref,
-                        'alt': alt,
-                        'qual': record.get('QUAL', '.'),
-                        'filter': record.get('FILTER', '.'),
-                        'gene_id': ann['gene_id'],
-                        'gene_name': ann['gene_name'],
-                        'transcript_id': '',
-                        'gene_type': '',
-                        'effect': ann['effect'],
-                        'impact': ann['impact'],
-                        'annotation_source': 'vcf_ann',
-                        'annotation_status': 'annotated',
-                    })
-                    continue
-                if requested == 'vcf_ann':
-                    rows.append({
-                        'variant_id': variant_id,
-                        'chrom': chrom,
-                        'pos': position,
-                        'ref': ref,
-                        'alt': alt,
-                        'qual': record.get('QUAL', '.'),
-                        'filter': record.get('FILTER', '.'),
-                        'gene_id': '',
-                        'gene_name': '',
-                        'transcript_id': '',
-                        'gene_type': '',
-                        'effect': '',
-                        'impact': '',
-                        'annotation_source': 'vcf_ann',
-                        'annotation_status': 'unmatched',
-                    })
-                    continue
-                if matches:
-                    annotation_source = 'gencode_gtf' if requested == 'gencode_gtf' else 'local_interval'
-                    sources.add(annotation_source)
-                    for match in matches:
-                        rows.append({
-                            'variant_id': variant_id,
-                            'chrom': chrom,
-                            'pos': position,
-                            'ref': ref,
-                            'alt': alt,
-                            'qual': record.get('QUAL', '.'),
-                            'filter': record.get('FILTER', '.'),
-                            'gene_id': str(match['gene_id']),
-                            'gene_name': str(match.get('gene_name', '')),
-                            'transcript_id': str(match.get('transcript_id', '')),
-                            'gene_type': str(match.get('gene_type', '')),
-                            'effect': str(match.get('effect', '')),
-                            'impact': str(match.get('impact', '')),
-                            'annotation_source': annotation_source,
-                            'annotation_status': 'annotated',
-                        })
-                else:
-                    rows.append({
-                        'variant_id': variant_id,
-                        'chrom': chrom,
-                        'pos': position,
-                        'ref': ref,
-                        'alt': alt,
-                        'qual': record.get('QUAL', '.'),
-                        'filter': record.get('FILTER', '.'),
-                        'gene_id': '',
-                        'gene_name': '',
-                        'transcript_id': '',
-                        'gene_type': '',
-                        'effect': '',
-                        'impact': '',
-                        'annotation_source': 'none',
-                        'annotation_status': 'unmatched',
-                    })
-    if header is None:
-        raise ValueError('VCF header is missing')
-    result = pd.DataFrame(rows, columns=[
-        'variant_id', 'chrom', 'pos', 'ref', 'alt', 'qual', 'filter',
-        'gene_id', 'gene_name', 'transcript_id', 'gene_type', 'effect', 'impact', 'annotation_source',
-        'annotation_status',
-    ])
-    output_csv = Path(output_csv)
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    result.to_csv(output_csv, index=False)
-    gene_ids = sorted({str(value) for value in result['gene_id'] if str(value).strip()})
-    effective_backend = 'mixed' if len(sources) > 1 else (next(iter(sources)) if sources else requested)
-    return variant_annotation_result(
+    return execute_variant_annotation(
+        vcf_path,
         output_csv,
-        requested,
-        effective_backend,
-        result,
-        n_variants,
-        n_alleles,
-        gene_ids,
-        toolchain_status(),
+        annotation_csv=annotation_csv,
+        annotation_backend=annotation_backend,
+        annotation_gtf=annotation_gtf,
+        toolchain=toolchain_status(),
     )
 
 
@@ -1184,169 +615,6 @@ def run_omics_analysis(expression_csv, metadata_csv, gene_sets_csv, output_dir,
         report_meta,
     )
     return write_omics_manifest(output_dir, manifest)
-
-
-def _run_specialist_workflow(workflow, output_dir, allowed_tools):
-    try:
-        from .workflow_runner import run_workflow
-    except ImportError:
-        from workflow_runner import run_workflow
-    output_dir = Path(output_dir)
-    manifest_path = output_dir / 'omics_workflow_manifest.json'
-    manifest = run_workflow(
-        workflow,
-        output_path=manifest_path,
-        dry_run=False,
-        allowed_tools=allowed_tools,
-        continue_on_error=False,
-    )
-    return specialist_workflow_result(workflow, manifest, manifest_path)
-
-
-def run_rnaseq_workbench(
-    fastq_paths,
-    output_dir,
-    reference_fasta=None,
-    annotation_gtf=None,
-    metadata_csv=None,
-    gene_sets_csv=None,
-    fastq_r2_paths=None,
-    evidence_csv=None,
-    evidence_provider='local',
-    statistics_backend='auto',
-    threads=1,
-    timeout=1800,
-):
-    output_dir = Path(output_dir)
-    fastq_qc_args = {
-        'fastq_paths': fastq_paths,
-        'output_dir': str(output_dir / 'fastq_qc'),
-        'threads': threads,
-        'timeout': timeout,
-    }
-    alignment_args = {
-        'fastq_paths': fastq_paths,
-        'reference_fasta': reference_fasta,
-        'output_dir': str(output_dir / 'alignment'),
-        'threads': threads,
-        'timeout': timeout,
-    }
-    if fastq_r2_paths is not None:
-        fastq_qc_args['fastq_r2_paths'] = fastq_r2_paths
-        alignment_args['fastq_r2_paths'] = fastq_r2_paths
-    steps = [
-        {
-            'id': 'fastq_qc',
-            'tool': 'omics_run_fastq_qc',
-            'args': fastq_qc_args,
-        },
-    ]
-    allowed_tools = ['omics_run_fastq_qc']
-    if reference_fasta:
-        steps.append({
-            'id': 'alignment',
-            'tool': 'omics_run_rnaseq_alignment',
-            'depends_on': ['fastq_qc'],
-            'args': alignment_args,
-        })
-        allowed_tools.append('omics_run_rnaseq_alignment')
-    if annotation_gtf and reference_fasta:
-        steps.append({
-            'id': 'feature_counts',
-            'tool': 'omics_run_feature_counts',
-            'depends_on': ['alignment'],
-            'args': {
-                'alignment_paths': '${alignment.alignment_paths}',
-                'annotation_gtf': annotation_gtf,
-                'output_dir': str(output_dir / 'feature_counts'),
-                'output_csv': str(output_dir / 'feature_counts' / 'expression_counts.csv'),
-                'paired_end': bool(fastq_r2_paths),
-                'threads': threads,
-                'timeout': timeout,
-            },
-        })
-        allowed_tools.append('omics_run_feature_counts')
-    if metadata_csv and gene_sets_csv and annotation_gtf and reference_fasta:
-        analysis_args = {
-            'expression_csv': '${feature_counts.output_csv}',
-            'metadata_csv': metadata_csv,
-            'gene_sets_csv': gene_sets_csv,
-            'evidence_provider': evidence_provider,
-            'statistics_backend': statistics_backend,
-            'output_dir': str(output_dir / 'analysis'),
-        }
-        if evidence_csv is not None:
-            analysis_args['evidence_csv'] = evidence_csv
-        steps.append({
-            'id': 'analysis',
-            'tool': 'omics_run_analysis',
-            'depends_on': ['feature_counts'],
-            'args': analysis_args,
-        })
-        allowed_tools.append('omics_run_analysis')
-    workflow = {
-        'name': 'rnaseq-specialist-workbench',
-        'steps': steps,
-    }
-    return _run_specialist_workflow(workflow, output_dir, allowed_tools)
-
-
-def run_variant_workbench(
-    vcf_path,
-    output_dir,
-    annotation_csv=None,
-    annotation_gtf=None,
-    annotation_backend='auto',
-    evidence_csv=None,
-    evidence_provider='local',
-):
-    output_dir = Path(output_dir)
-    annotation_args = {
-        'vcf_path': vcf_path,
-        'output_csv': str(output_dir / 'annotation' / 'variants_annotated.csv'),
-        'annotation_backend': annotation_backend,
-    }
-    if annotation_csv is not None:
-        annotation_args['annotation_csv'] = annotation_csv
-    if annotation_gtf is not None:
-        annotation_args['annotation_gtf'] = annotation_gtf
-    evidence_args = {
-        'gene_ids': '${annotation.gene_ids}',
-        'provider': evidence_provider,
-    }
-    if evidence_csv is not None:
-        evidence_args['evidence_csv'] = evidence_csv
-    workflow = {
-        'name': 'variant-specialist-workbench',
-        'steps': [
-            {
-                'id': 'genomics_qc',
-                'tool': 'omics_run_genomics_qc',
-                'args': {
-                    'input_path': vcf_path,
-                    'input_type': 'vcf',
-                    'output_dir': str(output_dir / 'genomics_qc'),
-                },
-            },
-            {
-                'id': 'annotation',
-                'tool': 'omics_annotate_variants',
-                'depends_on': ['genomics_qc'],
-                'args': annotation_args,
-            },
-            {
-                'id': 'evidence',
-                'tool': 'omics_search_gene_evidence',
-                'depends_on': ['annotation'],
-                'args': evidence_args,
-            },
-        ],
-    }
-    return _run_specialist_workflow(workflow, output_dir, [
-        'omics_run_genomics_qc',
-        'omics_annotate_variants',
-        'omics_search_gene_evidence',
-    ])
 
 
 TOOLS = build_omics_tools({

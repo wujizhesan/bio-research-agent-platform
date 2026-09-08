@@ -15,6 +15,10 @@ from src.omics_validation import (
     normalize_fastq_paths,
     resolve_qc_type,
 )
+from src.omics_workbenches import (
+    build_rnaseq_workbench,
+    build_variant_workbench,
+)
 from src.research_results import (
     catalog_result,
     workflow_result,
@@ -121,6 +125,56 @@ class OmicsBoundaryTests(unittest.TestCase):
         self.assertIn('Differential-expression result: de.csv', content)
         self.assertIn('Pathway result: pathways.csv', content)
         self.assertIn('Evidence matches: 1', content)
+
+    def test_rnaseq_workbench_builder_preserves_dependency_chain(self):
+        workflow, allowed_tools = build_rnaseq_workbench(
+            ['A_R1.fastq'],
+            'output/rnaseq',
+            reference_fasta='reference.fa',
+            annotation_gtf='genes.gtf',
+            metadata_csv='metadata.csv',
+            gene_sets_csv='gene_sets.csv',
+            fastq_r2_paths=['A_R2.fastq'],
+            evidence_csv='evidence.csv',
+            threads=4,
+        )
+        self.assertEqual(
+            [step['id'] for step in workflow['steps']],
+            ['fastq_qc', 'alignment', 'feature_counts', 'analysis'],
+        )
+        self.assertEqual(workflow['steps'][1]['depends_on'], ['fastq_qc'])
+        self.assertEqual(workflow['steps'][2]['depends_on'], ['alignment'])
+        self.assertEqual(workflow['steps'][3]['depends_on'], ['feature_counts'])
+        self.assertEqual(
+            workflow['steps'][0]['args']['fastq_r2_paths'],
+            ['A_R2.fastq'],
+        )
+        self.assertEqual(allowed_tools, [
+            'omics_run_fastq_qc',
+            'omics_run_rnaseq_alignment',
+            'omics_run_feature_counts',
+            'omics_run_analysis',
+        ])
+
+    def test_variant_workbench_builder_preserves_annotation_inputs(self):
+        workflow, allowed_tools = build_variant_workbench(
+            'variants.vcf',
+            'output/variants',
+            annotation_gtf='genes.gtf.gz',
+            annotation_backend='gencode_gtf',
+            evidence_csv='evidence.csv',
+        )
+        annotation = workflow['steps'][1]
+        evidence = workflow['steps'][2]
+        self.assertEqual(annotation['depends_on'], ['genomics_qc'])
+        self.assertEqual(annotation['args']['annotation_gtf'], 'genes.gtf.gz')
+        self.assertEqual(evidence['depends_on'], ['annotation'])
+        self.assertEqual(evidence['args']['gene_ids'], '${annotation.gene_ids}')
+        self.assertEqual(allowed_tools, [
+            'omics_run_genomics_qc',
+            'omics_annotate_variants',
+            'omics_search_gene_evidence',
+        ])
 
 
 class ResearchBoundaryTests(unittest.TestCase):

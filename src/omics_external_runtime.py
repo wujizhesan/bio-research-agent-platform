@@ -10,3 +10,4 @@ class ExternalToolDependencies:
     sha256: Callable[[Path], str]
     version: Callable[[str], dict]
     run_command: Callable[..., dict]
+    capture_command: Callable[..., dict]
