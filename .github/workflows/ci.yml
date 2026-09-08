@@ -102,6 +102,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m pip install -e . --no-deps
+          python -m pip install tests/fixtures/reliability_plugin --no-deps
           python -m pip install pytest pytest-asyncio
       - name: Upgrade previous database revision
         run: |
@@ -163,6 +164,7 @@ jobs:
           CORS_ORIGINS: http://127.0.0.1:4173
           JOB_BACKEND: redis
           JOB_EXECUTION_MODE: process
+          JOB_LEASE_SECONDS: '2'
           WORKER_METRICS_PORT: '0'
         run: |
           mkdir -p output

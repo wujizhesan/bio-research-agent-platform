@@ -11,6 +11,7 @@ const isCI = Boolean(process.env.CI)
 export default defineConfig({
   testDir: './e2e',
   fullyParallel: true,
+  workers: process.env.FULLSTACK_API_TOKEN ? 1 : undefined,
   forbidOnly: isCI,
   retries: isCI ? 1 : 0,
   timeout: 45_000,
