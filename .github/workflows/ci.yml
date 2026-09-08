@@ -274,14 +274,81 @@ jobs:
           test -s installed_domains.json
           test -s installed_workflow.json
 
+  supply-chain:
+    name: Audit Python and npm dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Audit Python dependencies
+        uses: pypa/gh-action-pip-audit@1220774d901786e6f652ae159f7b6bc8fea6d266 # v1.1.0
+        with:
+          inputs: requirements.txt
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Audit frontend dependencies
+        working-directory: frontend
+        run: npm audit --registry=https://registry.npmjs.org --audit-level=high
+
   container:
-    name: Build Docker image
+    name: Build, scan and inventory Docker image
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
         uses: actions/checkout@v7
       - name: Build image
         run: docker build --tag bio-research-agent:ci .
+      - name: Prepare SBOM output
+        run: mkdir -p output/sbom
+      - name: Generate image CycloneDX SBOM
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: bio-research-agent:ci
+          version: v0.74.0
+          format: cyclonedx
+          output: output/sbom/image.cdx.json
+          scanners: vuln
+          timeout: 15m
+          hide-progress: true
+      - name: Generate repository CycloneDX SBOM
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: cyclonedx
+          output: output/sbom/repository.cdx.json
+          scanners: vuln
+          timeout: 15m
+          hide-progress: true
+          skip-setup-trivy: true
+      - name: Upload software bills of materials
+        uses: actions/upload-artifact@v7
+        with:
+          name: cyclonedx-sbom
+          retention-days: 30
+          path: output/sbom/*.cdx.json
+          if-no-files-found: error
+      - name: Scan image for fixable high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: bio-research-agent:ci
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          timeout: 15m
+          hide-progress: true
+          skip-setup-trivy: true
 
   frontend:
     name: Build React workbench
