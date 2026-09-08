@@ -7,7 +7,11 @@ import unittest
 from unittest.mock import patch
 from prometheus_client import generate_latest
 
+from src.redis_job_coordinator import RedisExecutionCoordinator
 from src.redis_job_manager import RedisJobManager
+from src.redis_job_metrics import RedisJobMetrics
+from src.redis_job_recovery import RedisLeaseRecovery
+from src.redis_job_store import RedisQueueStore
 from src.resource_scheduling import ResourceCapacity
 
 
@@ -80,6 +84,22 @@ class InMemoryRedis:
 
 
 class RedisJobManagerTests(unittest.TestCase):
+    def test_manager_composes_four_redis_layers(self):
+        manager = RedisJobManager(
+            redis_client=InMemoryRedis(),
+            namespace='layers',
+        )
+        try:
+            self.assertIsInstance(manager._store, RedisQueueStore)
+            self.assertIsInstance(manager._recovery, RedisLeaseRecovery)
+            self.assertIsInstance(manager._coordinator, RedisExecutionCoordinator)
+            self.assertIsInstance(manager._metrics, RedisJobMetrics)
+            self.assertIs(manager._recovery.store, manager._store)
+            self.assertIs(manager._coordinator.recovery, manager._recovery)
+            self.assertIs(manager._coordinator.metrics, manager._metrics)
+        finally:
+            manager.shutdown()
+
     def test_submit_idempotency_and_worker_execution(self):
         redis = InMemoryRedis()
         manager = RedisJobManager(redis_client=redis, namespace='test')

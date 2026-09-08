@@ -5,10 +5,8 @@ from time import sleep, time
 
 try:
     from .job_manager import TERMINAL_STATUSES
-    from .observability import REDIS_RESULT_CACHE, log_event
 except ImportError:
     from job_manager import TERMINAL_STATUSES
-    from observability import REDIS_RESULT_CACHE, log_event
 
 
 class RedisJobWorkerRuntime:
@@ -20,9 +18,9 @@ class RedisJobWorkerRuntime:
         manager._claim(record)
         cached = manager._load_execution_result(record['_execution_key'])
         if cached is not None:
-            REDIS_RESULT_CACHE.labels(record['tool'], 'hit').inc()
+            manager._metrics.result_cache(record['tool'], 'hit')
             return manager._finish(job_id, cached['result'])
-        REDIS_RESULT_CACHE.labels(record['tool'], 'miss').inc()
+        manager._metrics.result_cache(record['tool'], 'miss')
         cancellation = {'checked_at': 0.0, 'requested': False}
         heartbeat = {'renewed_at': time()}
 
@@ -71,20 +69,7 @@ class RedisJobWorkerRuntime:
         return manager._finish(job_id, result, failed=failed)
 
     def next_job(self):
-        manager = self.manager
-        move = getattr(manager.redis, 'rpoplpush', None)
-        for queue_key in manager._queue_keys:
-            if move is not None:
-                item = move(queue_key, manager._processing_key)
-            else:
-                item = manager.redis.brpoplpush(
-                    queue_key,
-                    manager._processing_key,
-                    timeout=0,
-                )
-            if item:
-                return item
-        return None
+        return self.manager._store.next_job()
 
     def complete_queued_item(self, job_id, poll_timeout):
         manager = self.manager
@@ -94,10 +79,8 @@ class RedisJobWorkerRuntime:
             manager._ack(job_id)
         elif outcome and outcome.get('status') == 'queued':
             manager._ack(job_id)
-            manager.redis.lpush(
-                manager._queue_for_priority(int(record.get('priority', 0))),
-                job_id,
-            )
+            manager._store.enqueue(job_id, int(record.get('priority', 0)))
+            manager._refresh_queue_metrics()
             sleep(min(max(float(poll_timeout), 0.05), 1.0))
 
     def run_forever(self, poll_timeout=5):
@@ -117,10 +100,9 @@ class RedisJobWorkerRuntime:
                     try:
                         future.result()
                     except Exception as exc:
-                        log_event(
-                            'worker.job_handler_failed',
-                            worker_id=manager.worker_id,
-                            error_type=type(exc).__name__,
+                        manager._metrics.worker_job_handler_failed(
+                            manager.worker_id,
+                            exc,
                         )
                 while len(futures) < manager.max_concurrency:
                     item = self.next_job()
