@@ -9,8 +9,10 @@ SHA256_REFERENCE = re.compile(r"@sha256:[0-9a-f]{64}$")
 
 class SupplyChainConfigurationTests(unittest.TestCase):
     def test_github_actions_use_immutable_commits(self):
-        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        references = re.findall(r"^\s*uses:\s*([^\s#]+)", workflow, re.MULTILINE)
+        references = []
+        for workflow_path in (ROOT / ".github" / "workflows").glob("*.yml"):
+            workflow = workflow_path.read_text(encoding="utf-8")
+            references.extend(re.findall(r"^\s*uses:\s*([^\s#]+)", workflow, re.MULTILINE))
         remote_references = [reference for reference in references if not reference.startswith("./")]
         self.assertTrue(remote_references)
         for reference in remote_references:
@@ -48,6 +50,17 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         configuration = (ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
         ecosystems = re.findall(r"^\s*- package-ecosystem:\s*([^\s]+)", configuration, re.MULTILINE)
         self.assertEqual(set(ecosystems), {"uv", "npm", "docker", "github-actions"})
+
+    def test_release_images_are_attested_and_verified(self):
+        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        self.assertIn("packages: write", workflow)
+        self.assertIn("attestations: write", workflow)
+        self.assertIn("id-token: write", workflow)
+        self.assertEqual(workflow.count("push-to-registry: true"), 2)
+        self.assertIn("sbom-path:", workflow)
+        self.assertIn("gh attestation verify", workflow)
+        self.assertIn("--predicate-type https://cyclonedx.org/bom", workflow)
+        self.assertIn("Require successful CI for source commit", workflow)
 
 
 if __name__ == "__main__":

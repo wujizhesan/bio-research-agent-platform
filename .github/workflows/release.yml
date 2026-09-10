@@ -1,0 +1,175 @@
+name: Release containers
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source ref with a successful CI run
+        required: true
+        default: platform-main
+        type: string
+      version:
+        description: Optional container version tag
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-source:
+    name: Verify release source
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.ref || github.sha }}
+      - name: Resolve source commit
+        id: source
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Require successful CI for source commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow CI \
+            --commit "$COMMIT" \
+            --status completed \
+            --limit 20 \
+            --json conclusion,event,headSha \
+            | jq -e --arg commit "$COMMIT" \
+              'any(.[]; .headSha == $commit and .event == "push" and .conclusion == "success")' \
+              > /dev/null
+
+  publish:
+    name: Publish ${{ matrix.name }} image
+    needs: verify-source
+    runs-on: ubuntu-latest
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            image: bio-research-agent-platform
+            context: .
+            dockerfile: ./Dockerfile
+          - name: frontend
+            image: bio-research-agent-platform-frontend
+            context: ./frontend
+            dockerfile: ./frontend/Dockerfile
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+    steps:
+      - name: Check out verified source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.verify-source.outputs.commit }}
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
+            type=raw,value=${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.version != '' }}
+            type=sha,format=long,prefix=sha-
+            type=raw,value=latest,enable=${{ github.event_name == 'release' && github.event.release.prerelease == false }}
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=release-${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.name }}
+      - name: Generate CycloneDX SBOM
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          version: v0.74.0
+          format: cyclonedx
+          output: ${{ matrix.name }}.cdx.json
+          scanners: vuln
+          timeout: 15m
+          hide-progress: true
+      - name: Reject fixable high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          timeout: 15m
+          hide-progress: true
+          skip-setup-trivy: true
+      - name: Upload release SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-sbom-${{ matrix.name }}-${{ needs.verify-source.outputs.commit }}
+          retention-days: 90
+          path: ${{ matrix.name }}.cdx.json
+          if-no-files-found: error
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Attest SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: ${{ matrix.name }}.cdx.json
+          push-to-registry: true
+      - name: Verify published attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_REFERENCE: oci://${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if gh attestation verify "$IMAGE_REFERENCE" --repo "$GITHUB_REPOSITORY" \
+              && gh attestation verify "$IMAGE_REFERENCE" \
+                --repo "$GITHUB_REPOSITORY" \
+                --predicate-type https://cyclonedx.org/bom; then
+              exit 0
+            fi
+            sleep $((attempt * 2))
+          done
+          exit 1
