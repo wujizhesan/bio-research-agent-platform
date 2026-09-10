@@ -83,7 +83,8 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn("gh attestation verify", workflow)
         self.assertIn("--predicate-type https://cyclonedx.org/bom", workflow)
         self.assertIn("Require successful CI for source commit", workflow)
-        self.assertIn('      - "v*"', workflow)
+        self.assertIn("release:\n    types: [published]", workflow)
+        self.assertNotIn("push:\n    tags:", workflow)
 
     def test_third_party_image_vulnerabilities_use_expiring_baselines(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
