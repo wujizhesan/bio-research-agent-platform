@@ -38,8 +38,6 @@ attrs==26.1.0
     #   aiohttp
     #   jsonschema
     #   referencing
-audioop-lts==0.2.2 ; python_full_version >= '3.13'
-    # via chainlit
 bidict==0.24.1
     # via python-socketio
 biopython==1.88
@@ -57,7 +55,7 @@ certifi==2026.7.22
     #   requests
 cffi==2.1.1 ; platform_python_implementation != 'PyPy'
     # via cryptography
-chainlit==2.11.1
+chainlit==2.12.0
     # via bio-research-agent-platform
 charset-normalizer==3.5.1
     # via requests
