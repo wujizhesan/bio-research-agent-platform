@@ -33,6 +33,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
     environment:
       RUN_MIGRATIONS: "false"
       PLUGIN_SANDBOX_TOKEN_FILE: /run/secrets/plugin_sandbox_token
@@ -80,7 +83,7 @@ services:
       retries: 20
 
   clamav:
-    image: clamav/clamav:1.5
+    image: clamav/clamav:1.5@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422
     user: clamav
     entrypoint: ["/init-unprivileged"]
     expose:

@@ -1,6 +1,6 @@
 services:
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -8,7 +8,7 @@ services:
       retries: 10
 
   db:
-    image: postgres:16.15-alpine3.24
+    image: postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-bioagent}
       POSTGRES_USER: ${POSTGRES_USER:-bioagent}
@@ -25,6 +25,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
     depends_on:
       db:
         condition: service_healthy
@@ -92,6 +95,10 @@ services:
     volumes:
       - ./output:/app/output
       - ./data:/app/data:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
       interval: 5s
@@ -102,6 +109,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
     depends_on:
       db:
         condition: service_healthy
@@ -160,6 +170,10 @@ services:
     volumes:
       - ./output:/app/output
       - ./data:/app/data:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "${WORKER_METRICS_PUBLISHED_PORT:-9000}:9000"
     command: ["python", "-m", "src.worker"]

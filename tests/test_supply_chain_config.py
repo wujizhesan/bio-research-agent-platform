@@ -1,0 +1,54 @@
+import re
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SHA256_REFERENCE = re.compile(r"@sha256:[0-9a-f]{64}$")
+
+
+class SupplyChainConfigurationTests(unittest.TestCase):
+    def test_github_actions_use_immutable_commits(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        references = re.findall(r"^\s*uses:\s*([^\s#]+)", workflow, re.MULTILINE)
+        remote_references = [reference for reference in references if not reference.startswith("./")]
+        self.assertTrue(remote_references)
+        for reference in remote_references:
+            self.assertRegex(reference, r"@[0-9a-f]{40}$")
+
+    def test_external_container_images_use_digests(self):
+        files = [
+            ROOT / "docker-compose.yml",
+            ROOT / "docker-compose.secure.yml",
+            ROOT / ".github" / "workflows" / "ci.yml",
+        ]
+        references = []
+        for path in files:
+            content = path.read_text(encoding="utf-8")
+            references.extend(
+                re.findall(r"^\s*(?:image|pull_image):\s*([^\s#]+)", content, re.MULTILINE)
+            )
+        self.assertTrue(references)
+        for reference in references:
+            self.assertRegex(reference, SHA256_REFERENCE)
+
+    def test_dockerfile_bases_use_digests(self):
+        for relative_path in ("Dockerfile", "frontend/Dockerfile"):
+            content = (ROOT / relative_path).read_text(encoding="utf-8")
+            references = re.findall(r"^FROM\s+([^\s]+)", content, re.MULTILINE)
+            self.assertTrue(references)
+            for reference in references:
+                self.assertRegex(reference, SHA256_REFERENCE)
+
+    def test_backend_image_uses_unprivileged_runtime_user(self):
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertRegex(dockerfile, r"(?m)^USER bioagent$")
+
+    def test_dependabot_covers_all_dependency_sources(self):
+        configuration = (ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+        ecosystems = re.findall(r"^\s*- package-ecosystem:\s*([^\s]+)", configuration, re.MULTILINE)
+        self.assertEqual(set(ecosystems), {"uv", "npm", "docker", "github-actions"})
+
+
+if __name__ == "__main__":
+    unittest.main()
