@@ -4,6 +4,8 @@ import tomllib
 import unittest
 from pathlib import Path
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SHA256_REFERENCE = re.compile(r"@sha256:[0-9a-f]{64}$")
@@ -49,9 +51,27 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertRegex(dockerfile, r"(?m)^USER bioagent$")
 
     def test_dependabot_covers_all_dependency_sources(self):
-        configuration = (ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
-        ecosystems = re.findall(r"^\s*- package-ecosystem:\s*([^\s]+)", configuration, re.MULTILINE)
+        configuration = yaml.safe_load(
+            (ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+        )
+        ecosystems = {update["package-ecosystem"] for update in configuration["updates"]}
         self.assertEqual(set(ecosystems), {"uv", "npm", "docker", "github-actions"})
+
+    def test_dependabot_version_updates_exclude_major_releases(self):
+        configuration = yaml.safe_load(
+            (ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+        )
+        expected = [
+            {
+                "dependency-name": "*",
+                "update-types": [
+                    "version-update:semver-minor",
+                    "version-update:semver-patch",
+                ],
+            }
+        ]
+        for update in configuration["updates"]:
+            self.assertEqual(update["allow"], expected)
 
     def test_release_images_are_attested_and_verified(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
