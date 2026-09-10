@@ -1,13 +1,13 @@
 FROM python:3.12-slim AS builder
 
 WORKDIR /build
-COPY requirements.txt .
-RUN python -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt \
-    && rm -rf /opt/venv/bin/pip* \
-      /opt/venv/lib/python3.12/site-packages/pip \
-      /opt/venv/lib/python3.12/site-packages/pip-*.dist-info
+ARG UV_VERSION=0.11.30
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_LINK_MODE=copy
+COPY pyproject.toml uv.lock ./
+RUN python -m pip install --no-cache-dir "uv==$UV_VERSION" \
+    && uv sync --locked --no-dev --extra ui --no-install-project \
+    && rm -rf /root/.cache/uv
 
 FROM python:3.12-slim AS runtime
 

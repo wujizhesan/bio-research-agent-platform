@@ -30,7 +30,7 @@ CADD 是当前最完整的科学计算领域实现，其他领域通过同一套
 React 工作台的研究模式采用两阶段交互：先提交 `research_plan` 展示领域、证据源、输入门槛和实际工具链，再由用户确认后提交 `research_execute`；mRNA 模式仍可直接运行 `sequence_pipeline`。两阶段任务都通过同一套 Job/SSE 生命周期展示。
 
 ```bash
-python -m pip install -e .
+uv sync --locked --no-dev
 bio-agent-api --port 8000
 ```
 
@@ -149,8 +149,7 @@ CADD backend 通过统一 PluginContract 校验 API version 和 capability，配
 
 ```bash
 # 环境(第一次)
-python -m venv .venv
-.venv/Scripts/pip install -r requirements.txt
+uv sync --locked --all-extras
 
 # 跑完整虚拟筛选 → 出 top_hits.csv + report.md
 .venv/Scripts/python src/pipeline.py --exhaustiveness 6
@@ -273,7 +272,7 @@ src/          核心代码(pipeline/dock/build/report/agent/qa)
 tools/        AutoDock Vina 官方 Windows exe
 data/         PDB 结构 + 分子库(不入 git)
 output/       运行产物(top_hits.csv / report.md)
-requirements.txt / README.md / config.yaml
+pyproject.toml / uv.lock / README.md / config.yaml
 ```
 
 ## 对话式 UI（可选）
@@ -295,7 +294,7 @@ Streamlit Agent chat is integrated in app.py and runs in the core .venv. Chainli
 ## 安装为 Python 项目
 
 ```bash
-python -m pip install -e .
+uv sync --locked --no-dev
 ```
 
 安装后可以使用：

@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 .venv/
+.coverage
 
 # 运行产物
 output/

@@ -138,7 +138,7 @@ def _load_runtime_dependencies():
     except ImportError as exc:
         package = getattr(exc, 'name', None) or str(exc)
         raise RuntimeError(
-            f'缺少运行依赖 {package}，请先执行 python -m pip install -r requirements.txt'
+            f'缺少运行依赖 {package}，请先执行 uv sync --locked'
         ) from exc
     return prepare, build_library, dock_batch
 

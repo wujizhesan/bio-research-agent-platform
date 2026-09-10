@@ -13,7 +13,7 @@ try:
         MCPServer = FastMCP
         _MCP_API = 'fastmcp'
 except ImportError as exc:
-    raise SystemExit('MCP server requires the optional dependency: pip install "mcp>=1.28"') from exc
+    raise SystemExit('MCP server requires the optional dependency: uv sync --locked --extra ui') from exc
 
 if _MCP_API == 'fastmcp':
     class _CompatCallToolResult(CallToolResult):
