@@ -11,6 +11,11 @@ updates:
       python-dependencies:
         patterns:
           - "*"
+    allow:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-patch
     open-pull-requests-limit: 5
 
   - package-ecosystem: npm
@@ -24,6 +29,11 @@ updates:
       frontend-dependencies:
         patterns:
           - "*"
+    allow:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-patch
     open-pull-requests-limit: 5
 
   - package-ecosystem: docker
@@ -37,6 +47,11 @@ updates:
       backend-images:
         patterns:
           - "*"
+    allow:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-patch
     open-pull-requests-limit: 5
 
   - package-ecosystem: docker
@@ -50,6 +65,11 @@ updates:
       frontend-images:
         patterns:
           - "*"
+    allow:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-patch
     open-pull-requests-limit: 5
 
   - package-ecosystem: github-actions
@@ -63,4 +83,9 @@ updates:
       workflow-actions:
         patterns:
           - "*"
+    allow:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-patch
     open-pull-requests-limit: 5
