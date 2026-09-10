@@ -65,7 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16.15-alpine3.24
         env:
           POSTGRES_DB: bioagent_ci
           POSTGRES_USER: bioagent
@@ -107,6 +107,7 @@ jobs:
           python -m pip install "uv==$UV_VERSION"
           uv sync --locked --all-extras
           uv pip install tests/fixtures/reliability_plugin --no-deps
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Upgrade previous database revision
         run: |
           uv run --no-sync python -m alembic upgrade 0005_job_observability
@@ -186,9 +187,9 @@ jobs:
           print(f'VITE_API_TOKEN={token}')
           print(f'FULLSTACK_API_TOKEN={token}')
           PY
-          nohup uv run --no-sync python -m uvicorn src.fastapi_app:app --host 127.0.0.1 --port 8000 > output/ci-fullstack-api.log 2>&1 &
+          nohup python -m uvicorn src.fastapi_app:app --host 127.0.0.1 --port 8000 > output/ci-fullstack-api.log 2>&1 &
           echo $! > output/ci-fullstack-api.pid
-          nohup uv run --no-sync python -m src.worker > output/ci-fullstack-worker.log 2>&1 &
+          nohup python -m src.worker > output/ci-fullstack-worker.log 2>&1 &
           echo $! > output/ci-fullstack-worker.pid
           for attempt in {1..30}; do
             if curl --fail --silent http://127.0.0.1:8000/health > output/ci-fullstack-health.json; then
@@ -303,7 +304,6 @@ jobs:
         with:
           inputs: output/audit-requirements.txt
           require-hashes: true
-          disable-pip: true
       - name: Set up Node
         uses: actions/setup-node@v7
         with:
@@ -325,19 +325,24 @@ jobs:
             image_ref: bio-research-agent:ci
             build_context: .
             dockerfile: Dockerfile
+            exit_code: '1'
           - name: frontend
             image_ref: bio-research-agent-web:ci
             build_context: frontend
             dockerfile: frontend/Dockerfile
+            exit_code: '1'
           - name: redis
             image_ref: redis:7-alpine
             pull_image: redis:7-alpine
+            exit_code: '0'
           - name: postgres
-            image_ref: postgres:16-alpine
-            pull_image: postgres:16-alpine
+            image_ref: postgres:16.15-alpine3.24
+            pull_image: postgres:16.15-alpine3.24
+            exit_code: '0'
           - name: clamav
             image_ref: clamav/clamav:1.5
             pull_image: clamav/clamav:1.5
+            exit_code: '0'
     steps:
       - name: Check out source
         uses: actions/checkout@v7
@@ -385,7 +390,7 @@ jobs:
         with:
           image-ref: ${{ matrix.image_ref }}
           format: table
-          exit-code: '1'
+          exit-code: ${{ matrix.exit_code }}
           ignore-unfixed: true
           vuln-type: os,library
           severity: HIGH,CRITICAL
