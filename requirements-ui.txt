@@ -38,8 +38,6 @@ attrs==26.1.0
     #   aiohttp
     #   jsonschema
     #   referencing
-audioop-lts==0.2.2 ; python_full_version >= '3.13'
-    # via chainlit
 bidict==0.24.1
     # via python-socketio
 biopython==1.88
