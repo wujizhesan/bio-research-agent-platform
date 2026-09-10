@@ -1,5 +1,6 @@
 import json
 import re
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -75,6 +76,31 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         for image in baseline["images"].values():
             self.assertRegex(image["image_ref"], SHA256_REFERENCE)
         self.assertEqual(baseline["policy"]["max_exception_days"], {"HIGH": 30, "CRITICAL": 7})
+
+    def test_dependency_license_and_signature_policy_is_enforced(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        package = json.loads((ROOT / "frontend" / "package.json").read_text(encoding="utf-8"))
+        self.assertIn("pip-licenses==5.5.5", project["dependency-groups"]["dev"])
+        self.assertEqual(project["project"]["license"], "MIT")
+        self.assertTrue(project["tool"]["pip-licenses"]["allow-only"].strip())
+        self.assertIn("licenses:check", package["scripts"])
+        self.assertIn("npm audit signatures --registry=https://registry.npmjs.org", workflow)
+        self.assertIn("pip-licenses --output-file=output/python-licenses.json", workflow)
+        self.assertIn("dependency-license-evidence", workflow)
+
+    def test_scorecard_and_workflow_codeowners_are_configured(self):
+        scorecard = (ROOT / ".github" / "workflows" / "scorecard.yml").read_text(
+            encoding="utf-8"
+        )
+        codeowners = (ROOT / ".github" / "CODEOWNERS").read_text(encoding="utf-8")
+        self.assertIn("permissions: read-all", scorecard)
+        self.assertIn("security-events: write", scorecard)
+        self.assertIn("id-token: write", scorecard)
+        self.assertIn("persist-credentials: false", scorecard)
+        self.assertIn("publish_results: true", scorecard)
+        self.assertIn("branches: [main]", scorecard)
+        self.assertIn("/.github/workflows/ @wujizhesan", codeowners)
 
 
 if __name__ == "__main__":

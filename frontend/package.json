@@ -7,6 +7,7 @@
     "dev": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
     "budget:check": "node scripts/check-performance-budget.mjs",
+    "licenses:check": "node scripts/check-license-policy.mjs output/dependency-licenses.json",
     "typecheck": "tsc -b",
     "lint": "eslint . --max-warnings 0",
     "preview": "vite preview --host 0.0.0.0",

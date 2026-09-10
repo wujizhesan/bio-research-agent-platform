@@ -1,0 +1,6 @@
+/.github/CODEOWNERS @wujizhesan
+/.github/dependabot.yml @wujizhesan
+/.github/workflows/ @wujizhesan
+/security/ @wujizhesan
+/uv.lock @wujizhesan
+/frontend/package-lock.json @wujizhesan

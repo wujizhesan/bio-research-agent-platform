@@ -304,15 +304,36 @@ jobs:
         with:
           inputs: output/audit-requirements.txt
           require-hashes: true
+      - name: Enforce Python dependency license policy
+        run: uv run pip-licenses --output-file=output/python-licenses.json
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend audit dependencies
+        working-directory: frontend
+        run: npm ci --ignore-scripts
+      - name: Verify npm registry signatures and provenance
+        working-directory: frontend
+        run: npm audit signatures --registry=https://registry.npmjs.org
+      - name: Enforce frontend dependency license policy
+        working-directory: frontend
+        run: npm run licenses:check
       - name: Audit frontend dependencies
         working-directory: frontend
         run: npm audit --registry=https://registry.npmjs.org --audit-level=high
+      - name: Upload dependency license evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dependency-license-evidence
+          retention-days: 90
+          path: |
+            output/python-licenses.json
+            frontend/output/dependency-licenses.json
+          if-no-files-found: warn
 
   container:
     name: Scan ${{ matrix.name }} image

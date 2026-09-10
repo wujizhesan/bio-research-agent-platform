@@ -7,6 +7,7 @@ name = "bio-research-agent-platform"
 version = "0.1.0"
 description = "Pluggable research Agent platform for CADD, RNA-seq, mRNA design, literature and knowledge workflows"
 requires-python = ">=3.11"
+license = "MIT"
 dependencies = [
   "rdkit>=2024.3.5",
   "meeko>=0.7.1",
@@ -39,7 +40,40 @@ ui = ["streamlit>=1.40", "mcp>=1.28"]
 chainlit = ["chainlit==2.11.1"]
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "coverage>=7", "httpx>=0.27", "build>=1.2", "twine>=5"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "coverage>=7", "httpx>=0.27", "build>=1.2", "twine>=5", "pip-licenses==5.5.5"]
+
+[tool.pip-licenses]
+from = "mixed"
+format = "json"
+with-urls = true
+ignore-packages = ["bio-research-agent-platform"]
+allow-only = """
+3-Clause BSD License;
+Apache License 2.0;
+Apache Software License;
+Apache-2.0;
+Apache-2.0 AND BSD-2-Clause;
+Apache-2.0 AND MIT;
+Apache-2.0 OR BSD-2-Clause;
+Apache-2.0 OR BSD-3-Clause;
+BSD;
+BSD License;
+BSD-2-Clause;
+BSD-3-Clause;
+BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0;
+GNU Lesser General Public License v2 or later (LGPLv2+);
+LicenseRef-Biopython-License-Agreement;
+MIT;
+MIT AND PSF-2.0;
+MIT License;
+MIT-0;
+MIT-CMU;
+MPL-2.0;
+Mozilla Public License 2.0 (MPL 2.0);
+PSF-2.0;
+Public Domain;
+Python Software Foundation License
+"""
 
 [project.scripts]
 bio-agent-domains = "domain_registry:main"
