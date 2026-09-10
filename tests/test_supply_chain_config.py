@@ -1,3 +1,4 @@
+import json
 import re
 import unittest
 from pathlib import Path
@@ -62,6 +63,18 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn("--predicate-type https://cyclonedx.org/bom", workflow)
         self.assertIn("Require successful CI for source commit", workflow)
         self.assertIn('      - "v*"', workflow)
+
+    def test_third_party_image_vulnerabilities_use_expiring_baselines(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        baseline_path = ROOT / "security" / "container-vulnerability-baseline.json"
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+        self.assertIn("check_container_vulnerability_baseline.py", workflow)
+        self.assertIn("format: json", workflow)
+        self.assertIn("retention-days: 90", workflow)
+        self.assertEqual(set(baseline["images"]), {"redis", "postgres", "clamav"})
+        for image in baseline["images"].values():
+            self.assertRegex(image["image_ref"], SHA256_REFERENCE)
+        self.assertEqual(baseline["policy"]["max_exception_days"], {"HIGH": 30, "CRITICAL": 7})
 
 
 if __name__ == "__main__":

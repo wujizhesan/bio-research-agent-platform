@@ -334,14 +334,17 @@ jobs:
           - name: redis
             image_ref: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
             pull_image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+            baseline_name: redis
             exit_code: '0'
           - name: postgres
             image_ref: postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
             pull_image: postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+            baseline_name: postgres
             exit_code: '0'
           - name: clamav
             image_ref: clamav/clamav:1.5@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422
             pull_image: clamav/clamav:1.5@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422
+            baseline_name: clamav
             exit_code: '0'
     steps:
       - name: Check out source
@@ -353,7 +356,7 @@ jobs:
         if: matrix.pull_image != ''
         run: docker pull "${{ matrix.pull_image }}"
       - name: Prepare SBOM output
-        run: mkdir -p output/sbom
+        run: mkdir -p output/sbom output/security
       - name: Generate image CycloneDX SBOM
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -385,6 +388,38 @@ jobs:
             output/sbom/${{ matrix.name }}.cdx.json
             output/sbom/repository.cdx.json
           if-no-files-found: error
+      - name: Generate third-party vulnerability report
+        if: matrix.baseline_name != ''
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ matrix.image_ref }}
+          version: v0.74.0
+          format: json
+          output: output/security/${{ matrix.name }}.trivy.json
+          exit-code: '0'
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          timeout: 15m
+          hide-progress: true
+          skip-setup-trivy: true
+      - name: Enforce third-party vulnerability baseline
+        if: matrix.baseline_name != ''
+        run: |
+          python tools/check_container_vulnerability_baseline.py \
+            --image-name "${{ matrix.baseline_name }}" \
+            --image-ref "${{ matrix.image_ref }}" \
+            --report "output/security/${{ matrix.name }}.trivy.json" \
+            --baseline security/container-vulnerability-baseline.json \
+            --summary "output/security/${{ matrix.name }}.baseline-summary.json"
+      - name: Upload third-party vulnerability evidence
+        if: always() && matrix.baseline_name != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vulnerability-evidence-${{ matrix.name }}
+          retention-days: 90
+          path: output/security/
+          if-no-files-found: warn
       - name: Scan image for fixable high and critical vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
