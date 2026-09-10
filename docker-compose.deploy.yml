@@ -1,0 +1,16 @@
+services:
+  api:
+    image: ${BACKEND_IMAGE:?required}
+    pull_policy: always
+
+  worker:
+    image: ${BACKEND_IMAGE:?required}
+    pull_policy: always
+
+  web:
+    image: ${FRONTEND_IMAGE:?required}
+    pull_policy: always
+
+  plugin-sandbox:
+    image: ${BACKEND_IMAGE:?required}
+    pull_policy: always

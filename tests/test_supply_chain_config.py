@@ -86,6 +86,35 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn("release:\n    types: [published]", workflow)
         self.assertNotIn("push:\n    tags:", workflow)
 
+    def test_production_deployment_requires_approval_and_verified_digests(self):
+        workflow = yaml.safe_load(
+            (ROOT / ".github" / "workflows" / "deploy-production.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        verify = workflow["jobs"]["verify"]
+        deploy = workflow["jobs"]["deploy"]
+        self.assertNotIn("environment", verify)
+        self.assertNotIn("secrets.", json.dumps(verify))
+        self.assertEqual(deploy["environment"], {"name": "production"})
+        deployment = json.dumps(deploy)
+        self.assertIn("secrets.PRODUCTION_SSH_PRIVATE_KEY", deployment)
+        self.assertIn("gh attestation verify", json.dumps(verify))
+        self.assertIn("--signer-workflow", json.dumps(verify))
+        self.assertIn("--source-ref", json.dumps(verify))
+        self.assertIn("--no-build", deployment)
+
+        compose = yaml.safe_load(
+            (ROOT / "docker-compose.deploy.yml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(compose["services"]["api"]["image"], "${BACKEND_IMAGE:?required}")
+        self.assertEqual(compose["services"]["worker"]["image"], "${BACKEND_IMAGE:?required}")
+        self.assertEqual(
+            compose["services"]["plugin-sandbox"]["image"],
+            "${BACKEND_IMAGE:?required}",
+        )
+        self.assertEqual(compose["services"]["web"]["image"], "${FRONTEND_IMAGE:?required}")
+
     def test_third_party_image_vulnerabilities_use_expiring_baselines(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         baseline_path = ROOT / "security" / "container-vulnerability-baseline.json"
