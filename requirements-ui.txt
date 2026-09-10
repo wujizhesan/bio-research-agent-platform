@@ -154,7 +154,7 @@ kiwisolver==1.5.1
     # via matplotlib
 lazify==0.4.0
     # via chainlit
-literalai==0.1.201
+literalai==0.1.300
     # via chainlit
 mako==1.4.1
     # via alembic
@@ -336,7 +336,7 @@ opentelemetry-instrumentation-marqo==0.62.3
     # via traceloop-sdk
 opentelemetry-instrumentation-mcp==0.62.3
     # via traceloop-sdk
-opentelemetry-instrumentation-milvus==0.60.0
+opentelemetry-instrumentation-milvus==0.62.3
     # via traceloop-sdk
 opentelemetry-instrumentation-mistralai==0.62.3
     # via traceloop-sdk
@@ -346,7 +346,7 @@ opentelemetry-instrumentation-openai==0.62.3
     # via traceloop-sdk
 opentelemetry-instrumentation-openai-agents==0.62.3
     # via traceloop-sdk
-opentelemetry-instrumentation-pinecone==0.60.0
+opentelemetry-instrumentation-pinecone==0.62.3
     # via traceloop-sdk
 opentelemetry-instrumentation-qdrant==0.62.3
     # via traceloop-sdk
@@ -513,7 +513,7 @@ pydantic==2.13.5
     #   mcp
     #   pydantic-settings
     #   traceloop-sdk
-pydantic-core==2.46.5
+pydantic-core==2.48.0
     # via pydantic
 pydantic-settings==2.15.0
     # via
