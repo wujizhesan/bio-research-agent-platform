@@ -4,7 +4,10 @@ WORKDIR /build
 COPY requirements.txt .
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+    && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt \
+    && rm -rf /opt/venv/bin/pip* \
+      /opt/venv/lib/python3.12/site-packages/pip \
+      /opt/venv/lib/python3.12/site-packages/pip-*.dist-info
 
 FROM python:3.12-slim AS runtime
 
@@ -15,7 +18,11 @@ RUN apt-get update \
     && if [ "$INSTALL_DESEQ2" = "1" ]; then \
          apt-get install -y --no-install-recommends r-base r-bioc-deseq2; \
        fi \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+      /usr/local/bin/pip* \
+      /usr/local/lib/python3.12/ensurepip \
+      /usr/local/lib/python3.12/site-packages/pip \
+      /usr/local/lib/python3.12/site-packages/pip-*.dist-info
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
