@@ -45,6 +45,11 @@ class JobRow(Base):
     cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lease_until: Mapped[float | None] = mapped_column(Float, nullable=True)
+    resources: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    trace_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    run_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class ProjectRow(Base):
@@ -71,7 +76,9 @@ class ProjectMemberRow(Base):
 class JobProjectRow(Base):
     __tablename__ = 'job_projects'
 
-    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey('job_records.job_id', ondelete='CASCADE'), primary_key=True,
+    )
     project_id: Mapped[str] = mapped_column(
         String(64), ForeignKey('projects.project_id', ondelete='CASCADE'), nullable=False, index=True,
     )
@@ -104,6 +111,11 @@ def _row_values(record):
         'cancel_requested': bool(record.get('_cancel_requested')),
         'worker_id': record.get('_worker_id'),
         'lease_until': record.get('_lease_until'),
+        'resources': record.get('resources', {}),
+        'priority': int(record.get('priority', 0)),
+        'trace_id': record.get('trace_id'),
+        'request_id': record.get('request_id'),
+        'run_context': record.get('run_context'),
     }
 
 
@@ -135,11 +147,16 @@ def _public_row(row):
         'status': row.status,
         'created_at': row.created_at,
     }
-    for field in ('started_at', 'finished_at', 'result', 'error', 'retry_of'):
+    for field in (
+        'started_at', 'finished_at', 'result', 'error', 'retry_of',
+        'trace_id', 'request_id', 'run_context',
+    ):
         value = getattr(row, field)
         if value is not None:
             output[field] = value
     output['attempts'] = row.attempts
+    output['resources'] = row.resources or {}
+    output['priority'] = row.priority
     if row.cancel_requested:
         output['cancel_requested'] = True
     return output
@@ -184,12 +201,24 @@ class Database:
             'attempts': 'INTEGER NOT NULL DEFAULT 0',
             'worker_id': 'VARCHAR(128)',
             'lease_until': 'FLOAT',
+            'resources': "JSON NOT NULL DEFAULT '{}'",
+            'priority': 'INTEGER NOT NULL DEFAULT 0',
+            'trace_id': 'VARCHAR(128)',
+            'request_id': 'VARCHAR(128)',
+            'run_context': 'JSON',
         }
         boolean_default = 'FALSE' if connection.dialect.name == 'postgresql' else '0'
         missing['cancel_requested'] = f'BOOLEAN NOT NULL DEFAULT {boolean_default}'
         for name, definition in missing.items():
             if name not in columns:
                 connection.execute(text(f'ALTER TABLE job_records ADD COLUMN {name} {definition}'))
+        indexes = {
+            item['name'] for item in inspect(connection).get_indexes('job_records')
+        }
+        if 'ix_job_records_trace_id' not in indexes:
+            connection.execute(text(
+                'CREATE INDEX ix_job_records_trace_id ON job_records (trace_id)'
+            ))
 
     async def ping(self):
         async with self.engine.connect() as connection:

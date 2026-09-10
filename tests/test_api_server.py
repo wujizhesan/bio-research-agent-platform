@@ -1,9 +1,12 @@
-import unittest
+import io
 import json
 import tempfile
 import time
+import unittest
+import warnings
+from datetime import date
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import src.api_server as api_server
 from src.api_server import is_authorized, route_request
@@ -11,6 +14,58 @@ from src.job_manager import JobManager
 
 
 class ApiServerTests(unittest.TestCase):
+    def test_legacy_api_has_fixed_removal_date_and_successor(self):
+        lifecycle = api_server.legacy_api_lifecycle(date(2026, 12, 30))
+        self.assertEqual(lifecycle['removal_date'], '2026-12-31')
+        self.assertFalse(lifecycle['expired'])
+        self.assertEqual(lifecycle['successor'], 'FastAPI')
+        headers = api_server.legacy_api_response_headers()
+        self.assertEqual(headers['Deprecation'], 'true')
+        self.assertEqual(headers['Sunset'], 'Thu, 31 Dec 2026 00:00:00 GMT')
+        self.assertIn('bio-agent-api', headers['X-API-Successor'])
+
+    def test_legacy_api_warns_before_and_stops_on_removal_date(self):
+        with patch.dict('os.environ', {'APP_ENV': 'development'}, clear=False):
+            with warnings.catch_warnings(record=True) as captured:
+                warnings.simplefilter('always')
+                lifecycle = api_server.ensure_legacy_api_available(
+                    date(2026, 12, 30)
+                )
+            self.assertFalse(lifecycle['expired'])
+            self.assertTrue(any(
+                item.category is FutureWarning and '2026-12-31' in str(item.message)
+                for item in captured
+            ))
+            with self.assertRaisesRegex(SystemExit, 'reached its removal date'):
+                api_server.ensure_legacy_api_available(date(2026, 12, 31))
+
+    def test_legacy_http_responses_include_deprecation_headers(self):
+        handler = api_server.BioAPIHandler.__new__(api_server.BioAPIHandler)
+        handler.send_response = Mock()
+        handler.send_header = Mock()
+        handler.end_headers = Mock()
+        handler.wfile = io.BytesIO()
+        handler._write(200, {'status': 'ok'})
+        handler.send_header.assert_any_call('Deprecation', 'true')
+        handler.send_header.assert_any_call(
+            'Sunset', 'Thu, 31 Dec 2026 00:00:00 GMT'
+        )
+        handler.send_header.assert_any_call(
+            'X-API-Successor', 'FastAPI; command="bio-agent-api"'
+        )
+
+    def test_running_legacy_server_returns_gone_after_removal_date(self):
+        handler = api_server.BioAPIHandler.__new__(api_server.BioAPIHandler)
+        handler._write = Mock()
+        with patch.object(
+            api_server, '_utc_today', return_value=date(2026, 12, 31)
+        ):
+            self.assertFalse(handler._check_auth())
+        status, payload = handler._write.call_args.args[:2]
+        self.assertEqual(status, 410)
+        self.assertTrue(payload['lifecycle']['expired'])
+        self.assertIn('bio-agent-api', payload['error'])
+
     def test_configured_api_token_protects_non_health_requests(self):
         with patch.dict('os.environ', {'CADD_API_TOKEN': 'secret-token'}, clear=False):
             self.assertTrue(is_authorized('/health', {}))
@@ -18,10 +73,24 @@ class ApiServerTests(unittest.TestCase):
             self.assertFalse(is_authorized('/jobs', {'Authorization': 'Bearer wrong'}))
             self.assertTrue(is_authorized('/jobs', {'Authorization': 'Bearer secret-token'}))
 
+    def test_legacy_server_denies_non_health_routes_in_production(self):
+        with patch.dict('os.environ', {
+            'APP_ENV': 'production',
+            'CADD_API_TOKEN': 'legacy',
+        }, clear=False):
+            self.assertTrue(is_authorized('/health', {}))
+            self.assertFalse(is_authorized(
+                '/jobs', {'Authorization': 'Bearer legacy'}
+            ))
+            with self.assertRaisesRegex(SystemExit, 'disabled in production'):
+                api_server.ensure_legacy_api_available(date(2026, 9, 7))
+
     def test_health_and_plugin_catalog(self):
         status, health = route_request('GET', '/health')
         self.assertEqual(status, 200)
         self.assertEqual(health['status'], 'ok')
+        self.assertTrue(health['lifecycle']['deprecated'])
+        self.assertEqual(health['lifecycle']['removal_date'], '2026-12-31')
 
         status, payload = route_request('GET', '/plugins')
         self.assertEqual(status, 200)

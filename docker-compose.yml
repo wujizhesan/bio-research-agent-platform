@@ -1,6 +1,6 @@
 services:
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -8,7 +8,7 @@ services:
       retries: 10
 
   db:
-    image: postgres:16-alpine
+    image: postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-bioagent}
       POSTGRES_USER: ${POSTGRES_USER:-bioagent}
@@ -25,26 +25,35 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
     environment:
+      APP_ENV: production
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
-      CADD_API_TOKEN: ${CADD_API_TOKEN:-change-me-in-development}
+      CADD_API_TOKEN: ""
       RESEARCH_PLANNER_API_KEY: ${RESEARCH_PLANNER_API_KEY:-}
       RESEARCH_PLANNER_BASE_URL: ${RESEARCH_PLANNER_BASE_URL:-}
       RESEARCH_PLANNER_MODEL: ${RESEARCH_PLANNER_MODEL:-}
       CADD_JWT_SECRET: ${CADD_JWT_SECRET:-}
+      CADD_JWT_SECRET_FILE: ${CADD_JWT_SECRET_FILE:-}
       CADD_AUTH_USERS_JSON: ${CADD_AUTH_USERS_JSON:-}
+      CADD_AUTH_USERS_FILE: ${CADD_AUTH_USERS_FILE:-}
       AUTH_TOKEN_TTL_SECONDS: ${AUTH_TOKEN_TTL_SECONDS:-3600}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
       UPLOAD_ROOT: ${UPLOAD_ROOT:-/app/output/uploads}
       UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-52428800}
+      UPLOAD_TOTAL_QUOTA_BYTES: ${UPLOAD_TOTAL_QUOTA_BYTES:-10737418240}
+      UPLOAD_MAX_DECOMPRESSED_BYTES: ${UPLOAD_MAX_DECOMPRESSED_BYTES:-209715200}
+      UPLOAD_MAX_COMPRESSION_RATIO: ${UPLOAD_MAX_COMPRESSION_RATIO:-100}
       STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
       S3_BUCKET: ${S3_BUCKET:-}
       S3_PREFIX: ${S3_PREFIX:-bio-agent}
@@ -54,17 +63,42 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AUTO_CREATE_SCHEMA: "false"
       JOB_BACKEND: ${JOB_BACKEND:-redis}
+      JOB_EXECUTION_MODE: ${JOB_EXECUTION_MODE:-process}
+      JOB_MAX_WORKERS: ${JOB_MAX_WORKERS:-2}
+      JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-3600}
+      JOB_MEMORY_LIMIT_MB: ${JOB_MEMORY_LIMIT_MB:-8192}
+      JOB_CPU_TIME_SECONDS: ${JOB_CPU_TIME_SECONDS:-0}
+      JOB_RESULT_MAX_BYTES: ${JOB_RESULT_MAX_BYTES:-16777216}
+      JOB_TOTAL_CPU_CORES: ${JOB_TOTAL_CPU_CORES:-4}
+      JOB_TOTAL_MEMORY_MB: ${JOB_TOTAL_MEMORY_MB:-8192}
+      JOB_TOTAL_GPUS: ${JOB_TOTAL_GPUS:-0}
+      JOB_TOTAL_GPU_MEMORY_MB: ${JOB_TOTAL_GPU_MEMORY_MB:-0}
+      JOB_WORKER_LABELS: ${JOB_WORKER_LABELS:-}
+      PLUGIN_HEALTH_FAILURE_THRESHOLD: ${PLUGIN_HEALTH_FAILURE_THRESHOLD:-3}
+      PLUGIN_ALLOWED_NETWORK_HOSTS: ${PLUGIN_ALLOWED_NETWORK_HOSTS:-}
+      PLUGIN_ALLOWED_EXECUTABLES: ${PLUGIN_ALLOWED_EXECUTABLES:-}
+      PLUGIN_ALLOWED_ENV_VARS: ${PLUGIN_ALLOWED_ENV_VARS:-}
+      PLUGIN_ALLOW_UNTRUSTED_INLINE: "false"
+      WORKFLOW_CHECKPOINT_LOCK_TIMEOUT: ${WORKFLOW_CHECKPOINT_LOCK_TIMEOUT:-5}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       REDIS_NAMESPACE: ${REDIS_NAMESPACE:-bioagent}
       REDIS_SOCKET_TIMEOUT: ${REDIS_SOCKET_TIMEOUT:-15}
       JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-300}
+      JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-3}
       JOB_RESULT_TTL_SECONDS: ${JOB_RESULT_TTL_SECONDS:-86400}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      OBSERVABILITY_MAX_FIELD_LENGTH: ${OBSERVABILITY_MAX_FIELD_LENGTH:-512}
       RUN_MIGRATIONS: "true"
     ports:
       - "${API_PUBLISHED_PORT:-8000}:8000"
     volumes:
       - ./output:/app/output
       - ./data:/app/data:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
       interval: 5s
@@ -75,6 +109,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
     depends_on:
       db:
         condition: service_healthy
@@ -87,17 +124,32 @@ services:
       DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
-      CADD_API_TOKEN: ${CADD_API_TOKEN:-change-me-in-development}
       RESEARCH_PLANNER_API_KEY: ${RESEARCH_PLANNER_API_KEY:-}
       RESEARCH_PLANNER_BASE_URL: ${RESEARCH_PLANNER_BASE_URL:-}
       RESEARCH_PLANNER_MODEL: ${RESEARCH_PLANNER_MODEL:-}
-      CADD_JWT_SECRET: ${CADD_JWT_SECRET:-}
-      CADD_AUTH_USERS_JSON: ${CADD_AUTH_USERS_JSON:-}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       REDIS_NAMESPACE: ${REDIS_NAMESPACE:-bioagent}
       REDIS_SOCKET_TIMEOUT: ${REDIS_SOCKET_TIMEOUT:-15}
       JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-300}
+      JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-3}
       JOB_RESULT_TTL_SECONDS: ${JOB_RESULT_TTL_SECONDS:-86400}
+      WORKER_MAX_CONCURRENCY: ${WORKER_MAX_CONCURRENCY:-2}
+      JOB_EXECUTION_MODE: ${JOB_EXECUTION_MODE:-process}
+      JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-3600}
+      JOB_MEMORY_LIMIT_MB: ${JOB_MEMORY_LIMIT_MB:-8192}
+      JOB_CPU_TIME_SECONDS: ${JOB_CPU_TIME_SECONDS:-0}
+      JOB_RESULT_MAX_BYTES: ${JOB_RESULT_MAX_BYTES:-16777216}
+      JOB_TOTAL_CPU_CORES: ${JOB_TOTAL_CPU_CORES:-4}
+      JOB_TOTAL_MEMORY_MB: ${JOB_TOTAL_MEMORY_MB:-8192}
+      JOB_TOTAL_GPUS: ${JOB_TOTAL_GPUS:-0}
+      JOB_TOTAL_GPU_MEMORY_MB: ${JOB_TOTAL_GPU_MEMORY_MB:-0}
+      JOB_WORKER_LABELS: ${JOB_WORKER_LABELS:-}
+      PLUGIN_HEALTH_FAILURE_THRESHOLD: ${PLUGIN_HEALTH_FAILURE_THRESHOLD:-3}
+      PLUGIN_ALLOWED_NETWORK_HOSTS: ${PLUGIN_ALLOWED_NETWORK_HOSTS:-}
+      PLUGIN_ALLOWED_EXECUTABLES: ${PLUGIN_ALLOWED_EXECUTABLES:-}
+      PLUGIN_ALLOWED_ENV_VARS: ${PLUGIN_ALLOWED_ENV_VARS:-}
+      PLUGIN_ALLOW_UNTRUSTED_INLINE: "false"
+      WORKFLOW_CHECKPOINT_LOCK_TIMEOUT: ${WORKFLOW_CHECKPOINT_LOCK_TIMEOUT:-5}
       STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
       S3_BUCKET: ${S3_BUCKET:-}
       S3_PREFIX: ${S3_PREFIX:-bio-agent}
@@ -111,10 +163,17 @@ services:
       STATE_WRITER_BATCH_WAIT_MS: ${STATE_WRITER_BATCH_WAIT_MS:-20}
       WORKER_METRICS_HOST: ${WORKER_METRICS_HOST:-0.0.0.0}
       WORKER_METRICS_PORT: ${WORKER_METRICS_PORT:-9000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      OBSERVABILITY_MAX_FIELD_LENGTH: ${OBSERVABILITY_MAX_FIELD_LENGTH:-512}
       MRNA_FORGE_ROOT: ${MRNA_FORGE_ROOT:-}
     volumes:
       - ./output:/app/output
       - ./data:/app/data:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "${WORKER_METRICS_PUBLISHED_PORT:-9000}:9000"
     command: ["python", "-m", "src.worker"]

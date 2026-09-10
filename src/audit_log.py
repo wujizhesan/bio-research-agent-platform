@@ -7,9 +7,9 @@ from threading import Lock
 from uuid import uuid4
 
 try:
-    from .observability import REQUEST_ID
+    from .observability import REQUEST_ID, TRACE_ID
 except ImportError:
-    from observability import REQUEST_ID
+    from observability import REQUEST_ID, TRACE_ID
 
 
 class AuditLogger:
@@ -22,6 +22,7 @@ class AuditLogger:
             'event_id': uuid4().hex,
             'at': datetime.now(timezone.utc).isoformat(),
             'request_id': REQUEST_ID.get(),
+            'trace_id': TRACE_ID.get(),
             'actor': principal.subject if principal else 'anonymous',
             'roles': list(principal.roles) if principal else [],
             'action': action,

@@ -2,21 +2,70 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, platform-main]
   pull_request:
-    branches: [main]
+    branches: [main, platform-main]
+  schedule:
+    - cron: '17 3 * * 1'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  UV_VERSION: '0.11.30'
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Test Python ${{ matrix.python-version }}
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    env:
+      CADD_SKIP_ASSETS: '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install source and test dependencies
+        run: |
+          python -m pip install "uv==$UV_VERSION"
+          uv sync --locked --all-extras
+      - name: Run unit tests
+        run: |
+          uv run coverage run --source=src -m pytest -q --ignore=tests/integration
+          uv run coverage report --fail-under=65
+      - name: Verify domain catalog and workflow dry-run
+        run: |
+          mkdir -p output
+          uv run python -m src.domain_registry --domain all > output/ci_domains.json
+          uv run python -m src.workflow_runner --workflow examples/workflows/bgi_research_demo.yaml --dry-run --out output/ci_workflow.json
+      - name: Evaluate deterministic research planning
+        run: uv run python -m src.research_evaluator --out output/ci_research_eval.json
+      - name: Validate Compose configuration
+        run: |
+          docker compose config --quiet
+          PLUGIN_SANDBOX_TOKEN=ci-plugin-sandbox-token-0000000000000000 \
+            docker compose -f docker-compose.yml -f docker-compose.secure.yml config --quiet
+
+  services:
+    name: PostgreSQL, Redis and migrations
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
         env:
           POSTGRES_DB: bioagent_ci
           POSTGRES_USER: bioagent
@@ -28,61 +77,392 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      redis:
+        image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     env:
       CADD_SKIP_ASSETS: '1'
+      AUTO_CREATE_SCHEMA: 'false'
+      RUN_EXTERNAL_SERVICE_TESTS: '1'
+      DATABASE_URL: postgresql+asyncpg://bioagent:bioagent-ci-password@127.0.0.1:5432/bioagent_ci
+      REDIS_URL: redis://127.0.0.1:6379/0
+      REDIS_NAMESPACE: bioagent-fullstack-${{ github.run_id }}
+      CI_LEGACY_JOB_ID: ci-legacy-before-run-context
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install integration dependencies
+        run: |
+          python -m pip install "uv==$UV_VERSION"
+          uv sync --locked --all-extras
+          uv pip install tests/fixtures/reliability_plugin --no-deps
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+      - name: Upgrade previous database revision
+        run: |
+          uv run --no-sync python -m alembic upgrade 0005_job_observability
+          uv run --no-sync python - <<'PY'
+          import asyncio
+          import os
+          import asyncpg
+
+          async def seed():
+              connection = await asyncpg.connect(
+                  os.environ['DATABASE_URL'].replace('postgresql+asyncpg://', 'postgresql://')
+              )
+              try:
+                  await connection.execute(
+                      '''
+                      INSERT INTO job_records (
+                          job_id, tool, status, created_at, arguments, attempts,
+                          cancel_requested, resources, priority, trace_id
+                      ) VALUES ($1, $2, $3, $4, $5::json, $6, $7, $8::json, $9, $10)
+                      ''',
+                      os.environ['CI_LEGACY_JOB_ID'],
+                      'research_catalog',
+                      'completed',
+                      '2026-09-07T00:00:00+00:00',
+                      '{}',
+                      1,
+                      False,
+                      '{}',
+                      0,
+                      'ci-legacy-trace',
+                  )
+              finally:
+                  await connection.close()
+
+          asyncio.run(seed())
+          PY
+          uv run --no-sync python -m alembic upgrade head
+          uv run --no-sync python -m alembic current --check-heads
+          uv run --no-sync python -m alembic check
+      - name: Test real PostgreSQL and Redis
+        run: uv run --no-sync python -m pytest tests/integration/test_external_services.py -q
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend and browser dependencies
+        working-directory: frontend
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Start authenticated API and Redis worker
+        env:
+          APP_ENV: production
+          CADD_API_TOKEN: ''
+          CADD_JWT_SECRET: ci-fullstack-jwt-secret-at-least-32-characters
+          CORS_ORIGINS: http://127.0.0.1:4173
+          JOB_BACKEND: redis
+          JOB_EXECUTION_MODE: process
+          JOB_LEASE_SECONDS: '2'
+          WORKER_METRICS_PORT: '0'
+        run: |
+          mkdir -p output
+          uv run --no-sync python - <<'PY' >> "$GITHUB_ENV"
+          import time
+          import jwt
+
+          now = int(time.time())
+          token = jwt.encode({
+              'sub': 'ci-fullstack',
+              'roles': ['admin'],
+              'iat': now,
+              'exp': now + 1800,
+              'iss': 'bio-research-agent',
+          }, 'ci-fullstack-jwt-secret-at-least-32-characters', algorithm='HS256')
+          print(f'VITE_API_TOKEN={token}')
+          print(f'FULLSTACK_API_TOKEN={token}')
+          PY
+          nohup python -m uvicorn src.fastapi_app:app --host 127.0.0.1 --port 8000 > output/ci-fullstack-api.log 2>&1 &
+          echo $! > output/ci-fullstack-api.pid
+          nohup python -m src.worker > output/ci-fullstack-worker.log 2>&1 &
+          echo $! > output/ci-fullstack-worker.pid
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8000/health > output/ci-fullstack-health.json; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat output/ci-fullstack-api.log
+          cat output/ci-fullstack-worker.log
+          exit 1
+      - name: Run real full-stack smoke test
+        working-directory: frontend
+        run: npm run test:e2e:fullstack
+      - name: Upload full-stack smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fullstack-smoke-diagnostics
+          retention-days: 14
+          path: |
+            output/ci-fullstack-*.log
+            output/ci-fullstack-health.json
+            frontend/playwright-report
+            frontend/test-results
+          if-no-files-found: ignore
+
+  package:
+    name: Build and install Python package
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Build and validate distributions
+        run: |
+          python -m pip install "uv==$UV_VERSION"
+          uv sync --locked --all-extras
+          uv run python -m build
+          uv run python -m twine check dist/*
+      - name: Install wheel in a clean environment
+        run: |
+          uv venv .venv-package
+          uv pip install --python .venv-package/bin/python dist/*.whl
+          uv pip check --python .venv-package/bin/python
+      - name: Smoke-test installed modules and entry points
+        run: |
+          mkdir -p /tmp/bio-agent-package-smoke
+          cd /tmp/bio-agent-package-smoke
+          "$GITHUB_WORKSPACE/.venv-package/bin/python" - <<'PY'
+          from importlib.metadata import version
+          from pathlib import Path
+          import database
+          import domain_registry
+          import fastapi_app
+          import omics_protocol
+          import redis_job_manager
+          import redis_job_worker
+          import research_domain_workflows
+          import research_omics_workflow
+          import research_protocol
+          import research_workflow_builder
+          import run_context
+          import tool_contracts
+
+          assert version('bio-research-agent-platform')
+          assert 'site-packages' in Path(run_context.__file__).as_posix()
+          assert domain_registry.active_tool_specs()
+          assert fastapi_app.app is not None
+          assert database.Database is not None
+          assert redis_job_manager.RedisJobManager is not None
+          assert redis_job_worker.RedisJobWorkerRuntime is not None
+          assert omics_protocol.build_omics_tools is not None
+          assert research_protocol.build_research_tools is not None
+          assert research_workflow_builder._build_workflow is not None
+          assert tool_contracts.bind_tool_contracts is not None
+          PY
+          "$GITHUB_WORKSPACE/.venv-package/bin/bio-agent-domains" --domain all > installed_domains.json
+          "$GITHUB_WORKSPACE/.venv-package/bin/bio-agent-workflow" \
+            --workflow "$GITHUB_WORKSPACE/examples/workflows/bgi_research_demo.yaml" \
+            --dry-run \
+            --out installed_workflow.json
+          test -s installed_domains.json
+          test -s installed_workflow.json
+
+  supply-chain:
+    name: Audit Python and npm dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Export and verify locked Python dependencies
+        run: |
+          python -m pip install "uv==$UV_VERSION"
+          uv lock --check
+          uv export --locked --no-dev --no-hashes --no-emit-project --output-file requirements.txt
+          uv export --locked --all-extras --no-dev --no-hashes --no-emit-project --output-file requirements-ui.txt
+          git diff --exit-code -- requirements.txt requirements-ui.txt
+          mkdir -p output
+          uv export --locked --all-extras --no-emit-project --output-file output/audit-requirements.txt
+      - name: Audit runtime, UI, Chainlit and development dependencies
+        uses: pypa/gh-action-pip-audit@1220774d901786e6f652ae159f7b6bc8fea6d266 # v1.1.0
+        with:
+          inputs: output/audit-requirements.txt
+          require-hashes: true
+      - name: Enforce Python dependency license policy
+        run: uv run pip-licenses --output-file=output/python-licenses.json
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend audit dependencies
+        working-directory: frontend
+        run: npm ci --ignore-scripts
+      - name: Verify npm registry signatures and provenance
+        working-directory: frontend
+        run: npm audit signatures --registry=https://registry.npmjs.org
+      - name: Enforce frontend dependency license policy
+        working-directory: frontend
+        run: npm run licenses:check
+      - name: Audit frontend dependencies
+        working-directory: frontend
+        run: npm audit --registry=https://registry.npmjs.org --audit-level=high
+      - name: Upload dependency license evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dependency-license-evidence
+          retention-days: 90
+          path: |
+            output/python-licenses.json
+            frontend/output/dependency-licenses.json
+          if-no-files-found: warn
+
+  container:
+    name: Scan ${{ matrix.name }} image
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.11', '3.12']
+        include:
+          - name: backend
+            image_ref: bio-research-agent:ci
+            build_context: .
+            dockerfile: Dockerfile
+            exit_code: '1'
+          - name: frontend
+            image_ref: bio-research-agent-web:ci
+            build_context: frontend
+            dockerfile: frontend/Dockerfile
+            exit_code: '1'
+          - name: redis
+            image_ref: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+            pull_image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+            baseline_name: redis
+            exit_code: '0'
+          - name: postgres
+            image_ref: postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+            pull_image: postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+            baseline_name: postgres
+            exit_code: '0'
+          - name: clamav
+            image_ref: clamav/clamav:1.5@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422
+            pull_image: clamav/clamav:1.5@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422
+            baseline_name: clamav
+            exit_code: '0'
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
-      - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Build local image
+        if: matrix.build_context != ''
+        run: docker build --file "${{ matrix.dockerfile }}" --tag "${{ matrix.image_ref }}" "${{ matrix.build_context }}"
+      - name: Pull service image
+        if: matrix.pull_image != ''
+        run: docker pull "${{ matrix.pull_image }}"
+      - name: Prepare SBOM output
+        run: mkdir -p output/sbom output/security
+      - name: Generate image CycloneDX SBOM
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-      - name: Install dependencies
+          image-ref: ${{ matrix.image_ref }}
+          version: v0.74.0
+          format: cyclonedx
+          output: output/sbom/${{ matrix.name }}.cdx.json
+          scanners: vuln
+          timeout: 15m
+          hide-progress: true
+      - name: Generate repository CycloneDX SBOM
+        if: matrix.name == 'backend'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: cyclonedx
+          output: output/sbom/repository.cdx.json
+          scanners: vuln
+          timeout: 15m
+          hide-progress: true
+          skip-setup-trivy: true
+      - name: Upload software bills of materials
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cyclonedx-sbom-${{ matrix.name }}
+          retention-days: 30
+          path: |
+            output/sbom/${{ matrix.name }}.cdx.json
+            output/sbom/repository.cdx.json
+          if-no-files-found: error
+      - name: Generate third-party vulnerability report
+        if: matrix.baseline_name != ''
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ matrix.image_ref }}
+          version: v0.74.0
+          format: json
+          output: output/security/${{ matrix.name }}.trivy.json
+          exit-code: '0'
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          timeout: 15m
+          hide-progress: true
+          skip-setup-trivy: true
+      - name: Enforce third-party vulnerability baseline
+        if: matrix.baseline_name != ''
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install -e . --no-deps
-          python -m pip install pytest pytest-asyncio coverage
-      - name: Run unit and integration tests
-        run: |
-          coverage run --source=src -m pytest -q
-          coverage report
-      - name: Verify database migration
-        run: |
-          mkdir -p output
-          DATABASE_URL=sqlite+aiosqlite:///./output/ci.db alembic upgrade head
-          DATABASE_URL=postgresql+asyncpg://bioagent:bioagent-ci-password@127.0.0.1:5432/bioagent_ci alembic upgrade head
-      - name: Verify domain catalog and workflow dry-run
-        run: |
-          python -m src.domain_registry --domain all > output/ci_domains.json
-          python -m src.workflow_runner --workflow examples/workflows/bgi_research_demo.yaml --dry-run --out output/ci_workflow.json
-      - name: Evaluate deterministic research planning
-        run: python -m src.research_evaluator --out output/ci_research_eval.json
-      - name: Validate Compose configuration
-        run: docker compose config --quiet
-
-  container:
-    name: Build Docker image
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v6
-      - name: Build image
-        run: docker build --tag bio-research-agent:ci .
+          python tools/check_container_vulnerability_baseline.py \
+            --image-name "${{ matrix.baseline_name }}" \
+            --image-ref "${{ matrix.image_ref }}" \
+            --report "output/security/${{ matrix.name }}.trivy.json" \
+            --baseline security/container-vulnerability-baseline.json \
+            --summary "output/security/${{ matrix.name }}.baseline-summary.json"
+      - name: Upload third-party vulnerability evidence
+        if: always() && matrix.baseline_name != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vulnerability-evidence-${{ matrix.name }}
+          retention-days: 90
+          path: output/security/
+          if-no-files-found: warn
+      - name: Scan image for fixable high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ matrix.image_ref }}
+          format: table
+          exit-code: ${{ matrix.exit_code }}
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          timeout: 15m
+          hide-progress: true
+          skip-setup-trivy: true
 
   frontend:
     name: Build React workbench
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '22'
           cache: npm
@@ -90,6 +470,41 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
+      - name: Lint frontend
+        working-directory: frontend
+        run: npm run lint
+      - name: Type-check frontend
+        working-directory: frontend
+        run: npm run typecheck
+      - name: Test frontend with coverage thresholds
+        working-directory: frontend
+        run: npm run test:coverage
+      - name: Upload frontend coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: frontend-coverage
+          path: frontend/coverage
+          if-no-files-found: error
       - name: Build frontend
         working-directory: frontend
         run: npm run build
+      - name: Enforce frontend performance budget
+        working-directory: frontend
+        run: npm run budget:check
+      - name: Install Playwright Chromium
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+      - name: Run frontend smoke and accessibility tests
+        working-directory: frontend
+        run: npm run test:e2e
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: frontend-playwright-report
+          retention-days: 14
+          path: |
+            frontend/playwright-report
+            frontend/test-results
+          if-no-files-found: ignore

@@ -17,7 +17,8 @@ class StreamlitChatTests(unittest.TestCase):
         self.assertEqual(command['traces'][0]['result']['status'], 'accepted')
         job_id = command['traces'][0]['result']['job']['job_id']
         current = None
-        for _ in range(100):
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
             current = route_request('GET', '/jobs/' + job_id)[1]['job']
             if current['status'] in {'completed', 'failed'}:
                 break

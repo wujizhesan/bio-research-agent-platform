@@ -23,18 +23,20 @@ CADD 是当前最完整的科学计算领域实现，其他领域通过同一套
 
 提交后台任务后，可通过 `GET /api/v1/jobs/{job_id}/events` 使用 SSE 订阅状态变化，服务会推送 `queued`、`running` 和终态事件；接口支持 `interval_seconds`、`timeout_seconds` 查询参数。
 
-任务执行支持两种后端：本地开发默认使用进程内线程池；Compose 默认启用 Redis 队列和独立 Worker。API 通过 `JOB_BACKEND=redis` 切换 Redis 模式，Worker 使用 `python -m src.worker` 启动，任务状态和队列可在多个 API/Worker 实例之间共享。Worker 使用 processing 列表和租约实现至少一次投递，进程崩溃后会自动回收过期任务；可通过 `JOB_LEASE_SECONDS` 调整租约时长。每个任务还会缓存成功执行结果，恢复同一任务时优先复用缓存；缓存保留时间由 `JOB_RESULT_TTL_SECONDS` 控制。
+任务执行支持本地和 Redis 两种后端。生产任务默认在独立子进程中执行，故障、超时和取消不会拖垮 API 或 Worker；可通过 `JOB_MAX_WORKERS`、`JOB_TIMEOUT_SECONDS`、`JOB_MEMORY_LIMIT_MB`、`JOB_CPU_TIME_SECONDS` 和 `JOB_RESULT_MAX_BYTES` 控制并发及资源上限，开发调试时可设置 `JOB_EXECUTION_MODE=inline`。任务提交支持 `priority` 以及 CPU、内存、GPU、GPU 显存和 Worker 标签需求；本地调度器会进行容量预留和优先级回填，Redis Worker 使用高/普通/低三级队列并跳过能力不匹配的任务。Worker 容量由 `JOB_TOTAL_CPU_CORES`、`JOB_TOTAL_MEMORY_MB`、`JOB_TOTAL_GPUS`、`JOB_TOTAL_GPU_MEMORY_MB` 和 `JOB_WORKER_LABELS` 声明，`WORKER_MAX_CONCURRENCY` 控制单 Worker 最大并发，并发任务会原子预留资源；`GET /api/v1/scheduler/resources` 可查看容量与剩余额度。Compose 默认启用 Redis 队列和独立 Worker，API 通过 `JOB_BACKEND=redis` 切换 Redis 模式。Worker 使用 processing 列表和自动续租实现至少一次投递，进程崩溃后会自动回收过期任务；达到 `JOB_MAX_ATTEMPTS` 或执行失败的任务会进入 dead-letter 队列。可通过 `JOB_LEASE_SECONDS` 调整租约时长。每个任务还会缓存成功执行结果，恢复同一任务时优先复用缓存；缓存保留时间由 `JOB_RESULT_TTL_SECONDS` 控制。
 
-研究输入可以通过 `POST /api/v1/files` 以 multipart 上传。服务端按扩展名和大小校验文件，使用随机文件 ID 隔离目录并记录 SHA-256；上传响应中的 `path` 可直接作为 `research_plan` 的输入，`GET /api/v1/files/{file_id}` 用于下载。默认限制为 50 MiB，可通过 `UPLOAD_ROOT` 和 `UPLOAD_MAX_BYTES` 配置。
+研究输入可以通过 `POST /api/v1/files` 以 multipart 上传。服务端使用随机文件 ID 隔离目录并记录 SHA-256，同时检查扩展名与真实内容、拒绝归档/可执行文件/已知恶意测试签名，并只允许受解压大小和压缩比限制的 `.vcf.gz`。单文件、总磁盘、解压后大小和压缩比分别由 `UPLOAD_MAX_BYTES`、`UPLOAD_TOTAL_QUOTA_BYTES`、`UPLOAD_MAX_DECOMPRESSED_BYTES`、`UPLOAD_MAX_COMPRESSION_RATIO` 控制；拒绝事件会进入审计日志。上传响应中的 `path` 可直接作为 `research_plan` 的输入，`GET /api/v1/files/{file_id}` 用于附件下载。
 
 React 工作台的研究模式采用两阶段交互：先提交 `research_plan` 展示领域、证据源、输入门槛和实际工具链，再由用户确认后提交 `research_execute`；mRNA 模式仍可直接运行 `sequence_pipeline`。两阶段任务都通过同一套 Job/SSE 生命周期展示。
 
 ```bash
-python -m pip install -e .
+uv sync --locked --no-dev
 bio-agent-api --port 8000
 ```
 
-服务启动后访问 `http://127.0.0.1:8000/docs`。开发环境可以配置 `CADD_API_TOKEN` 使用兼容的管理员 Token；生产环境建议配置至少 32 字符的 `CADD_JWT_SECRET` 和 `CADD_AUTH_USERS_JSON`，通过 `POST /api/v1/auth/token` 获取 JWT。角色支持 `admin`、`researcher` 和 `viewer`，任务提交、文件上传下载和插件状态变更会写入 `output/audit.jsonl`。
+服务启动后访问 `http://127.0.0.1:8000/docs`。`CADD_API_TOKEN` 仅保留给本地兼容测试；`APP_ENV=production` 时平台会拒绝该 Token 并强制要求至少 32 字符的 `CADD_JWT_SECRET`。Secret 和用户配置也可分别通过 `CADD_JWT_SECRET_FILE`、`CADD_AUTH_USERS_FILE` 从外部 Secret 挂载读取。生产环境同时禁用旧 `api_server`，只允许 FastAPI JWT 入口。角色支持 `admin`、`researcher` 和 `viewer`，任务提交、文件上传下载和插件状态变更会写入 `output/audit.jsonl`。
+
+旧 `python -m src.api_server` HTTP 服务已进入兼容期，并将在 **2026-12-31 00:00 UTC** 起拒绝启动，随后从发行包移除。兼容期内它仍只允许开发环境使用，启动时会发出废弃警告，所有 HTTP 响应会携带 `Deprecation`、`Sunset`、`Link` 和 `X-API-Successor` 迁移信息。新部署和调用方必须使用 `bio-agent-api`（即 `src.fastapi_app`）及 `/api/v1/*` 接口；Docker、Compose 和项目脚本均已只指向 FastAPI。
 
 JWT 用户配置示例：
 
@@ -50,11 +52,26 @@ JWT 用户配置示例：
 alembic upgrade head
 ```
 
-`/metrics` 提供 Prometheus 格式的 HTTP 请求量、延迟、任务提交和任务状态指标。
+`/metrics` 提供统一的 Prometheus 指标，包括 HTTP 请求量/延迟/并发、任务排队与执行耗时、任务状态迁移、插件工具调用、工作流与步骤执行，以及插件健康状态。指标标签只使用后端、路由模板、已注册工具和有限状态，不使用 job ID 或用户输入，避免高基数失控。
 
 Redis Worker 单独在 `http://127.0.0.1:9000/metrics` 暴露队列深度、processing 深度、执行耗时、重试、缓存命中和当前执行数指标；可通过 `WORKER_METRICS_PUBLISHED_PORT` 修改本地端口。
 
+API 接受 `X-Request-ID`、`X-Trace-ID` 和 W3C `traceparent`，并在响应中返回 `X-Request-ID` 与 `X-Trace-ID`。同一 `trace_id` 会贯穿 API、任务记录、本地调度器或 Redis Worker、隔离子进程、插件工具和工作流 Manifest。服务与 Worker 默认输出 JSON 结构化日志；`LOG_LEVEL`、`LOG_FORMAT=json|text` 和 `OBSERVABILITY_MAX_FIELD_LENGTH` 控制日志级别、格式和字段截断，令牌、密码、Cookie、API Key 等敏感字段会自动脱敏。
+
 Redis 模式下，Redis 负责任务队列和执行缓存，PostgreSQL 的 `job_records` 负责任务最终状态、结果和执行次数；Worker 通过数据库状态写入桥异步更新记录，API 查询优先读取 PostgreSQL。
+
+### 高安全部署
+
+高安全档会把所有科研工具执行转发到独立的插件沙箱容器。沙箱服务不接收数据库、Redis、JWT 或对象存储凭据，仅通过带 32 字符以上随机令牌的内部网络接受 Worker 请求；令牌由 Compose Secret 以只读文件分别授予 Worker 和沙箱，不进入容器环境变量。容器使用非 root 用户、只读根文件系统、`no-new-privileges`、移除全部 Linux capabilities，并限制 PID、CPU、内存和临时目录。它不会挂载 Docker Socket，也不能访问数据库网络。沙箱默认没有外网；需要联网的插件应通过单独的白名单出口代理接入，而不是把沙箱加入平台默认网络。
+
+上传文件在写入正式元数据或上传 S3 前依次经过 ClamAV `INSTREAM` 扫描、CDR 内容重构、重构后内容复检。CDR 会规范化科研文本和 VCF gzip，重新序列化 JSON/YAML，并把 HTML 转为无活动内容的纯文本；ClamAV 不可用、发现恶意内容或 CDR 失败时，高安全档会关闭式拒绝上传并清理隔离目录。ClamAV TCP 端口只存在于内部扫描网络，不发布到宿主机。
+
+```bash
+export PLUGIN_SANDBOX_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
+docker compose -f docker-compose.yml -f docker-compose.secure.yml up --build
+```
+
+ClamAV 特征库保存在 `clamav_signatures` 卷中。首次启动需要下载特征库并加载到内存，建议至少为 ClamAV 预留 4 GB；安全档默认把单文件限制收紧到 20 MB，避免超过 ClamAV 默认 `StreamMaxLength`。生产环境应把 `PLUGIN_SANDBOX_TOKEN` 放入 Secret 管理器，不要写入 Compose 文件或提交到仓库。Linux 主机可通过 `PLUGIN_SANDBOX_UID`、`PLUGIN_SANDBOX_GID` 与 `output` 目录所有者对齐，保持非 root 的同时允许插件写入结果。普通 `docker-compose.yml` 仍保持开发模式，不强制依赖 ClamAV 或沙箱服务。
 
 ```bash
 docker compose up --build
@@ -120,14 +137,19 @@ src/pipeline.py ── 一条命令串起 ──► src/report.py (离线 markdo
 
 ## 可插拔扩展
 
-CADD backend 通过统一 PluginContract 校验 API version 和 capability，配置支持内置模块、module:attribute、mapping target，以及 Python entry point：cadd_agent.plugins。domain_registry 还支持通过 cadd_agent.domains 安装外部领域工具集。每次运行的 run_manifest.json 会记录插件名称、版本、API 版本和能力。
+CADD backend 通过统一 PluginContract 校验 API version 和 capability，配置支持内置模块、module:attribute、mapping target，以及 Python entry point：cadd_agent.plugins。domain_registry 还支持通过 cadd_agent.domains 安装外部领域工具集。Manifest v2 包含语义化插件版本、Python 依赖、工具输入/输出 JSON Schema 和 SHA-256 契约指纹；不兼容入口点会被隔离，不会阻断平台启动。`POST /api/v1/plugins/validate` 可在安装前校验 Manifest 与当前环境，`POST /api/v1/plugins/{domain}/health` 执行健康检查；连续失败次数达到 `PLUGIN_HEALTH_FAILURE_THRESHOLD` 后插件会自动进入 quarantined 状态。每次运行的 run_manifest.json 会记录插件名称、版本、API 版本和能力。
+
+内置领域属于平台可信计算基；通过 `cadd_agent.domains` 发现的第三方插件默认零权限且必须在隔离子进程执行。插件只能按工具参数声明输入文件、输出文件或目录，并以精确主机名、可执行文件名和环境变量名声明额外能力；平台再通过 `PLUGIN_ALLOWED_NETWORK_HOSTS`、`PLUGIN_ALLOWED_EXECUTABLES` 和 `PLUGIN_ALLOWED_ENV_VARS` 审批。未声明或未审批的文件访问、网络连接、子进程、Shell 和动态库加载会被拒绝并记录 `plugin.security.denied` 事件及 Prometheus 指标。生产环境不得启用 `PLUGIN_ALLOW_UNTRUSTED_INLINE`。
+
+跨领域工作流支持步骤级原子检查点。使用 `--resume` 或在 `research_execute` / `research_run_preset` 参数中设置 `resume=true` 后，平台会按输入文件哈希、上游步骤指纹、插件版本和契约指纹复用已完成步骤；输入变化、插件升级、产物缺失或产物被修改时自动重算。任务的 Retry 接口会在检测到有效检查点时自动启用恢复模式，同一检查点的并发写入会被锁拒绝。锁等待时间由 `WORKFLOW_CHECKPOINT_LOCK_TIMEOUT` 控制。
+
+工作流 Manifest 同时记录完整工作流配方、Python 与科学计算依赖版本、可复现性相关环境变量、插件实现代码 SHA-256、输入与输出文件 SHA-256、随机种子状态、步骤结果摘要和整体运行指纹。环境或插件实现发生漂移时，断点步骤不会被错误复用。可使用 `bio-agent-reproduce <manifest.json>`、`python -m src.reproducibility <manifest.json>`，或调用 `research_verify_reproducibility` 工具验证当前文件、运行环境和插件是否仍与实验记录一致。
 
 ## 快速运行（一条命令）
 
 ```bash
 # 环境(第一次)
-python -m venv .venv
-.venv/Scripts/pip install -r requirements.txt
+uv sync --locked --all-extras
 
 # 跑完整虚拟筛选 → 出 top_hits.csv + report.md
 .venv/Scripts/python src/pipeline.py --exhaustiveness 6
@@ -158,6 +180,7 @@ python -m venv .venv
 # Traceable cross-domain workflow
 .venv/Scripts/python -m src.workflow_runner --workflow examples/workflows/rnaseq.yaml --dry-run --out output/workflow_demo_dry/workflow_manifest.json
 .venv/Scripts/python -m src.workflow_runner --workflow examples/workflows/rnaseq.yaml --out output/workflow_demo/workflow_manifest.json
+.venv/Scripts/python -m src.workflow_runner --workflow examples/workflows/rnaseq.yaml --out output/workflow_demo/workflow_manifest.json --resume
 
 # End-to-end RNA-seq research Agent workflow
 .venv/Scripts/python -m src.workflow_runner --workflow examples/workflows/rnaseq_research_agent.yaml --out output/rnaseq_research_agent/workflow_manifest.json
@@ -249,7 +272,7 @@ src/          核心代码(pipeline/dock/build/report/agent/qa)
 tools/        AutoDock Vina 官方 Windows exe
 data/         PDB 结构 + 分子库(不入 git)
 output/       运行产物(top_hits.csv / report.md)
-requirements.txt / README.md / config.yaml
+pyproject.toml / uv.lock / README.md / config.yaml
 ```
 
 ## 对话式 UI（可选）
@@ -271,7 +294,7 @@ Streamlit Agent chat is integrated in app.py and runs in the core .venv. Chainli
 ## 安装为 Python 项目
 
 ```bash
-python -m pip install -e .
+uv sync --locked --no-dev
 ```
 
 安装后可以使用：

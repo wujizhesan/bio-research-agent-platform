@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from src.api_server import route_request
@@ -155,6 +156,61 @@ class PluginManagerTests(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             self.assertFalse(payload['plugin']['enabled'])
+
+    def test_repeated_health_failures_quarantine_plugin(self):
+        with tempfile.TemporaryDirectory(prefix='plugin_state_') as raw:
+            source = SimpleNamespace(
+                health_check=lambda: {'healthy': False, 'reason': 'backend offline'}
+            )
+            manager = PluginManager(
+                state_path=Path(raw) / 'plugin_state.json',
+                catalog_loader=self._manager(raw).catalog_loader,
+                source_loader=lambda _domain: source,
+                failure_threshold=2,
+            )
+            first = manager.check_health('demo')
+            second = manager.check_health('demo')
+            self.assertTrue(first['enabled'])
+            self.assertEqual(first['failure_count'], 1)
+            self.assertFalse(second['enabled'])
+            self.assertEqual(second['activation'], 'quarantined')
+            self.assertEqual(second['failure_count'], 2)
+
+    def test_quarantined_plugin_requires_healthy_check_before_enable(self):
+        with tempfile.TemporaryDirectory(prefix='plugin_state_') as raw:
+            status = {'healthy': False}
+            source = SimpleNamespace(health_check=lambda: status)
+            manager = PluginManager(
+                state_path=Path(raw) / 'plugin_state.json',
+                catalog_loader=self._manager(raw).catalog_loader,
+                source_loader=lambda _domain: source,
+                failure_threshold=1,
+            )
+            manager.check_health('demo')
+            with self.assertRaisesRegex(ValueError, 'health check failed'):
+                manager.enable('demo')
+            status['healthy'] = True
+            enabled = manager.enable('demo')
+            self.assertTrue(enabled['enabled'])
+            self.assertEqual(enabled['activation'], 'enabled')
+            self.assertEqual(enabled['failure_count'], 0)
+
+    def test_http_routes_validate_and_check_plugin_health(self):
+        with tempfile.TemporaryDirectory(prefix='plugin_state_') as raw:
+            manager = self._manager(raw)
+            status, payload = route_request(
+                'POST', '/plugins/health', plugin_manager=manager
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(len(payload['plugins']), 2)
+            manifest = {
+                'manifest_version': 999,
+            }
+            status, payload = route_request(
+                'POST', '/plugins/validate', payload=manifest, plugin_manager=manager
+            )
+            self.assertEqual(status, 200)
+            self.assertFalse(payload['validation']['compatible'])
 
 
 if __name__ == '__main__':

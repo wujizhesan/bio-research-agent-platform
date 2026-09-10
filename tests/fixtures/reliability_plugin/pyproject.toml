@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bio-agent-reliability-test-plugin"
+version = "1.0.0"
+requires-python = ">=3.11"
+
+[project.entry-points."cadd_agent.domains"]
+ci_reliability = "reliability_test_plugin"
+
+[tool.setuptools]
+py-modules = ["reliability_test_plugin"]

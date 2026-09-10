@@ -1,0 +1,116 @@
+services:
+  api:
+    depends_on:
+      clamav:
+        condition: service_healthy
+    environment:
+      FILE_SECURITY_MODE: required
+      FILE_CDR_MODE: normalize
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: "3310"
+      CLAMAV_TIMEOUT_SECONDS: ${CLAMAV_TIMEOUT_SECONDS:-30}
+      UPLOAD_MAX_BYTES: ${SECURE_UPLOAD_MAX_BYTES:-20971520}
+    networks:
+      - default
+      - malware_scan
+
+  worker:
+    depends_on:
+      plugin-sandbox:
+        condition: service_healthy
+    environment:
+      JOB_EXECUTION_MODE: container
+      PLUGIN_SANDBOX_URL: http://plugin-sandbox:8081
+      PLUGIN_SANDBOX_TOKEN_FILE: /run/secrets/plugin_sandbox_token
+      PLUGIN_SANDBOX_CLIENT_CONCURRENCY: ${PLUGIN_SANDBOX_CLIENT_CONCURRENCY:-8}
+    secrets:
+      - plugin_sandbox_token
+    networks:
+      - default
+      - plugin_control
+
+  plugin-sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    environment:
+      RUN_MIGRATIONS: "false"
+      PLUGIN_SANDBOX_TOKEN_FILE: /run/secrets/plugin_sandbox_token
+      PLUGIN_SANDBOX_HOST: 0.0.0.0
+      PLUGIN_SANDBOX_PORT: "8081"
+      PLUGIN_SANDBOX_MAX_CONCURRENCY: ${PLUGIN_SANDBOX_MAX_CONCURRENCY:-2}
+      PLUGIN_SANDBOX_MAX_REQUEST_BYTES: ${PLUGIN_SANDBOX_MAX_REQUEST_BYTES:-16777216}
+      JOB_EXECUTION_MODE: process
+      JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-3600}
+      JOB_MEMORY_LIMIT_MB: ${PLUGIN_SANDBOX_MEMORY_LIMIT_MB:-4096}
+      JOB_CPU_TIME_SECONDS: ${PLUGIN_SANDBOX_CPU_TIME_SECONDS:-1800}
+      JOB_RESULT_MAX_BYTES: ${JOB_RESULT_MAX_BYTES:-16777216}
+      PLUGIN_ALLOWED_NETWORK_HOSTS: ${PLUGIN_ALLOWED_NETWORK_HOSTS:-}
+      PLUGIN_ALLOWED_EXECUTABLES: ${PLUGIN_ALLOWED_EXECUTABLES:-}
+      PLUGIN_ALLOWED_ENV_VARS: ${PLUGIN_ALLOWED_ENV_VARS:-}
+      PLUGIN_ALLOW_UNTRUSTED_INLINE: "false"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      PYTHONPATH: /app
+    command: ["python", "-m", "src.plugin_sandbox_server"]
+    secrets:
+      - plugin_sandbox_token
+    expose:
+      - "8081"
+    read_only: true
+    user: "${PLUGIN_SANDBOX_UID:-1000}:${PLUGIN_SANDBOX_GID:-1000}"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: ${PLUGIN_SANDBOX_PIDS_LIMIT:-128}
+    mem_limit: ${PLUGIN_SANDBOX_CONTAINER_MEMORY:-6g}
+    cpus: ${PLUGIN_SANDBOX_CPUS:-2.0}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
+    volumes:
+      - ./output:/app/output:rw
+      - ./data:/app/data:ro
+    networks:
+      - plugin_control
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  clamav:
+    image: clamav/clamav:1.5@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422
+    user: clamav
+    entrypoint: ["/init-unprivileged"]
+    expose:
+      - "3310"
+    volumes:
+      - clamav_signatures:/var/lib/clamav
+    networks:
+      - malware_scan
+      - signature_updates
+    mem_limit: ${CLAMAV_MEMORY_LIMIT:-4g}
+    cpus: ${CLAMAV_CPUS:-2.0}
+    pids_limit: 256
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  malware_scan:
+    internal: true
+  plugin_control:
+    internal: true
+  signature_updates: {}
+
+volumes:
+  clamav_signatures:
+
+secrets:
+  plugin_sandbox_token:
+    environment: PLUGIN_SANDBOX_TOKEN

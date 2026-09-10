@@ -12,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 try:
     import chainlit as cl
 except ImportError as exc:
-    raise SystemExit("Chainlit UI requires: pip install -r requirements-ui.txt") from exc
+    raise SystemExit("Chainlit UI requires: uv sync --locked --extra chainlit") from exc
 
 from src import agent
 from src.domain_registry import run_tool as run_domain_tool
