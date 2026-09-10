@@ -1,0 +1,208 @@
+name: Deploy production
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published release tag that produced the images
+        required: true
+        type: string
+      backend_digest:
+        description: Backend image sha256 digest
+        required: true
+        type: string
+      frontend_digest:
+        description: Frontend image sha256 digest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify immutable release images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      backend_image: ${{ steps.images.outputs.backend_image }}
+      frontend_image: ${{ steps.images.outputs.frontend_image }}
+    steps:
+      - name: Validate digest-pinned inputs
+        id: images
+        env:
+          BACKEND_DIGEST: ${{ inputs.backend_digest }}
+          FRONTEND_DIGEST: ${{ inputs.frontend_digest }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]
+          [[ "$BACKEND_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$FRONTEND_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "backend_image=ghcr.io/${GITHUB_REPOSITORY_OWNER}/bio-research-agent-platform@${BACKEND_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "frontend_image=ghcr.io/${GITHUB_REPOSITORY_OWNER}/bio-research-agent-platform-frontend@${FRONTEND_DIGEST}" >> "$GITHUB_OUTPUT"
+      - name: Authenticate to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Require a published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,tagName \
+            | jq -e --arg tag "$RELEASE_TAG" '.isDraft == false and .tagName == $tag' \
+            > /dev/null
+      - name: Resolve immutable manifests
+        env:
+          BACKEND_IMAGE: ${{ steps.images.outputs.backend_image }}
+          FRONTEND_IMAGE: ${{ steps.images.outputs.frontend_image }}
+        run: |
+          docker buildx imagetools inspect "$BACKEND_IMAGE"
+          docker buildx imagetools inspect "$FRONTEND_IMAGE"
+      - name: Verify release provenance
+        env:
+          BACKEND_IMAGE: ${{ steps.images.outputs.backend_image }}
+          FRONTEND_IMAGE: ${{ steps.images.outputs.frontend_image }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/release.yml
+        run: |
+          for image in "$BACKEND_IMAGE" "$FRONTEND_IMAGE"; do
+            gh attestation verify "oci://${image}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$SIGNER_WORKFLOW" \
+              --source-ref "refs/tags/${RELEASE_TAG}" \
+              --deny-self-hosted-runners
+          done
+      - name: Verify release SBOM attestations
+        env:
+          BACKEND_IMAGE: ${{ steps.images.outputs.backend_image }}
+          FRONTEND_IMAGE: ${{ steps.images.outputs.frontend_image }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/release.yml
+        run: |
+          for image in "$BACKEND_IMAGE" "$FRONTEND_IMAGE"; do
+            gh attestation verify "oci://${image}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$SIGNER_WORKFLOW" \
+              --source-ref "refs/tags/${RELEASE_TAG}" \
+              --predicate-type https://cyclonedx.org/bom \
+              --deny-self-hosted-runners
+          done
+
+  deploy:
+    name: Deploy approved images
+    needs: verify
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check out protected deployment configuration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Validate production connection settings
+        env:
+          DEPLOY_PATH: ${{ vars.PRODUCTION_DEPLOY_PATH }}
+          HEALTH_URL: ${{ vars.PRODUCTION_API_HEALTH_URL }}
+          SSH_HOST: ${{ secrets.PRODUCTION_SSH_HOST }}
+          SSH_KNOWN_HOSTS: ${{ secrets.PRODUCTION_SSH_KNOWN_HOSTS }}
+          SSH_PORT: ${{ vars.PRODUCTION_SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+          SSH_USER: ${{ secrets.PRODUCTION_SSH_USER }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_HOST"
+          test -n "$SSH_USER"
+          test -n "$SSH_PRIVATE_KEY"
+          test -n "$SSH_KNOWN_HOSTS"
+          [[ "$SSH_PORT" =~ ^[0-9]{1,5}$ ]]
+          [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ ]]
+          [[ "$HEALTH_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]]
+      - name: Configure SSH trust
+        env:
+          SSH_KNOWN_HOSTS: ${{ secrets.PRODUCTION_SSH_KNOWN_HOSTS }}
+          SSH_PRIVATE_KEY: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_deploy"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          ssh-keygen -y -f "$HOME/.ssh/id_deploy" > /dev/null
+      - name: Stage digest-pinned deployment bundle
+        env:
+          BACKEND_IMAGE: ${{ needs.verify.outputs.backend_image }}
+          DEPLOY_PATH: ${{ vars.PRODUCTION_DEPLOY_PATH }}
+          FRONTEND_IMAGE: ${{ needs.verify.outputs.frontend_image }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SSH_HOST: ${{ secrets.PRODUCTION_SSH_HOST }}
+          SSH_PORT: ${{ vars.PRODUCTION_SSH_PORT }}
+          SSH_USER: ${{ secrets.PRODUCTION_SSH_USER }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf 'BACKEND_IMAGE=%s\nFRONTEND_IMAGE=%s\nRELEASE_TAG=%s\n' \
+            "$BACKEND_IMAGE" "$FRONTEND_IMAGE" "$RELEASE_TAG" \
+            > release-images.env
+          printf -v prepare_command 'mkdir -p %q' "$DEPLOY_PATH"
+          ssh -i "$HOME/.ssh/id_deploy" -p "$SSH_PORT" \
+            "$SSH_USER@$SSH_HOST" "$prepare_command"
+          scp -i "$HOME/.ssh/id_deploy" -P "$SSH_PORT" \
+            docker-compose.yml docker-compose.secure.yml docker-compose.deploy.yml release-images.env \
+            "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/"
+      - name: Apply approved production deployment
+        env:
+          DEPLOY_PATH: ${{ vars.PRODUCTION_DEPLOY_PATH }}
+          HEALTH_URL: ${{ vars.PRODUCTION_API_HEALTH_URL }}
+          SSH_HOST: ${{ secrets.PRODUCTION_SSH_HOST }}
+          SSH_PORT: ${{ vars.PRODUCTION_SSH_PORT }}
+          SSH_USER: ${{ secrets.PRODUCTION_SSH_USER }}
+        run: |
+          set -euo pipefail
+          printf -v remote_command 'bash -s -- %q %q' "$DEPLOY_PATH" "$HEALTH_URL"
+          ssh -i "$HOME/.ssh/id_deploy" -p "$SSH_PORT" \
+            "$SSH_USER@$SSH_HOST" "$remote_command" <<'REMOTE'
+          set -euo pipefail
+          deploy_path=$1
+          health_url=$2
+          cd "$deploy_path"
+          test -f .env.production
+          grep -Eq '^POSTGRES_PASSWORD=.+$' .env.production
+          grep -Eq '^CADD_JWT_SECRET=.{32,}$' .env.production
+          grep -Eq '^PLUGIN_SANDBOX_TOKEN=.{32,}$' .env.production
+          ! grep -Eq '^POSTGRES_PASSWORD=(bioagent-dev-password|"bioagent-dev-password")$' .env.production
+          compose=(
+            docker compose
+            --env-file .env.production
+            --env-file release-images.env
+            -f docker-compose.yml
+            -f docker-compose.secure.yml
+            -f docker-compose.deploy.yml
+          )
+          "${compose[@]}" config --quiet
+          "${compose[@]}" pull api worker web plugin-sandbox
+          "${compose[@]}" up -d --no-build --remove-orphans
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error "$health_url" > /dev/null; then
+              "${compose[@]}" ps
+              exit 0
+            fi
+            sleep 5
+          done
+          "${compose[@]}" ps
+          exit 1
+          REMOTE
