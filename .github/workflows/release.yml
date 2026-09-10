@@ -1,6 +1,9 @@
 name: Release containers
 
 on:
+  push:
+    tags:
+      - "v*"
   release:
     types: [published]
   workflow_dispatch:
@@ -99,6 +102,7 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
+            type=ref,event=tag
             type=raw,value=${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.version != '' }}
             type=sha,format=long,prefix=sha-
             type=raw,value=latest,enable=${{ github.event_name == 'release' && github.event.release.prerelease == false }}

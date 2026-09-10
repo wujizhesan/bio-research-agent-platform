@@ -61,6 +61,7 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn("gh attestation verify", workflow)
         self.assertIn("--predicate-type https://cyclonedx.org/bom", workflow)
         self.assertIn("Require successful CI for source commit", workflow)
+        self.assertIn('      - "v*"', workflow)
 
 
 if __name__ == "__main__":
