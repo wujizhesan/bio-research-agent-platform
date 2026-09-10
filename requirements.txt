@@ -112,7 +112,7 @@ prometheus-client==0.26.0
     # via bio-research-agent-platform
 pydantic==2.13.5
     # via fastapi
-pydantic-core==2.46.5
+pydantic-core==2.48.0
     # via pydantic
 pyjwt==2.13.0
     # via bio-research-agent-platform
@@ -194,5 +194,5 @@ uvloop==0.22.1 ; platform_python_implementation != 'PyPy' and sys_platform != 'c
     # via uvicorn
 watchfiles==1.2.0
     # via uvicorn
-websockets==16.1.1
+websockets==17.1
     # via uvicorn
