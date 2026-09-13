@@ -162,7 +162,8 @@ jobs:
           ssh -i "$HOME/.ssh/id_deploy" -p "$SSH_PORT" \
             "$SSH_USER@$SSH_HOST" "$prepare_command"
           scp -i "$HOME/.ssh/id_deploy" -P "$SSH_PORT" \
-            docker-compose.yml docker-compose.secure.yml docker-compose.deploy.yml release-images.next.env \
+            docker-compose.yml docker-compose.secure.yml docker-compose.deploy.yml \
+            scripts/deploy_transaction.sh release-images.next.env \
             "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/"
       - name: Apply approved production deployment
         env:
@@ -173,80 +174,7 @@ jobs:
           SSH_USER: ${{ secrets.PRODUCTION_SSH_USER }}
         run: |
           set -euo pipefail
-          printf -v remote_command 'bash -s -- %q %q' "$DEPLOY_PATH" "$HEALTH_URL"
+          printf -v remote_script '%q/deploy_transaction.sh' "$DEPLOY_PATH"
+          printf -v remote_command 'bash %s %q %q' "$remote_script" "$DEPLOY_PATH" "$HEALTH_URL"
           ssh -i "$HOME/.ssh/id_deploy" -p "$SSH_PORT" \
-            "$SSH_USER@$SSH_HOST" "$remote_command" <<'REMOTE'
-          set -euo pipefail
-          deploy_path=$1
-          health_url=$2
-          cd "$deploy_path"
-          test -f .env.production
-          grep -Eq '^POSTGRES_PASSWORD=.+$' .env.production
-          grep -Eq '^CADD_JWT_SECRET=.{32,}$' .env.production
-          grep -Eq '^PLUGIN_SANDBOX_TOKEN=.{32,}$' .env.production
-          ! grep -Eq '^POSTGRES_PASSWORD=(bioagent-dev-password|"bioagent-dev-password")$' .env.production
-          test "$(grep -c '^RECOVERY_EVIDENCE_PATH=' .env.production)" -eq 1
-          test "$(grep -c '^RECOVERY_POINT_MAX_AGE_SECONDS=' .env.production)" -eq 1
-          test "$(grep -c '^RECOVERY_VERIFICATION_MAX_AGE_SECONDS=' .env.production)" -eq 1
-          grep -Eq '^RECOVERY_EVIDENCE_PATH=/[A-Za-z0-9._/-]+$' .env.production
-          ! grep -Eq '^RECOVERY_EVIDENCE_PATH=.*\.\.' .env.production
-          grep -Eq '^RECOVERY_POINT_MAX_AGE_SECONDS=[1-9][0-9]*$' .env.production
-          grep -Eq '^RECOVERY_VERIFICATION_MAX_AGE_SECONDS=[1-9][0-9]*$' .env.production
-          test -f release-images.next.env
-          base_compose=(
-            docker compose
-            --env-file .env.production
-            -f docker-compose.yml
-            -f docker-compose.secure.yml
-            -f docker-compose.deploy.yml
-          )
-          next_compose=("${base_compose[@]}" --env-file release-images.next.env)
-          had_current=false
-          if test -f release-images.env; then
-            had_current=true
-            current_compose=("${base_compose[@]}" --env-file release-images.env)
-            cp release-images.env release-images.previous.env
-          fi
-          "${next_compose[@]}" config --quiet
-          "${next_compose[@]}" pull api worker web plugin-sandbox migration recovery-check
-          "${next_compose[@]}" run --rm --no-deps recovery-check
-          "${next_compose[@]}" run --rm migration
-          deployment_healthy=false
-          if "${next_compose[@]}" up -d --no-build --remove-orphans; then
-            for attempt in $(seq 1 30); do
-              if curl --fail --silent --show-error "$health_url" > /dev/null; then
-                deployment_healthy=true
-                break
-              fi
-              sleep 5
-            done
-          fi
-          if "$deployment_healthy"; then
-            mv release-images.next.env release-images.env
-            "${next_compose[@]}" ps
-            exit 0
-          fi
-          "${next_compose[@]}" ps
-          if "$had_current"; then
-            echo "candidate deployment unhealthy; rolling back to previous image digests" >&2
-            rollback_healthy=false
-            if "${current_compose[@]}" up -d --no-build --remove-orphans; then
-              for attempt in $(seq 1 30); do
-                if curl --fail --silent --show-error "$health_url" > /dev/null; then
-                  rollback_healthy=true
-                  break
-                fi
-                sleep 5
-              done
-            fi
-            "${current_compose[@]}" ps
-            if "$rollback_healthy"; then
-              echo "rollback completed; deployment remains failed" >&2
-            else
-              echo "rollback failed to restore a healthy service" >&2
-            fi
-          else
-            echo "candidate deployment unhealthy and no previous image set exists" >&2
-          fi
-          exit 1
-          REMOTE
+            "$SSH_USER@$SSH_HOST" "$remote_command"

@@ -102,11 +102,15 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertNotIn("secrets.", json.dumps(verify))
         self.assertEqual(deploy["environment"], {"name": "production"})
         deployment = json.dumps(deploy)
+        deployment_script = (ROOT / "scripts" / "deploy_transaction.sh").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("secrets.PRODUCTION_SSH_PRIVATE_KEY", deployment)
         self.assertIn("gh attestation verify", json.dumps(verify))
         self.assertIn("--signer-workflow", json.dumps(verify))
         self.assertIn("--source-ref", json.dumps(verify))
-        self.assertIn("--no-build", deployment)
+        self.assertIn("scripts/deploy_transaction.sh", deployment)
+        self.assertIn("--no-build", deployment_script)
 
         compose = yaml.safe_load(
             (ROOT / "docker-compose.deploy.yml").read_text(encoding="utf-8")
@@ -131,6 +135,8 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" / "deploy-production.yml").read_text(
             encoding="utf-8"
         )
+        script = (ROOT / "scripts" / "deploy_transaction.sh").read_text(encoding="utf-8")
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         secure_compose = yaml.safe_load(
             (ROOT / "docker-compose.secure.yml").read_text(encoding="utf-8")
         )
@@ -149,18 +155,20 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertEqual(recovery["network_mode"], "none")
         self.assertTrue(recovery["read_only"])
         self.assertIn("release-images.next.env", workflow)
-        self.assertIn("release-images.previous.env", workflow)
-        self.assertIn('run --rm --no-deps recovery-check', workflow)
-        self.assertIn('run --rm migration', workflow)
-        self.assertIn('rolling back to previous image digests', workflow)
-        self.assertIn('RECOVERY_EVIDENCE_PATH=', workflow)
+        self.assertIn("deploy_transaction.sh", workflow)
+        self.assertIn("release-images.previous.env", script)
+        self.assertIn('run --rm --no-deps recovery-check', script)
+        self.assertIn('run --rm migration', script)
+        self.assertIn('rolling back to previous image digests', script)
+        self.assertIn('RECOVERY_EVIDENCE_PATH=', script)
+        self.assertIn("check_expand_contract_migrations.py", ci)
         self.assertLess(
-            workflow.index('run --rm --no-deps recovery-check'),
-            workflow.index('run --rm migration'),
+            script.index('run --rm --no-deps recovery-check'),
+            script.index('run --rm migration'),
         )
         self.assertLess(
-            workflow.index('run --rm migration'),
-            workflow.index('up -d --no-build --remove-orphans'),
+            script.index('run --rm migration'),
+            script.index('up -d --no-build --remove-orphans'),
         )
 
     def test_recovery_drill_restores_durable_state_and_discards_redis(self):
