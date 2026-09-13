@@ -1,0 +1,46 @@
+services:
+  db:
+    image: postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+    environment:
+      POSTGRES_DB: bioagent_recovery
+      POSTGRES_USER: bioagent
+      POSTGRES_PASSWORD: recovery-only-password
+    ports:
+      - "${RECOVERY_POSTGRES_PORT:-15432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bioagent -d bioagent_recovery"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - recovery_pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+    ports:
+      - "${RECOVERY_REDIS_PORT:-16379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  minio:
+    image: quay.io/minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: recovery-access-key
+      MINIO_ROOT_PASSWORD: recovery-secret-key
+    ports:
+      - "${RECOVERY_S3_PORT:-19000}:9000"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - recovery_object_data:/data
+
+volumes:
+  recovery_pgdata:
+  recovery_object_data:
