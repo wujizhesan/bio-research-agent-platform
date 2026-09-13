@@ -330,8 +330,10 @@ class S3FileStorage(LocalFileStorage):
         prefix: str = 'bio-agent',
         endpoint_url: str | None = None,
         region_name: str | None = None,
+        expected_bucket_owner: str | None = None,
         access_key_id: str | None = None,
         secret_access_key: str | None = None,
+        session_token: str | None = None,
         max_bytes: int = 50 * 1024 * 1024,
         total_quota_bytes: int = 10 * 1024 * 1024 * 1024,
         max_decompressed_bytes: int = 200 * 1024 * 1024,
@@ -357,17 +359,25 @@ class S3FileStorage(LocalFileStorage):
             raise RuntimeError('boto3 is required when STORAGE_BACKEND=s3') from exc
         self.bucket = bucket.strip()
         self.prefix = prefix.strip('/')
+        self.expected_bucket_owner = str(expected_bucket_owner or '').strip() or None
         self.client = client or boto3.client(
             's3',
             endpoint_url=endpoint_url or None,
             region_name=region_name or None,
             aws_access_key_id=access_key_id or os.environ.get('AWS_ACCESS_KEY_ID'),
             aws_secret_access_key=secret_access_key or os.environ.get('AWS_SECRET_ACCESS_KEY'),
+            aws_session_token=session_token or os.environ.get('AWS_SESSION_TOKEN'),
         )
+
+    def _bucket_request(self, **values):
+        request = {'Bucket': self.bucket, **values}
+        if self.expected_bucket_owner:
+            request['ExpectedBucketOwner'] = self.expected_bucket_owner
+        return request
 
     def ping(self):
         super().ping()
-        self.client.head_bucket(Bucket=self.bucket)
+        self.client.head_bucket(**self._bucket_request())
 
     def _object_key(self, file_id, filename):
         parts = [item for item in (self.prefix, file_id, filename) if item]
@@ -391,6 +401,10 @@ class S3FileStorage(LocalFileStorage):
                             (stored.security or {}).get('status', 'unscanned')
                         ),
                     },
+                    **(
+                        {'ExpectedBucketOwner': self.expected_bucket_owner}
+                        if self.expected_bucket_owner else {}
+                    ),
                 },
             )
         except Exception:
@@ -406,8 +420,9 @@ class S3FileStorage(LocalFileStorage):
 
     def _find_remote_object(self, file_id):
         response = self.client.list_objects_v2(
-            Bucket=self.bucket,
-            Prefix=f'{self.prefix}/{file_id}/' if self.prefix else f'{file_id}/',
+            **self._bucket_request(
+                Prefix=f'{self.prefix}/{file_id}/' if self.prefix else f'{file_id}/',
+            ),
         )
         objects = response.get('Contents') or []
         for item in objects:
@@ -427,8 +442,20 @@ class S3FileStorage(LocalFileStorage):
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / filename
         try:
-            head = self.client.head_object(Bucket=self.bucket, Key=storage_key)
-            self.client.download_file(self.bucket, storage_key, str(target))
+            head = self.client.head_object(**self._bucket_request(Key=storage_key))
+            download_args = (
+                {'ExpectedBucketOwner': self.expected_bucket_owner}
+                if self.expected_bucket_owner else None
+            )
+            if download_args:
+                self.client.download_file(
+                    self.bucket,
+                    storage_key,
+                    str(target),
+                    ExtraArgs=download_args,
+                )
+            else:
+                self.client.download_file(self.bucket, storage_key, str(target))
             digest = hashlib.sha256()
             with target.open('rb') as source:
                 for chunk in iter(lambda: source.read(CHUNK_SIZE), b''):

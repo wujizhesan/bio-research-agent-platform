@@ -164,7 +164,7 @@ jobs:
           npx playwright install --with-deps chromium
       - name: Start authenticated API and Redis worker
         env:
-          APP_ENV: production
+          APP_ENV: ci
           CADD_API_TOKEN: ''
           CADD_JWT_SECRET: ci-fullstack-jwt-secret-at-least-32-characters
           CORS_ORIGINS: http://127.0.0.1:4173

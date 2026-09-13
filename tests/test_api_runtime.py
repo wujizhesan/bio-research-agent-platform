@@ -73,6 +73,20 @@ class ApiRuntimeTests(unittest.IsolatedAsyncioTestCase):
                         audit_log=object(),
                     )
 
+    def test_production_rejects_local_storage(self):
+        with tempfile.TemporaryDirectory(prefix='api_runtime_') as raw:
+            values = {'APP_ENV': 'production', 'STORAGE_BACKEND': 'local'}
+            with patch.dict('os.environ', values, clear=False):
+                with self.assertRaisesRegex(ValueError, 'production requires'):
+                    build_api_runtime(
+                        Path(raw),
+                        Path(raw) / 'output',
+                        job_manager=FakeJobs(),
+                        plugin_manager=object(),
+                        database=FakeDatabase(),
+                        audit_log=object(),
+                    )
+
     def test_local_backend_uses_configured_process_isolation(self):
         with tempfile.TemporaryDirectory(prefix='api_runtime_') as raw:
             values = {

@@ -130,6 +130,18 @@ class SupplyChainConfigurationTests(unittest.TestCase):
             "${BACKEND_IMAGE:?required}",
         )
         self.assertEqual(
+            compose["services"]["storage-check"]["image"],
+            "${BACKEND_IMAGE:?required}",
+        )
+        self.assertEqual(
+            compose["services"]["pitr-checkpoint"]["image"],
+            "${BACKEND_IMAGE:?required}",
+        )
+        self.assertEqual(
+            compose["services"]["api"]["environment"]["DATABASE_URL"],
+            "${DATABASE_URL:?required}",
+        )
+        self.assertEqual(
             compose["services"]["plugin-sandbox"]["image"],
             "${BACKEND_IMAGE:?required}",
         )
@@ -161,6 +173,12 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         publisher = compose["services"]["recovery-evidence-publisher"]
         self.assertEqual(publisher["network_mode"], "none")
         self.assertTrue(publisher["read_only"])
+        storage_check = compose["services"]["storage-check"]
+        self.assertEqual(storage_check["profiles"], ["operations"])
+        self.assertTrue(storage_check["read_only"])
+        pitr_checkpoint = compose["services"]["pitr-checkpoint"]
+        self.assertEqual(pitr_checkpoint["profiles"], ["operations"])
+        self.assertTrue(pitr_checkpoint["read_only"])
         self.assertEqual(
             compose["services"]["worker"]["stop_grace_period"],
             "${WORKER_STOP_GRACE_PERIOD:-150s}",
@@ -170,6 +188,8 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn("release-images.previous.env", script)
         self.assertIn('run --rm --no-deps recovery-evidence-publisher', script)
         self.assertIn('run --rm --no-deps recovery-check', script)
+        self.assertIn('run --rm --no-deps storage-check', script)
+        self.assertIn('run --rm --no-deps pitr-checkpoint', script)
         self.assertIn('run --rm migration', script)
         self.assertIn('rolling back to previous image digests', script)
         self.assertIn('RECOVERY_EVIDENCE_PATH=', script)
@@ -177,11 +197,19 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn("source_commit", workflow)
         self.assertIn("X-Expected-Release", script)
         self.assertLess(
+            script.index('run --rm --no-deps storage-check'),
+            script.index('run --rm --no-deps recovery-evidence-publisher'),
+        )
+        self.assertLess(
             script.index('run --rm --no-deps recovery-evidence-publisher'),
             script.index('run --rm --no-deps recovery-check'),
         )
         self.assertLess(
             script.index('run --rm --no-deps recovery-check'),
+            script.index('run --rm --no-deps pitr-checkpoint'),
+        )
+        self.assertLess(
+            script.index('run --rm --no-deps pitr-checkpoint'),
             script.index('run --rm migration'),
         )
         self.assertLess(

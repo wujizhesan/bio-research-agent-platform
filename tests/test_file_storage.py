@@ -35,6 +35,7 @@ class FakeS3Client:
     def __init__(self):
         self.objects = {}
         self.uploads = []
+        self.bucket_owners = []
 
     def upload_file(self, filename, bucket, key, ExtraArgs):
         self.objects[(bucket, key)] = Path(filename).read_bytes()
@@ -56,7 +57,8 @@ class FakeS3Client:
     def download_file(self, bucket, key, filename):
         Path(filename).write_bytes(self.objects[(bucket, key)])
 
-    def head_bucket(self, Bucket):
+    def head_bucket(self, Bucket, ExpectedBucketOwner=None):
+        self.bucket_owners.append(ExpectedBucketOwner)
         return {'Bucket': Bucket}
 
 
@@ -77,6 +79,20 @@ class S3FileStorageTests(unittest.TestCase):
                 self.assertEqual(restored.storage_key, stored.storage_key)
                 self.assertEqual(restored.path.read_bytes(), b'@read1\nACGT\n')
                 self.assertIsNone(storage.ping())
+
+    def test_ping_uses_expected_bucket_owner(self):
+        client = FakeS3Client()
+        fake_boto3 = types.ModuleType('boto3')
+        fake_boto3.client = lambda *_args, **_kwargs: client
+        with tempfile.TemporaryDirectory(prefix='s3_storage_') as raw:
+            with mock.patch.dict(sys.modules, {'boto3': fake_boto3}):
+                storage = S3FileStorage(
+                    Path(raw) / 'uploads',
+                    bucket='bio-test',
+                    expected_bucket_owner='123456789012',
+                )
+                storage.ping()
+        self.assertEqual(client.bucket_owners, ['123456789012'])
 
 
 class LocalFileStorageSecurityTests(unittest.TestCase):

@@ -21,8 +21,18 @@ class DeployTransactionTests(unittest.TestCase):
             "\n".join(
                 [
                     "POSTGRES_PASSWORD=production-password",
+                    "APP_ENV=production",
                     f"CADD_JWT_SECRET={'a' * 32}",
                     f"PLUGIN_SANDBOX_TOKEN={'b' * 32}",
+                    "DATABASE_URL=postgresql+asyncpg://app:secret@postgres.example:5432/bioagent",
+                    "PITR_DATABASE_URL=postgresql://backup:secret@postgres.example:5432/bioagent",
+                    "STORAGE_BACKEND=s3",
+                    "S3_BUCKET=bioagent-production",
+                    "S3_REGION=us-east-1",
+                    "S3_ENDPOINT_URL=https://s3.us-east-1.amazonaws.com",
+                    "S3_EXPECTED_BUCKET_OWNER=123456789012",
+                    "S3_BACKUP_ROLE_ARN=arn:aws:iam::123456789012:role/bioagent-backup",
+                    "PITR_CHECKPOINT_TIMEOUT_SECONDS=60",
                     "RECOVERY_EVIDENCE_PATH=/var/lib/bioagent/latest-production.json",
                     "RECOVERY_EVIDENCE_DIRECTORY=/var/lib/bioagent",
                     "RECOVERY_BACKUP_MANIFEST_PATH=/var/lib/bioagent/latest-backup.json",
@@ -101,10 +111,24 @@ exit "${CURL_EXIT:-0}"
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse((deploy / "release-images.next.env").exists())
             self.assertIn("next-backend", (deploy / "release-images.env").read_text())
-            recovery = next(i for i, line in enumerate(commands) if "recovery-check" in line)
+            storage = next(
+                i for i, line in enumerate(commands)
+                if "run --rm --no-deps storage-check" in line
+            )
+            recovery = next(
+                i for i, line in enumerate(commands)
+                if "run --rm --no-deps recovery-check" in line
+            )
+            pitr = next(
+                i for i, line in enumerate(commands)
+                if "run --rm --no-deps pitr-checkpoint" in line
+            )
             migration = next(i for i, line in enumerate(commands) if "run --rm migration" in line)
             rollout = next(i for i, line in enumerate(commands) if " up -d " in line)
             health = next(i for i, line in enumerate(commands) if line.startswith("curl "))
+            self.assertLess(storage, recovery)
+            self.assertLess(recovery, pitr)
+            self.assertLess(pitr, migration)
             self.assertLess(recovery, migration)
             self.assertLess(migration, rollout)
             self.assertLess(rollout, health)
@@ -134,6 +158,51 @@ exit "${CURL_EXIT:-0}"
             self.assertEqual(result.returncode, 1)
             self.assertIn("no previous image set exists", result.stderr)
             self.assertFalse((deploy / "release-images.env").exists())
+
+    def test_rejects_local_storage_before_running_compose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory)
+            environment_path = deploy / ".env.production"
+            environment_path.write_text(
+                environment_path.read_text(encoding="utf-8").replace(
+                    "STORAGE_BACKEND=s3",
+                    "STORAGE_BACKEND=local",
+                ),
+                encoding="utf-8",
+            )
+            result = self.run_deploy(deploy, environment)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(log.exists())
+
+    def test_rejects_local_database_before_running_compose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory)
+            environment_path = deploy / ".env.production"
+            environment_path.write_text(
+                environment_path.read_text(encoding="utf-8").replace(
+                    "postgres.example:5432",
+                    "db:5432",
+                ),
+                encoding="utf-8",
+            )
+            result = self.run_deploy(deploy, environment)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(log.exists())
+
+    def test_rejects_default_database_password_before_running_compose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory)
+            environment_path = deploy / ".env.production"
+            environment_path.write_text(
+                environment_path.read_text(encoding="utf-8").replace(
+                    "POSTGRES_PASSWORD=production-password",
+                    "POSTGRES_PASSWORD=bioagent-dev-password",
+                ),
+                encoding="utf-8",
+            )
+            result = self.run_deploy(deploy, environment)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(log.exists())
 
 
 if __name__ == "__main__":

@@ -82,6 +82,9 @@ def _build_storage(project_root, output_root, file_storage):
     configured_backend = os.environ.get('STORAGE_BACKEND', 'local').strip().lower()
     if file_storage is not None:
         return file_storage, getattr(file_storage, 'backend', configured_backend)
+    if os.environ.get('APP_ENV', 'development').strip().lower() == 'production':
+        if configured_backend != 's3':
+            raise ValueError('production requires STORAGE_BACKEND=s3')
     configured_root = os.environ.get('UPLOAD_ROOT')
     upload_root = Path(configured_root) if configured_root else output_root / 'uploads'
     if not upload_root.is_absolute():
@@ -112,8 +115,10 @@ def _build_storage(project_root, output_root, file_storage):
             prefix=os.environ.get('S3_PREFIX', 'bio-agent'),
             endpoint_url=os.environ.get('S3_ENDPOINT_URL') or None,
             region_name=os.environ.get('S3_REGION') or None,
+            expected_bucket_owner=os.environ.get('S3_EXPECTED_BUCKET_OWNER') or None,
             access_key_id=os.environ.get('AWS_ACCESS_KEY_ID') or None,
             secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY') or None,
+            session_token=os.environ.get('AWS_SESSION_TOKEN') or None,
             **storage_limits,
         )
     else:

@@ -34,7 +34,7 @@ services:
       redis:
         condition: service_healthy
     environment:
-      APP_ENV: production
+      APP_ENV: ${APP_ENV:-development}
       APP_RELEASE_TAG: ${RELEASE_TAG:-development}
       APP_GIT_SHA: ${GIT_SHA:-unknown}
       APP_IMAGE_REFERENCE: ${BACKEND_IMAGE:-unknown}
@@ -62,8 +62,10 @@ services:
       S3_PREFIX: ${S3_PREFIX:-bio-agent}
       S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
       S3_REGION: ${S3_REGION:-}
+      S3_EXPECTED_BUCKET_OWNER: ${S3_EXPECTED_BUCKET_OWNER:-}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
       AUTO_CREATE_SCHEMA: "false"
       JOB_BACKEND: ${JOB_BACKEND:-redis}
       JOB_EXECUTION_MODE: ${JOB_EXECUTION_MODE:-process}
@@ -129,6 +131,57 @@ services:
     security_opt:
       - no-new-privileges:true
     command: ["alembic", "upgrade", "head"]
+
+  storage-check:
+    profiles: ["operations"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    environment:
+      RUN_MIGRATIONS: "false"
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      S3_REGION: ${S3_REGION:-}
+      S3_EXPECTED_BUCKET_OWNER: ${S3_EXPECTED_BUCKET_OWNER:-}
+      S3_BACKUP_ROLE_ARN: ${S3_BACKUP_ROLE_ARN:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    command: ["python", "scripts/verify_s3_durability.py"]
+
+  pitr-checkpoint:
+    profiles: ["operations"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    environment:
+      RUN_MIGRATIONS: "false"
+      PITR_DATABASE_URL: ${PITR_DATABASE_URL:-}
+      RELEASE_TAG: ${RELEASE_TAG:-development}
+      PITR_CHECKPOINT_TIMEOUT_SECONDS: ${PITR_CHECKPOINT_TIMEOUT_SECONDS:-60}
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ${RECOVERY_EVIDENCE_DIRECTORY:-./output/recovery}:/run/output:rw
+    command:
+      - python
+      - scripts/create_pitr_checkpoint.py
+      - --output
+      - /run/output/pre-migration-pitr.json
 
   recovery-check:
     profiles: ["operations"]
@@ -248,8 +301,10 @@ services:
       S3_PREFIX: ${S3_PREFIX:-bio-agent}
       S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
       S3_REGION: ${S3_REGION:-}
+      S3_EXPECTED_BUCKET_OWNER: ${S3_EXPECTED_BUCKET_OWNER:-}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
       RUN_MIGRATIONS: "false"
       AUTO_CREATE_SCHEMA: "false"
       STATE_WRITER_BATCH_SIZE: ${STATE_WRITER_BATCH_SIZE:-50}
