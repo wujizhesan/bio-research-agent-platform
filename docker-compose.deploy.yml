@@ -7,6 +7,14 @@ services:
     image: ${BACKEND_IMAGE:?required}
     pull_policy: always
 
+  migration:
+    image: ${BACKEND_IMAGE:?required}
+    pull_policy: always
+
+  recovery-check:
+    image: ${BACKEND_IMAGE:?required}
+    pull_policy: always
+
   web:
     image: ${FRONTEND_IMAGE:?required}
     pull_policy: always
