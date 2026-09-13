@@ -4,6 +4,7 @@ services:
       clamav:
         condition: service_healthy
     environment:
+      RUN_MIGRATIONS: "false"
       FILE_SECURITY_MODE: required
       FILE_CDR_MODE: normalize
       CLAMAV_HOST: clamav

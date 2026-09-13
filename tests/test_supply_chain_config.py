@@ -114,10 +114,54 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertEqual(compose["services"]["api"]["image"], "${BACKEND_IMAGE:?required}")
         self.assertEqual(compose["services"]["worker"]["image"], "${BACKEND_IMAGE:?required}")
         self.assertEqual(
+            compose["services"]["migration"]["image"],
+            "${BACKEND_IMAGE:?required}",
+        )
+        self.assertEqual(
+            compose["services"]["recovery-check"]["image"],
+            "${BACKEND_IMAGE:?required}",
+        )
+        self.assertEqual(
             compose["services"]["plugin-sandbox"]["image"],
             "${BACKEND_IMAGE:?required}",
         )
         self.assertEqual(compose["services"]["web"]["image"], "${FRONTEND_IMAGE:?required}")
+
+    def test_production_deployment_is_gated_and_rolls_back_images(self):
+        workflow = (ROOT / ".github" / "workflows" / "deploy-production.yml").read_text(
+            encoding="utf-8"
+        )
+        secure_compose = yaml.safe_load(
+            (ROOT / "docker-compose.secure.yml").read_text(encoding="utf-8")
+        )
+        compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+        self.assertEqual(
+            secure_compose["services"]["api"]["environment"]["RUN_MIGRATIONS"],
+            "false",
+        )
+        self.assertEqual(compose["services"]["migration"]["profiles"], ["operations"])
+        self.assertEqual(
+            compose["services"]["migration"]["command"],
+            ["alembic", "upgrade", "head"],
+        )
+        recovery = compose["services"]["recovery-check"]
+        self.assertEqual(recovery["profiles"], ["operations"])
+        self.assertEqual(recovery["network_mode"], "none")
+        self.assertTrue(recovery["read_only"])
+        self.assertIn("release-images.next.env", workflow)
+        self.assertIn("release-images.previous.env", workflow)
+        self.assertIn('run --rm --no-deps recovery-check', workflow)
+        self.assertIn('run --rm migration', workflow)
+        self.assertIn('rolling back to previous image digests', workflow)
+        self.assertIn('RECOVERY_EVIDENCE_PATH=', workflow)
+        self.assertLess(
+            workflow.index('run --rm --no-deps recovery-check'),
+            workflow.index('run --rm migration'),
+        )
+        self.assertLess(
+            workflow.index('run --rm migration'),
+            workflow.index('up -d --no-build --remove-orphans'),
+        )
 
     def test_recovery_drill_restores_durable_state_and_discards_redis(self):
         workflow = (

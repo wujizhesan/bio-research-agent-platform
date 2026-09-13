@@ -105,6 +105,55 @@ services:
       timeout: 3s
       retries: 20
 
+  migration:
+    profiles: ["operations"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}
+      AUTO_CREATE_SCHEMA: "false"
+      RUN_MIGRATIONS: "false"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    command: ["alembic", "upgrade", "head"]
+
+  recovery-check:
+    profiles: ["operations"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    environment:
+      RUN_MIGRATIONS: "false"
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ${RECOVERY_EVIDENCE_PATH:-./output/recovery/latest-production.json}:/run/recovery/evidence.json:ro
+    command:
+      - python
+      - scripts/verify_recovery_point.py
+      - --evidence
+      - /run/recovery/evidence.json
+      - --max-recovery-point-age-seconds
+      - ${RECOVERY_POINT_MAX_AGE_SECONDS:-900}
+      - --max-verification-age-seconds
+      - ${RECOVERY_VERIFICATION_MAX_AGE_SECONDS:-604800}
+
   worker:
     build:
       context: .
