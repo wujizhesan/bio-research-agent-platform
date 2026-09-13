@@ -4,6 +4,7 @@
 .chainlit
 .files
 .playwright-cli
+frontend
 __pycache__
 *.pyc
 output

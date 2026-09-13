@@ -16,6 +16,7 @@ ARG APP_UID=1000
 ARG APP_GID=1000
 
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends hisat2 samtools bcftools subread fastqc multiqc \
     && if [ "$INSTALL_DESEQ2" = "1" ]; then \
          apt-get install -y --no-install-recommends r-base r-bioc-deseq2; \

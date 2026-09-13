@@ -49,7 +49,10 @@ class SupplyChainConfigurationTests(unittest.TestCase):
 
     def test_backend_image_uses_unprivileged_runtime_user(self):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
         self.assertRegex(dockerfile, r"(?m)^USER bioagent$")
+        self.assertIn("apt-get upgrade -y", dockerfile)
+        self.assertIn("frontend", dockerignore)
 
     def test_dependabot_covers_all_dependency_sources(self):
         configuration = yaml.safe_load(
