@@ -1,8 +1,9 @@
+import hashlib
 import os
-from pathlib import Path
-from threading import Event
 import tempfile
 import unittest
+from pathlib import Path
+from threading import Event
 from unittest.mock import Mock, patch
 
 import yaml
@@ -14,7 +15,7 @@ from src.job_execution import (
 )
 from src.plugin_container import ContainerToolExecutor
 from src.plugin_sandbox_server import SandboxRuntime, create_server
-
+from src.storage_workspace import S3ObjectReference
 
 TOKEN = 'test-plugin-sandbox-token-0000000000000000'
 
@@ -80,6 +81,53 @@ class PluginContainerTests(unittest.TestCase):
         finally:
             released.set()
             executor.shutdown()
+
+    def test_container_executor_materializes_input_for_sandbox_and_cleans_workspace(self):
+        content = b'gene,value\nTP53,12\n'
+        digest = hashlib.sha256(content).hexdigest()
+        observed = {}
+
+        class Client:
+            def head_object(self, **_request):
+                return {
+                    'VersionId': 'version-1',
+                    'ContentLength': len(content),
+                    'Metadata': {'sha256': digest},
+                }
+
+            def download_file(self, _bucket, _key, filename, ExtraArgs=None):
+                Path(filename).write_bytes(content)
+
+        def transport(_path, payload, _timeout):
+            input_path = Path(payload['arguments']['input_path'])
+            observed['path'] = input_path
+            observed['content'] = input_path.read_bytes()
+            return {'ok': True, 'result': {'status': 'ok'}}
+
+        reference = S3ObjectReference(
+            'bio-test',
+            'research/file/expression.csv',
+            'version-1',
+            digest,
+            len(content),
+        ).serialize()
+        with tempfile.TemporaryDirectory(prefix='container_inputs_') as raw:
+            executor = ContainerToolExecutor(
+                'http://plugin-sandbox:8081',
+                TOKEN,
+                limits=self.limits(),
+                transport=transport,
+                input_workspace_root=raw,
+                storage_client=Client(),
+            )
+            try:
+                with patch.dict(os.environ, {'S3_BUCKET': 'bio-test', 'S3_PREFIX': 'research'}):
+                    executor.execute('demo_run', {'input_path': reference})
+            finally:
+                executor.shutdown()
+            self.assertEqual(list(Path(raw).iterdir()), [])
+        self.assertEqual(observed['content'], content)
+        self.assertFalse(observed['path'].exists())
 
     def test_environment_selects_container_executor(self):
         values = {
@@ -147,6 +195,10 @@ class PluginContainerTests(unittest.TestCase):
         self.assertEqual(
             services['worker']['environment']['JOB_EXECUTION_MODE'],
             'container',
+        )
+        self.assertEqual(
+            services['worker']['environment']['JOB_INPUT_WORKSPACE_ROOT'],
+            '/app/output/.job-inputs',
         )
         self.assertNotIn('ports', services['clamav'])
         self.assertTrue(compose['networks']['malware_scan']['internal'])

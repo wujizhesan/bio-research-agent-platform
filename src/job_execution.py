@@ -1,12 +1,12 @@
 """Isolated execution for research tools."""
 
-from dataclasses import dataclass
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 from threading import Event, Lock
 from time import monotonic, sleep
 
@@ -18,6 +18,7 @@ try:
         log_event,
     )
     from .run_context import current_run_context
+    from .storage_workspace import materialize_storage_references
 except ImportError:
     from observability import (
         TOOL_DURATION,
@@ -26,6 +27,7 @@ except ImportError:
         log_event,
     )
     from run_context import current_run_context
+    from storage_workspace import materialize_storage_references
 
 
 class JobExecutionError(RuntimeError):
@@ -127,15 +129,24 @@ class ExecutionLimits:
 class InlineToolExecutor:
     mode = 'inline'
 
-    def __init__(self, runner):
+    def __init__(self, runner, storage_client=None):
         self.runner = runner
+        self.storage_client = storage_client
 
     def execute(self, tool, arguments, *, cancelled=None, heartbeat=None):
         if cancelled and cancelled():
             raise JobExecutionCancelled('job cancelled by user')
         if heartbeat:
             heartbeat()
-        result = self.runner(tool, arguments)
+        with tempfile.TemporaryDirectory(
+            prefix='bio_agent_job_', ignore_cleanup_errors=True
+        ) as raw:
+            resolved_arguments = materialize_storage_references(
+                arguments,
+                Path(raw) / 'inputs',
+                client=self.storage_client,
+            )
+            result = self.runner(tool, resolved_arguments)
         if cancelled and cancelled():
             raise JobExecutionCancelled('job cancelled by user')
         return result
@@ -219,11 +230,19 @@ class _WindowsJob:
 class ProcessToolExecutor:
     mode = 'process'
 
-    def __init__(self, limits=None, python_executable=None, runner_path=None, popen_factory=None):
+    def __init__(
+        self,
+        limits=None,
+        python_executable=None,
+        runner_path=None,
+        popen_factory=None,
+        storage_client=None,
+    ):
         self.limits = limits or ExecutionLimits.from_env()
         self.python_executable = python_executable or sys.executable
         self.runner_path = Path(runner_path or Path(__file__).with_name('job_subprocess.py'))
         self.popen_factory = popen_factory or subprocess.Popen
+        self.storage_client = storage_client
         self._shutdown = Event()
         self._process_lock = Lock()
         self._active_processes = set()
@@ -249,11 +268,16 @@ class ProcessToolExecutor:
             response_path = root / 'response.json'
             error_path = root / 'stderr.log'
             child_environment = _sandbox_environment(tool, root)
+            resolved_arguments = materialize_storage_references(
+                arguments,
+                root / 'inputs',
+                client=self.storage_client,
+            )
             request_path.write_text(
                 json.dumps(
                     {
                         'tool': tool,
-                        'arguments': arguments,
+                        'arguments': resolved_arguments,
                         'limits': self.limits.as_dict(),
                         'observability': current_context(),
                         'run_context': current_run_context(as_dict=True),

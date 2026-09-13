@@ -1,7 +1,7 @@
-import os
 import asyncio
 import gzip
 import json
+import os
 import shutil
 import tempfile
 import time
@@ -11,11 +11,11 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
+import src.fastapi_app as fastapi_module
 from src.audit_log import AuditLogger
 from src.database import Database
-from src.file_storage import LocalFileStorage
 from src.fastapi_app import create_app
-import src.fastapi_app as fastapi_module
+from src.file_storage import LocalFileStorage, StoredFile
 from src.job_manager import JobManager
 from src.plugin_manager import PluginManager
 
@@ -812,6 +812,50 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(downloaded.content, content)
                     self.assertEqual(downloaded.headers['x-file-sha256'], uploaded['sha256'])
                     self.assertIn('expression.csv', downloaded.headers['content-disposition'])
+            finally:
+                self._close_app(app)
+
+    def test_remote_file_download_forwards_reference_and_releases_workspace(self):
+        class RemoteStorage(LocalFileStorage):
+            backend = 's3'
+
+            def __init__(self, root):
+                super().__init__(root)
+                self.reference = None
+                self.materialized_path = None
+
+            def get(self, file_id, reference=None):
+                self.reference = reference
+                directory = self.root / '.downloads' / file_id
+                directory.mkdir(parents=True)
+                self.materialized_path = directory / 'expression.csv'
+                self.materialized_path.write_bytes(b'gene,value\nTP53,12\n')
+                return StoredFile(
+                    file_id=file_id,
+                    filename='expression.csv',
+                    content_type='text/csv',
+                    size_bytes=self.materialized_path.stat().st_size,
+                    sha256='a' * 64,
+                    path=self.materialized_path,
+                    version_id='version-1',
+                )
+
+            def release(self, stored):
+                stored.path.unlink(missing_ok=True)
+
+        with tempfile.TemporaryDirectory(prefix='fastapi_remote_file_') as raw:
+            storage = RemoteStorage(Path(raw) / 'uploads')
+            app = self._app(raw, storage)
+            try:
+                with TestClient(app) as client:
+                    response = client.get(
+                        f'/api/v1/files/{"a" * 32}',
+                        params={'storage_reference': 'bio+s3://bucket/key'},
+                    )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(storage.reference, 'bio+s3://bucket/key')
+                self.assertEqual(response.headers['x-file-version'], 'version-1')
+                self.assertFalse(storage.materialized_path.exists())
             finally:
                 self._close_app(app)
 

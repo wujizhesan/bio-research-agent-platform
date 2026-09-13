@@ -1,10 +1,10 @@
 import asyncio
 import gzip
-from pathlib import Path
 import sys
 import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from src.file_security import (
@@ -15,6 +15,7 @@ from src.file_security import (
     build_file_security_pipeline_from_env,
 )
 from src.file_storage import LocalFileStorage, S3FileStorage
+from src.storage_workspace import StorageIntegrityError, materialize_storage_references
 
 
 class Upload:
@@ -38,10 +39,15 @@ class FakeS3Client:
         self.bucket_owners = []
 
     def upload_file(self, filename, bucket, key, ExtraArgs):
-        self.objects[(bucket, key)] = Path(filename).read_bytes()
+        self.objects[(bucket, key)] = {
+            'content': Path(filename).read_bytes(),
+            'content_type': ExtraArgs['ContentType'],
+            'metadata': ExtraArgs['Metadata'],
+            'version_id': 'version-1',
+        }
         self.uploads.append((bucket, key, ExtraArgs))
 
-    def list_objects_v2(self, Bucket, Prefix):
+    def list_objects_v2(self, Bucket, Prefix, ExpectedBucketOwner=None):
         return {
             'Contents': [
                 {'Key': key}
@@ -50,12 +56,22 @@ class FakeS3Client:
             ]
         }
 
-    def head_object(self, Bucket, Key):
-        content = self.objects[(Bucket, Key)]
-        return {'ContentType': 'text/plain', 'ContentLength': len(content), 'Metadata': {}}
+    def head_object(self, Bucket, Key, VersionId=None, ExpectedBucketOwner=None):
+        item = self.objects[(Bucket, Key)]
+        if VersionId is not None and VersionId != item['version_id']:
+            raise KeyError(VersionId)
+        return {
+            'ContentType': item['content_type'],
+            'ContentLength': len(item['content']),
+            'Metadata': item['metadata'],
+            'VersionId': item['version_id'],
+        }
 
-    def download_file(self, bucket, key, filename):
-        Path(filename).write_bytes(self.objects[(bucket, key)])
+    def download_file(self, bucket, key, filename, ExtraArgs=None):
+        item = self.objects[(bucket, key)]
+        if ExtraArgs and ExtraArgs.get('VersionId') != item['version_id']:
+            raise KeyError(ExtraArgs['VersionId'])
+        Path(filename).write_bytes(item['content'])
 
     def head_bucket(self, Bucket, ExpectedBucketOwner=None):
         self.bucket_owners.append(ExpectedBucketOwner)
@@ -72,13 +88,55 @@ class S3FileStorageTests(unittest.TestCase):
                 storage = S3FileStorage(Path(raw) / 'uploads', bucket='bio-test', prefix='research')
                 stored = asyncio.run(storage.save(Upload(b'@read1\nACGT\n')))
                 self.assertEqual(stored.storage_key, f'research/{stored.file_id}/reads.fastq')
+                self.assertEqual(stored.version_id, 'version-1')
                 self.assertEqual(client.uploads[0][0:2], ('bio-test', stored.storage_key))
-                stored.path.unlink()
+                self.assertFalse(stored.path.exists())
+                payload = storage.payload(stored, raw, f'/api/v1/files/{stored.file_id}')
+                self.assertTrue(payload['path'].startswith('bio+s3://bio-test/'))
+                self.assertIn('storage_reference=', payload['download_url'])
                 stored.path.parent.joinpath('metadata.json').unlink()
-                restored = asyncio.run(storage.aget(stored.file_id))
+                restored = asyncio.run(storage.aget(
+                    stored.file_id,
+                    reference=payload['path'],
+                ))
                 self.assertEqual(restored.storage_key, stored.storage_key)
                 self.assertEqual(restored.path.read_bytes(), b'@read1\nACGT\n')
+                storage.release(restored)
+                self.assertFalse(restored.path.exists())
                 self.assertIsNone(storage.ping())
+
+    def test_materialization_is_version_locked_and_reuses_duplicate_reference(self):
+        client = FakeS3Client()
+        fake_boto3 = types.ModuleType('boto3')
+        fake_boto3.client = lambda *_args, **_kwargs: client
+        with tempfile.TemporaryDirectory(prefix='s3_materialize_') as raw:
+            with mock.patch.dict(sys.modules, {'boto3': fake_boto3}):
+                storage = S3FileStorage(Path(raw) / 'uploads', bucket='bio-test', prefix='research')
+                stored = asyncio.run(storage.save(Upload(b'@read1\nACGT\n')))
+                reference = storage.payload(stored, raw, '/download')['path']
+                resolved = materialize_storage_references(
+                    {'first': reference, 'nested': [reference]},
+                    Path(raw) / 'job',
+                    client=client,
+                    configured_bucket='bio-test',
+                    configured_prefix='research',
+                )
+                self.assertEqual(resolved['first'], resolved['nested'][0])
+                self.assertEqual(Path(resolved['first']).read_bytes(), b'@read1\nACGT\n')
+
+    def test_download_rejects_tampered_object_content(self):
+        client = FakeS3Client()
+        fake_boto3 = types.ModuleType('boto3')
+        fake_boto3.client = lambda *_args, **_kwargs: client
+        with tempfile.TemporaryDirectory(prefix='s3_integrity_') as raw:
+            with mock.patch.dict(sys.modules, {'boto3': fake_boto3}):
+                storage = S3FileStorage(Path(raw) / 'uploads', bucket='bio-test', prefix='research')
+                stored = asyncio.run(storage.save(Upload(b'@read1\nACGT\n')))
+                client.objects[('bio-test', stored.storage_key)]['content'] = b'@read1\nTGCA\n'
+                with self.assertRaisesRegex(StorageIntegrityError, 'checksum'):
+                    storage.get(stored.file_id)
+                downloads = storage.root / '.downloads'
+                self.assertFalse(downloads.exists() and any(downloads.iterdir()))
 
     def test_ping_uses_expected_bucket_owner(self):
         client = FakeS3Client()

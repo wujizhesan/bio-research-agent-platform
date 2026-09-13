@@ -1,8 +1,9 @@
 """Remote container executor for isolated scientific tool execution."""
 
-from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event, Lock
 from time import monotonic, sleep
@@ -19,6 +20,7 @@ try:
     )
     from .observability import current_context, log_event
     from .run_context import current_run_context
+    from .storage_workspace import materialize_storage_references
 except ImportError:
     from job_execution import (
         ExecutionLimits,
@@ -28,6 +30,7 @@ except ImportError:
     )
     from observability import current_context, log_event
     from run_context import current_run_context
+    from storage_workspace import materialize_storage_references
 
 
 class ContainerToolExecutor:
@@ -40,6 +43,8 @@ class ContainerToolExecutor:
         limits=None,
         transport=None,
         max_concurrency=8,
+        input_workspace_root=None,
+        storage_client=None,
     ):
         if not base_url or not str(base_url).strip():
             raise ValueError('PLUGIN_SANDBOX_URL is required')
@@ -49,6 +54,11 @@ class ContainerToolExecutor:
         self.token = str(token)
         self.limits = limits or ExecutionLimits.from_env()
         self.transport = transport or self._http_transport
+        self.input_workspace_root = Path(
+            input_workspace_root
+            or os.environ.get('JOB_INPUT_WORKSPACE_ROOT', 'output/.job-inputs')
+        ).resolve()
+        self.storage_client = storage_client
         self._pool = ThreadPoolExecutor(max_workers=max(int(max_concurrency), 1))
         self._shutdown = Event()
         self._active = set()
@@ -97,6 +107,25 @@ class ContainerToolExecutor:
             return
 
     def execute(self, tool, arguments, *, cancelled=None, heartbeat=None):
+        self.input_workspace_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix='bio_agent_container_',
+            dir=self.input_workspace_root,
+            ignore_cleanup_errors=True,
+        ) as raw:
+            resolved_arguments = materialize_storage_references(
+                arguments,
+                Path(raw) / 'inputs',
+                client=self.storage_client,
+            )
+            return self._execute_resolved(
+                tool,
+                resolved_arguments,
+                cancelled=cancelled,
+                heartbeat=heartbeat,
+            )
+
+    def _execute_resolved(self, tool, arguments, *, cancelled=None, heartbeat=None):
         if self._shutdown.is_set():
             raise JobExecutionCancelled('tool executor is shutting down')
         request_id = uuid4().hex
@@ -176,4 +205,5 @@ def container_tool_executor_from_env():
         token,
         limits=ExecutionLimits.from_env(),
         max_concurrency=int(os.environ.get('PLUGIN_SANDBOX_CLIENT_CONCURRENCY', '8')),
+        input_workspace_root=os.environ.get('JOB_INPUT_WORKSPACE_ROOT') or None,
     )

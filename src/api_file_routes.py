@@ -4,15 +4,18 @@ from datetime import datetime, timezone
 
 from fastapi import Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 
 try:
     from .api_server import list_run_manifests
     from .auth import Principal
     from .observability import FILE_OPERATIONS, FILE_UPLOAD_BYTES
+    from .storage_workspace import StorageIntegrityError
 except ImportError:
     from api_server import list_run_manifests
     from auth import Principal
     from observability import FILE_OPERATIONS, FILE_UPLOAD_BYTES
+    from storage_workspace import StorageIntegrityError
 
 
 def register_file_routes(
@@ -118,6 +121,7 @@ def register_file_routes(
     @app.get('/api/v1/files/{file_id}', tags=['files'])
     async def download_file(
         file_id: str,
+        storage_reference: str | None = Query(default=None, max_length=4096),
         principal: Principal = Depends(require_permission('files:read')),
     ):
         project_id = await database.get_file_project(file_id)
@@ -129,7 +133,10 @@ def register_file_routes(
             )
         try:
             async_get = getattr(storage, 'aget', None)
-            stored = await async_get(file_id) if async_get else storage.get(file_id)
+            stored = (
+                await async_get(file_id, reference=storage_reference)
+                if async_get else storage.get(file_id, reference=storage_reference)
+            )
         except FileNotFoundError as exc:
             FILE_OPERATIONS.labels(
                 app.state.storage_backend,
@@ -139,6 +146,16 @@ def register_file_routes(
             raise HTTPException(
                 status_code=404,
                 detail=f'file not found: {file_id}',
+            ) from exc
+        except StorageIntegrityError as exc:
+            FILE_OPERATIONS.labels(
+                app.state.storage_backend,
+                'download',
+                'integrity_error',
+            ).inc()
+            raise HTTPException(
+                status_code=502,
+                detail='stored file failed integrity verification',
             ) from exc
         except Exception:
             FILE_OPERATIONS.labels(
@@ -159,11 +176,19 @@ def register_file_routes(
             file_id,
             {'filename': stored.filename},
         )
+        release = getattr(storage, 'release', None)
         return FileResponse(
             stored.path,
             media_type=stored.content_type,
             filename=stored.filename,
-            headers={'X-File-SHA256': stored.sha256},
+            headers={
+                'X-File-SHA256': stored.sha256,
+                **(
+                    {'X-File-Version': stored.version_id}
+                    if stored.version_id else {}
+                ),
+            },
+            background=BackgroundTask(release, stored) if release else None,
         )
 
     return runs, upload_file, download_file
