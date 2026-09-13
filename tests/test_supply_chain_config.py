@@ -124,7 +124,14 @@ class SupplyChainConfigurationTests(unittest.TestCase):
             ROOT / ".github" / "workflows" / "recovery-drill.yml"
         ).read_text(encoding="utf-8")
         script = (ROOT / "scripts" / "recovery_drill.py").read_text(encoding="utf-8")
+        self.assertIn("pull_request:", workflow)
         self.assertIn('cron: "37 2 * * 0"', workflow)
+        self.assertIn("--max-rpo-seconds 900", workflow)
+        self.assertIn("--max-rto-seconds 60", workflow)
+        self.assertIn("Capture recovery failure diagnostics", workflow)
+        self.assertIn("logs --no-color --timestamps", workflow)
+        self.assertIn("Clean up isolated recovery services", workflow)
+        self.assertIn("Publish recovery summary", workflow)
         self.assertIn("--volumes", script)
         self.assertIn("pg_dump", script)
         self.assertIn("pg_restore", script)
@@ -133,6 +140,9 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn("restore_objects", script)
         self.assertIn('"backed_up": False', script)
         self.assertIn("verify_redis_is_disposable", script)
+        self.assertIn('metrics["simulated_rpo_seconds"]', script)
+        self.assertIn('metrics["rto_seconds"]', script)
+        self.assertIn('backup_dir / "failure.json"', script)
 
     def test_third_party_image_vulnerabilities_use_expiring_baselines(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")

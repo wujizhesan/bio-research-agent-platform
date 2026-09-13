@@ -44,6 +44,36 @@ def digest_file(path):
     return digest.hexdigest()
 
 
+def rounded_seconds(started):
+    return round(time.monotonic() - started, 3)
+
+
+def write_json(path, payload):
+    Path(path).write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def write_summary(backup_dir, payload):
+    metrics = payload.get("metrics", {})
+    lines = [
+        "## Recovery drill",
+        "",
+        f"- Status: `{payload['status']}`",
+        f"- Stage: `{payload.get('stage', 'completed')}`",
+        f"- Simulated RPO: `{metrics.get('simulated_rpo_seconds', 'n/a')}s`",
+        f"- RTO: `{metrics.get('rto_seconds', 'n/a')}s`",
+        f"- Total: `{metrics.get('total_seconds', 'n/a')}s`",
+    ]
+    if payload.get("error"):
+        lines.append(f"- Error: `{payload['error_type']}: {payload['error']}`")
+    (backup_dir / "summary.md").write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+
+
 def compose_command(project, *arguments):
     return [
         "docker",
@@ -391,12 +421,20 @@ def verify_redis_is_disposable(args):
 def execute(args):
     if not re.fullmatch(r"bio-recovery-[a-z0-9-]+", args.project):
         raise ValueError("recovery project must use the bio-recovery- prefix")
-    started = time.monotonic()
     backup_dir = Path(args.output).resolve()
     backup_dir.mkdir(parents=True, exist_ok=True)
+    for filename in ("compose.log", "failure.json", "report.json", "summary.md"):
+        (backup_dir / filename).unlink(missing_ok=True)
+    started = time.monotonic()
+    stage = "service_start"
+    metrics = {}
     environment = recovery_environment(args)
-    run(compose_command(args.project, "up", "--detach", "--wait"), env=environment)
     try:
+        stage_started = time.monotonic()
+        run(compose_command(args.project, "up", "--detach", "--wait"), env=environment)
+        metrics["service_start_seconds"] = rounded_seconds(stage_started)
+        stage = "seed"
+        stage_started = time.monotonic()
         run(
             [sys.executable, "-m", "alembic", "upgrade", SOURCE_REVISION],
             env=environment,
@@ -404,8 +442,13 @@ def execute(args):
         asyncio.run(seed_database(args))
         seed_object_storage(args)
         seed_redis(args)
+        metrics["seed_seconds"] = rounded_seconds(stage_started)
+        stage = "backup"
+        stage_started = time.monotonic()
+        recovery_point_at = datetime.now(timezone.utc)
         dump_path = backup_database(args, backup_dir)
         object_entries = backup_objects(args, backup_dir)
+        metrics["backup_seconds"] = rounded_seconds(stage_started)
         manifest = {
             "schema_version": 1,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -417,38 +460,88 @@ def execute(args):
             "objects": object_entries,
             "redis": {"backed_up": False, "reason": "disposable queue and cache"},
         }
-        manifest_path = backup_dir / "manifest.json"
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        write_json(backup_dir / "manifest.json", manifest)
+        stage = "destruction"
+        stage_started = time.monotonic()
+        incident_at = datetime.now(timezone.utc)
+        incident_started = time.monotonic()
         destroy_state(args)
         asyncio.run(assert_destroyed(args))
+        metrics["destruction_seconds"] = rounded_seconds(stage_started)
         if digest_file(dump_path) != manifest["database"]["sha256"]:
             raise RuntimeError("database backup checksum mismatch")
+        stage = "restore"
+        stage_started = time.monotonic()
         restore_database(args, dump_path)
         restore_objects(args, backup_dir, object_entries)
+        metrics["restore_seconds"] = rounded_seconds(stage_started)
+        stage = "migration"
+        stage_started = time.monotonic()
         run([sys.executable, "-m", "alembic", "upgrade", "head"], env=environment)
         run([sys.executable, "-m", "alembic", "current", "--check-heads"], env=environment)
+        metrics["migration_seconds"] = rounded_seconds(stage_started)
+        stage = "validation"
+        stage_started = time.monotonic()
         restored_revision = asyncio.run(verify_restored_database(args))
         object_sha256 = verify_restored_objects(args)
         verify_redis_is_disposable(args)
+        metrics["validation_seconds"] = rounded_seconds(stage_started)
+        metrics["simulated_rpo_seconds"] = round(
+            (incident_at - recovery_point_at).total_seconds(),
+            3,
+        )
+        metrics["rto_seconds"] = rounded_seconds(incident_started)
+        metrics["total_seconds"] = rounded_seconds(started)
+        stage = "budget_validation"
+        if metrics["simulated_rpo_seconds"] > args.max_rpo_seconds:
+            raise RuntimeError(
+                "simulated RPO exceeded budget: "
+                f"{metrics['simulated_rpo_seconds']}s > {args.max_rpo_seconds}s"
+            )
+        if metrics["rto_seconds"] > args.max_rto_seconds:
+            raise RuntimeError(
+                f"RTO exceeded budget: {metrics['rto_seconds']}s > {args.max_rto_seconds}s"
+            )
         report = {
             "status": "passed",
+            "scenario": "synthetic",
             "source_revision": SOURCE_REVISION,
             "restored_revision": restored_revision,
             "database_sha256": manifest["database"]["sha256"],
             "object_count": len(object_entries),
             "object_sha256": object_sha256,
             "redis_restored": False,
-            "duration_seconds": round(time.monotonic() - started, 3),
+            "recovery_point_at": recovery_point_at.isoformat(),
+            "incident_at": incident_at.isoformat(),
+            "budgets": {
+                "max_rpo_seconds": args.max_rpo_seconds,
+                "max_rto_seconds": args.max_rto_seconds,
+            },
+            "metrics": metrics,
+            "duration_seconds": metrics["total_seconds"],
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
-        (backup_dir / "report.json").write_text(
-            json.dumps(report, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        write_json(backup_dir / "report.json", report)
+        write_summary(backup_dir, report)
         print(json.dumps(report, sort_keys=True))
+    except Exception as error:
+        metrics["total_seconds"] = rounded_seconds(started)
+        failure = {
+            "status": "failed",
+            "scenario": "synthetic",
+            "stage": stage,
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "budgets": {
+                "max_rpo_seconds": args.max_rpo_seconds,
+                "max_rto_seconds": args.max_rto_seconds,
+            },
+            "metrics": metrics,
+            "failed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        write_json(backup_dir / "failure.json", failure)
+        write_summary(backup_dir, failure)
+        raise
     finally:
         if not args.keep:
             run(
@@ -471,6 +564,8 @@ def parse_args():
     parser.add_argument("--redis-port", type=int, default=16379)
     parser.add_argument("--s3-port", type=int, default=19000)
     parser.add_argument("--bucket", default="bioagent-recovery")
+    parser.add_argument("--max-rpo-seconds", type=float, default=900)
+    parser.add_argument("--max-rto-seconds", type=float, default=60)
     parser.add_argument("--keep", action="store_true")
     return parser.parse_args()
 

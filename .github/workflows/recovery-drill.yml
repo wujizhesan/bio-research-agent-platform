@@ -1,6 +1,7 @@
 name: Recovery drill
 
 on:
+  pull_request:
   schedule:
     - cron: "37 2 * * 0"
   workflow_dispatch:
@@ -9,14 +10,17 @@ permissions:
   contents: read
 
 concurrency:
-  group: recovery-drill
-  cancel-in-progress: false
+  group: recovery-drill-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   restore:
     name: Restore PostgreSQL, objects and durable job state
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      RECOVERY_PROJECT: bio-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+      RECOVERY_OUTPUT: output/recovery-drill
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -38,13 +42,41 @@ jobs:
       - name: Execute destructive recovery drill against isolated services
         run: |
           uv run python scripts/recovery_drill.py \
-            --project "bio-recovery-${GITHUB_RUN_ID}" \
-            --output output/recovery-drill
+            --project "$RECOVERY_PROJECT" \
+            --output "$RECOVERY_OUTPUT" \
+            --max-rpo-seconds 900 \
+            --max-rto-seconds 60 \
+            --keep
+      - name: Capture recovery failure diagnostics
+        if: failure()
+        run: |
+          mkdir -p "$RECOVERY_OUTPUT"
+          docker compose \
+            --project-name "$RECOVERY_PROJECT" \
+            --file docker-compose.recovery.yml \
+            logs --no-color --timestamps \
+            > "$RECOVERY_OUTPUT/compose.log" 2>&1 || true
+      - name: Clean up isolated recovery services
+        if: always()
+        run: |
+          docker compose \
+            --project-name "$RECOVERY_PROJECT" \
+            --file docker-compose.recovery.yml \
+            down --volumes --remove-orphans
+      - name: Publish recovery summary
+        if: always()
+        run: |
+          if [ -f "$RECOVERY_OUTPUT/summary.md" ]; then
+            cat "$RECOVERY_OUTPUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Recovery drill" >> "$GITHUB_STEP_SUMMARY"
+            echo "Recovery evidence was not produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Upload recovery evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: recovery-drill-${{ github.run_id }}
           retention-days: 30
-          path: output/recovery-drill
+          path: ${{ env.RECOVERY_OUTPUT }}
           if-no-files-found: warn
