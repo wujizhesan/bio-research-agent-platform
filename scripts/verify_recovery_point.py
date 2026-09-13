@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import hmac
 import json
 import re
 from datetime import datetime, timezone
@@ -12,6 +14,38 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 class EvidenceError(ValueError):
     pass
+
+
+def canonical_payload(evidence):
+    payload = {key: value for key, value in evidence.items() if key != "signature"}
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def load_hmac_key(path):
+    try:
+        key = Path(path).read_bytes().strip()
+    except OSError as error:
+        raise EvidenceError("recovery evidence verification key is unavailable") from error
+    if len(key) < 32:
+        raise EvidenceError("recovery evidence verification key is too short")
+    return key
+
+
+def sign_evidence(evidence, key):
+    return hmac.new(key, canonical_payload(evidence), hashlib.sha256).hexdigest()
+
+
+def verify_evidence_signature(evidence, key):
+    signature = evidence.get("signature")
+    if not isinstance(signature, str) or not SHA256.fullmatch(signature):
+        raise EvidenceError("recovery evidence signature is invalid")
+    if not hmac.compare_digest(signature, sign_evidence(evidence, key)):
+        raise EvidenceError("recovery evidence signature mismatch")
 
 
 def parse_timestamp(value, field):
@@ -42,10 +76,11 @@ def verify_evidence(
     now=None,
     max_recovery_point_age_seconds,
     max_verification_age_seconds,
+    hmac_key=None,
 ):
     if not isinstance(evidence, dict):
         raise EvidenceError("evidence must be a JSON object")
-    if evidence.get("schema_version") != 1:
+    if evidence.get("schema_version") not in {1, 2}:
         raise EvidenceError("unsupported schema_version")
     if evidence.get("status") != "passed":
         raise EvidenceError("recovery verification did not pass")
@@ -56,6 +91,20 @@ def verify_evidence(
     require_nonempty_string(evidence.get("restored_revision"), "restored_revision")
     require_sha256(evidence.get("database_sha256"), "database_sha256")
     require_sha256(evidence.get("object_manifest_sha256"), "object_manifest_sha256")
+    if evidence["schema_version"] == 2:
+        require_nonempty_string(evidence.get("verified_backup_id"), "verified_backup_id")
+        require_sha256(
+            evidence.get("verified_database_sha256"),
+            "verified_database_sha256",
+        )
+        require_sha256(
+            evidence.get("verified_object_manifest_sha256"),
+            "verified_object_manifest_sha256",
+        )
+        if hmac_key is None:
+            raise EvidenceError("recovery evidence verification key is required")
+    if hmac_key is not None:
+        verify_evidence_signature(evidence, hmac_key)
 
     object_count = evidence.get("object_count")
     if not isinstance(object_count, int) or isinstance(object_count, bool) or object_count < 1:
@@ -112,12 +161,14 @@ def main():
     parser.add_argument("--evidence", required=True)
     parser.add_argument("--max-recovery-point-age-seconds", required=True, type=positive_seconds)
     parser.add_argument("--max-verification-age-seconds", required=True, type=positive_seconds)
+    parser.add_argument("--hmac-key-file")
     args = parser.parse_args()
     try:
         result = verify_evidence(
             load_evidence(args.evidence),
             max_recovery_point_age_seconds=args.max_recovery_point_age_seconds,
             max_verification_age_seconds=args.max_verification_age_seconds,
+            hmac_key=load_hmac_key(args.hmac_key_file) if args.hmac_key_file else None,
         )
     except EvidenceError as error:
         parser.exit(1, f"recovery evidence rejected: {error}\n")

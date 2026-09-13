@@ -601,6 +601,10 @@ class JobManager:
         snapshot['running'] = running
         return snapshot
 
+    def ping(self):
+        if self._stopping:
+            raise RuntimeError('job manager is stopping')
+
     def shutdown(self):
         with self._condition:
             self._stopping = True

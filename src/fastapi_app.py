@@ -1,5 +1,6 @@
 """FastAPI service adapter for the pluggable research Agent platform."""
 import argparse
+import asyncio
 import logging
 import os
 from datetime import datetime, timezone
@@ -78,7 +79,7 @@ OUTPUT_ROOT = PROJECT_ROOT / 'output'
 
 
 def _authorized(request: Request, authorization=None):
-    if request.url.path == '/health':
+    if request.url.path in {'/health', '/live', '/ready'}:
         return True
     try:
         AuthService.from_env().authenticate(authorization)
@@ -104,6 +105,31 @@ def _public_specs(domain=None):
     ]
 
 
+def _deployment_identity():
+    return {
+        'release_tag': os.environ.get('APP_RELEASE_TAG', 'development'),
+        'git_sha': os.environ.get('APP_GIT_SHA', 'unknown'),
+        'image_reference': os.environ.get('APP_IMAGE_REFERENCE', 'unknown'),
+    }
+
+
+async def _dependency_probe(component):
+    probe = getattr(component, 'ping', None)
+    if probe is None:
+        return
+    if asyncio.iscoroutinefunction(probe):
+        await probe()
+    else:
+        await asyncio.to_thread(probe)
+
+
+def _readiness_timeout():
+    try:
+        return min(max(float(os.environ.get('READINESS_TIMEOUT_SECONDS', '2')), 0.1), 30.0)
+    except ValueError:
+        return 2.0
+
+
 def _register_core_routes(
     app,
     *,
@@ -115,24 +141,70 @@ def _register_core_routes(
     require_permission,
     project_access,
 ):
+    @app.get('/live', tags=['system'])
+    async def live():
+        return {
+            'status': 'ok',
+            'service': API_NAME,
+            'deployment': _deployment_identity(),
+        }
+
+    @app.get('/ready', tags=['system'])
     @app.get('/health', tags=['system'])
-    async def health():
-        try:
-            await db.ping()
-        except Exception as exc:
+    async def health(request: Request):
+        deployment = _deployment_identity()
+        expected_release = request.headers.get('x-expected-release')
+        expected_commit = request.headers.get('x-expected-commit')
+        if (
+            expected_release and expected_release != deployment['release_tag']
+        ) or (
+            expected_commit and expected_commit != deployment['git_sha']
+        ):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    'status': 'version_mismatch',
+                    'service': API_NAME,
+                    'deployment': deployment,
+                },
+            )
+        components = {
+            'database': db,
+            'job_backend': app.state.job_manager,
+            'storage': app.state.file_storage,
+        }
+        checks = {}
+        for name, component in components.items():
+            try:
+                await asyncio.wait_for(
+                    _dependency_probe(component),
+                    timeout=_readiness_timeout(),
+                )
+                checks[name] = 'ok'
+            except Exception as exc:
+                checks[name] = 'unavailable'
+                log_event(
+                    'service.readiness.failed',
+                    component=name,
+                    error_type=type(exc).__name__,
+                )
+        if any(value != 'ok' for value in checks.values()):
             return JSONResponse(
                 status_code=503,
                 content={
                     'status': 'degraded',
-                    'database': 'unavailable',
-                    'error': str(exc),
+                    'service': API_NAME,
+                    'deployment': deployment,
+                    'dependencies': checks,
                 },
             )
         return {
             'status': 'ok',
             'service': API_NAME,
             'version': API_VERSION,
-            'database': 'ok',
+            'deployment': deployment,
+            'dependencies': checks,
+            'database': checks['database'],
             'job_backend': app.state.job_backend,
             'storage_backend': app.state.storage_backend,
             'observability': {

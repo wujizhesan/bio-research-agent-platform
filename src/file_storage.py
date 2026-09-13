@@ -81,6 +81,10 @@ class LocalFileStorage:
         self.root.mkdir(parents=True, exist_ok=True)
         self._quota_lock = asyncio.Lock()
 
+    def ping(self):
+        if not self.root.is_dir() or not os.access(self.root, os.R_OK | os.W_OK):
+            raise RuntimeError('local storage is unavailable')
+
     @staticmethod
     def _safe_filename(filename: str | None) -> str:
         candidate = Path(str(filename or 'upload')).name
@@ -360,6 +364,10 @@ class S3FileStorage(LocalFileStorage):
             aws_access_key_id=access_key_id or os.environ.get('AWS_ACCESS_KEY_ID'),
             aws_secret_access_key=secret_access_key or os.environ.get('AWS_SECRET_ACCESS_KEY'),
         )
+
+    def ping(self):
+        super().ping()
+        self.client.head_bucket(Bucket=self.bucket)
 
     def _object_key(self, file_id, filename):
         parts = [item for item in (self.prefix, file_id, filename) if item]

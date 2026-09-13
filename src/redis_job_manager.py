@@ -395,8 +395,12 @@ class RedisJobManager:
     def _complete_queued_item(self, job_id, poll_timeout):
         return self._worker_runtime.complete_queued_item(job_id, poll_timeout)
 
-    def run_forever(self, poll_timeout=5):
-        return self._worker_runtime.run_forever(poll_timeout)
+    def run_forever(self, poll_timeout=5, stop_event=None, drain_timeout_seconds=120):
+        return self._worker_runtime.run_forever(
+            poll_timeout,
+            stop_event=stop_event,
+            drain_timeout_seconds=drain_timeout_seconds,
+        )
 
     def resource_status(self):
         return {
@@ -407,6 +411,10 @@ class RedisJobManager:
             'resources': self.resource_pool.snapshot(),
             'queues': self._store.priority_depths(),
         }
+
+    def ping(self):
+        if not self.redis.ping():
+            raise RuntimeError('Redis is unavailable')
 
     def shutdown(self):
         shutdown = getattr(self._tool_executor, 'shutdown', None)

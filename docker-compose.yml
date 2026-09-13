@@ -35,6 +35,9 @@ services:
         condition: service_healthy
     environment:
       APP_ENV: production
+      APP_RELEASE_TAG: ${RELEASE_TAG:-development}
+      APP_GIT_SHA: ${GIT_SHA:-unknown}
+      APP_IMAGE_REFERENCE: ${BACKEND_IMAGE:-unknown}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
@@ -89,6 +92,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-json}
       OBSERVABILITY_MAX_FIELD_LENGTH: ${OBSERVABILITY_MAX_FIELD_LENGTH:-512}
+      READINESS_TIMEOUT_SECONDS: ${READINESS_TIMEOUT_SECONDS:-2}
       RUN_MIGRATIONS: "true"
     ports:
       - "${API_PUBLISHED_PORT:-8000}:8000"
@@ -144,6 +148,7 @@ services:
       - no-new-privileges:true
     volumes:
       - ${RECOVERY_EVIDENCE_PATH:-./output/recovery/latest-production.json}:/run/recovery/evidence.json:ro
+      - ${RECOVERY_EVIDENCE_HMAC_KEY_PATH:-./output/recovery/evidence.key}:/run/secrets/recovery-evidence.key:ro
     command:
       - python
       - scripts/verify_recovery_point.py
@@ -153,6 +158,41 @@ services:
       - ${RECOVERY_POINT_MAX_AGE_SECONDS:-900}
       - --max-verification-age-seconds
       - ${RECOVERY_VERIFICATION_MAX_AGE_SECONDS:-604800}
+      - --hmac-key-file
+      - /run/secrets/recovery-evidence.key
+
+  recovery-evidence-publisher:
+    profiles: ["operations"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    environment:
+      RUN_MIGRATIONS: "false"
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ${RECOVERY_BACKUP_MANIFEST_PATH:-./output/recovery/latest-backup.json}:/run/input/backup.json:ro
+      - ${RECOVERY_RESTORE_REPORT_PATH:-./output/recovery/latest-restore.json}:/run/input/restore.json:ro
+      - ${RECOVERY_EVIDENCE_HMAC_KEY_PATH:-./output/recovery/evidence.key}:/run/secrets/recovery-evidence.key:ro
+      - ${RECOVERY_EVIDENCE_DIRECTORY:-./output/recovery}:/run/output:rw
+    command:
+      - python
+      - scripts/publish_recovery_evidence.py
+      - --backup-manifest
+      - /run/input/backup.json
+      - --restore-report
+      - /run/input/restore.json
+      - --hmac-key-file
+      - /run/secrets/recovery-evidence.key
+      - --output
+      - /run/output/latest-production.json
 
   worker:
     build:
@@ -169,6 +209,9 @@ services:
       api:
         condition: service_healthy
     environment:
+      APP_RELEASE_TAG: ${RELEASE_TAG:-development}
+      APP_GIT_SHA: ${GIT_SHA:-unknown}
+      APP_IMAGE_REFERENCE: ${BACKEND_IMAGE:-unknown}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
@@ -183,6 +226,7 @@ services:
       JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-3}
       JOB_RESULT_TTL_SECONDS: ${JOB_RESULT_TTL_SECONDS:-86400}
       WORKER_MAX_CONCURRENCY: ${WORKER_MAX_CONCURRENCY:-2}
+      WORKER_DRAIN_TIMEOUT_SECONDS: ${WORKER_DRAIN_TIMEOUT_SECONDS:-120}
       JOB_EXECUTION_MODE: ${JOB_EXECUTION_MODE:-process}
       JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-3600}
       JOB_MEMORY_LIMIT_MB: ${JOB_MEMORY_LIMIT_MB:-8192}
@@ -226,6 +270,7 @@ services:
     ports:
       - "${WORKER_METRICS_PUBLISHED_PORT:-9000}:9000"
     command: ["python", "-m", "src.worker"]
+    stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-150s}
 
   web:
     build:

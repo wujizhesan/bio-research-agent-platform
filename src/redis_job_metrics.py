@@ -18,6 +18,7 @@ try:
         REDIS_QUEUE_DEPTH,
         REDIS_RESULT_CACHE,
         REDIS_WORKER_ACTIVE,
+        REDIS_WORKER_DRAINING,
         log_event,
     )
 except ImportError:
@@ -36,6 +37,7 @@ except ImportError:
         REDIS_QUEUE_DEPTH,
         REDIS_RESULT_CACHE,
         REDIS_WORKER_ACTIVE,
+        REDIS_WORKER_DRAINING,
         log_event,
     )
 
@@ -77,6 +79,14 @@ class RedisJobMetrics:
             'worker.job_handler_failed',
             worker_id=worker_id,
             error_type=type(error).__name__,
+        )
+
+    def draining(self, worker_id, enabled, active_jobs=0):
+        REDIS_WORKER_DRAINING.labels(self.namespace, worker_id).set(1 if enabled else 0)
+        log_event(
+            'worker.draining' if enabled else 'worker.drain_finished',
+            worker_id=worker_id,
+            active_jobs=active_jobs,
         )
 
     def claimed(self, record, worker_id):
