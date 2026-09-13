@@ -2,14 +2,30 @@ services:
   api:
     image: ${BACKEND_IMAGE:?required}
     pull_policy: always
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?required}
 
   worker:
     image: ${BACKEND_IMAGE:?required}
     pull_policy: always
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?required}
 
   migration:
     image: ${BACKEND_IMAGE:?required}
     pull_policy: always
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?required}
+
+  storage-check:
+    image: ${BACKEND_IMAGE:?required}
+    pull_policy: always
+
+  pitr-checkpoint:
+    image: ${BACKEND_IMAGE:?required}
+    pull_policy: always
+    environment:
+      PITR_DATABASE_URL: ${PITR_DATABASE_URL:?required}
 
   recovery-check:
     image: ${BACKEND_IMAGE:?required}

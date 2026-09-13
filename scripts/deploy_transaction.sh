@@ -43,9 +43,35 @@ wait_for_health() {
 cd "$deploy_path"
 test -f .env.production
 grep -Eq '^POSTGRES_PASSWORD=.+$' .env.production
+grep -Eq '^APP_ENV=production$' .env.production
 grep -Eq '^CADD_JWT_SECRET=.{32,}$' .env.production
 grep -Eq '^PLUGIN_SANDBOX_TOKEN=.{32,}$' .env.production
-! grep -Eq '^POSTGRES_PASSWORD=(bioagent-dev-password|"bioagent-dev-password")$' .env.production
+if grep -Eq '^POSTGRES_PASSWORD=(bioagent-dev-password|"bioagent-dev-password")$' .env.production; then
+  echo "production PostgreSQL password must not use the development default" >&2
+  exit 1
+fi
+test "$(grep -c '^DATABASE_URL=' .env.production)" -eq 1
+test "$(grep -c '^PITR_DATABASE_URL=' .env.production)" -eq 1
+test "$(grep -c '^STORAGE_BACKEND=' .env.production)" -eq 1
+test "$(grep -c '^S3_BUCKET=' .env.production)" -eq 1
+test "$(grep -c '^S3_REGION=' .env.production)" -eq 1
+test "$(grep -c '^S3_ENDPOINT_URL=' .env.production)" -eq 1
+test "$(grep -c '^S3_EXPECTED_BUCKET_OWNER=' .env.production)" -eq 1
+test "$(grep -c '^S3_BACKUP_ROLE_ARN=' .env.production)" -eq 1
+test "$(grep -c '^PITR_CHECKPOINT_TIMEOUT_SECONDS=' .env.production)" -eq 1
+grep -Eq '^DATABASE_URL=postgres(ql)?(\+asyncpg)?://.+$' .env.production
+grep -Eq '^PITR_DATABASE_URL=postgres(ql)?(\+asyncpg)?://.+$' .env.production
+if grep -Eqi '^(DATABASE_URL|PITR_DATABASE_URL)=.*@(db|localhost|127\.|\[::1\])[:/]' .env.production; then
+  echo "production database URLs must not target a local Compose host" >&2
+  exit 1
+fi
+grep -Eq '^STORAGE_BACKEND=s3$' .env.production
+grep -Eq '^S3_BUCKET=[A-Za-z0-9][A-Za-z0-9.-]{1,61}[A-Za-z0-9]$' .env.production
+grep -Eq '^S3_REGION=[a-z0-9-]+$' .env.production
+grep -Eq '^S3_ENDPOINT_URL=https://[^[:space:]]+$' .env.production
+grep -Eq '^S3_EXPECTED_BUCKET_OWNER=[0-9]{12}$' .env.production
+grep -Eq '^S3_BACKUP_ROLE_ARN=arn:(aws|aws-cn|aws-us-gov):iam::[0-9]{12}:role/.+$' .env.production
+grep -Eq '^PITR_CHECKPOINT_TIMEOUT_SECONDS=[1-9][0-9]*$' .env.production
 test "$(grep -c '^RECOVERY_EVIDENCE_PATH=' .env.production)" -eq 1
 test "$(grep -c '^RECOVERY_EVIDENCE_DIRECTORY=' .env.production)" -eq 1
 test "$(grep -c '^RECOVERY_BACKUP_MANIFEST_PATH=' .env.production)" -eq 1
@@ -92,9 +118,12 @@ fi
 
 "${next_compose[@]}" config --quiet
 "${next_compose[@]}" pull \
-  api worker web plugin-sandbox migration recovery-check recovery-evidence-publisher
+  api worker web plugin-sandbox migration recovery-check recovery-evidence-publisher \
+  storage-check pitr-checkpoint
+"${next_compose[@]}" run --rm --no-deps storage-check
 "${next_compose[@]}" run --rm --no-deps recovery-evidence-publisher
 "${next_compose[@]}" run --rm --no-deps recovery-check
+"${next_compose[@]}" run --rm --no-deps pitr-checkpoint
 "${next_compose[@]}" run --rm migration
 
 if "${next_compose[@]}" up -d --no-build --remove-orphans \
