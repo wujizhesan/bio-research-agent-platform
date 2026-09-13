@@ -124,6 +124,25 @@ class RecoveryPointTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertNotIn(marker, result.stderr)
 
+    def test_schema_two_requires_signature_key(self):
+        now = datetime(2026, 9, 13, 12, 0, tzinfo=timezone.utc)
+        evidence = self.evidence(now)
+        evidence.update(
+            {
+                "schema_version": 2,
+                "verified_backup_id": "verified-backup",
+                "verified_database_sha256": "c" * 64,
+                "verified_object_manifest_sha256": "d" * 64,
+            }
+        )
+        with self.assertRaisesRegex(MODULE.EvidenceError, "key is required"):
+            MODULE.verify_evidence(
+                evidence,
+                now=now,
+                max_recovery_point_age_seconds=900,
+                max_verification_age_seconds=3600,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

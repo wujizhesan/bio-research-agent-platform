@@ -1,7 +1,8 @@
 """Execution runtime for Redis-backed job workers."""
 
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from time import sleep, time
+from threading import Event
+from time import monotonic, sleep, time
 
 try:
     from .job_manager import TERMINAL_STATUSES
@@ -83,10 +84,14 @@ class RedisJobWorkerRuntime:
             manager._refresh_queue_metrics()
             sleep(min(max(float(poll_timeout), 0.05), 1.0))
 
-    def run_forever(self, poll_timeout=5):
+    def run_forever(self, poll_timeout=5, stop_event=None, drain_timeout_seconds=120):
         manager = self.manager
+        stop_event = stop_event or Event()
+        drain_timeout_seconds = max(float(drain_timeout_seconds), 0.0)
         manager.recover_stale_jobs()
         futures = set()
+        drain_deadline = None
+        draining = False
         executor = ThreadPoolExecutor(
             max_workers=manager.max_concurrency,
             thread_name_prefix='redis-job',
@@ -104,16 +109,30 @@ class RedisJobWorkerRuntime:
                             manager.worker_id,
                             exc,
                         )
-                while len(futures) < manager.max_concurrency:
-                    item = self.next_job()
-                    if not item:
-                        break
-                    job_id = item.decode('utf-8') if isinstance(item, bytes) else str(item)
-                    futures.add(executor.submit(
-                        self.complete_queued_item,
-                        job_id,
-                        poll_timeout,
-                    ))
+                if stop_event.is_set():
+                    if not draining:
+                        draining = True
+                        drain_deadline = monotonic() + drain_timeout_seconds
+                        manager._metrics.draining(
+                            manager.worker_id,
+                            True,
+                            active_jobs=len(futures),
+                        )
+                    if not futures:
+                        return True
+                    if monotonic() >= drain_deadline:
+                        return False
+                else:
+                    while len(futures) < manager.max_concurrency:
+                        item = self.next_job()
+                        if not item:
+                            break
+                        job_id = item.decode('utf-8') if isinstance(item, bytes) else str(item)
+                        futures.add(executor.submit(
+                            self.complete_queued_item,
+                            job_id,
+                            poll_timeout,
+                        ))
                 if not futures:
                     manager.recover_stale_jobs()
                     sleep(min(max(float(poll_timeout), 0.05), 1.0))
@@ -124,5 +143,13 @@ class RedisJobWorkerRuntime:
                         return_when=FIRST_COMPLETED,
                     )
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-            manager._worker_executor = None
+            if draining:
+                manager._metrics.draining(
+                    manager.worker_id,
+                    False,
+                    active_jobs=len(futures),
+                )
+            has_active_jobs = any(not future.done() for future in futures)
+            executor.shutdown(wait=not has_active_jobs, cancel_futures=True)
+            if not has_active_jobs:
+                manager._worker_executor = None

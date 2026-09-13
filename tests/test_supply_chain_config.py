@@ -126,6 +126,10 @@ class SupplyChainConfigurationTests(unittest.TestCase):
             "${BACKEND_IMAGE:?required}",
         )
         self.assertEqual(
+            compose["services"]["recovery-evidence-publisher"]["image"],
+            "${BACKEND_IMAGE:?required}",
+        )
+        self.assertEqual(
             compose["services"]["plugin-sandbox"]["image"],
             "${BACKEND_IMAGE:?required}",
         )
@@ -154,14 +158,28 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertEqual(recovery["profiles"], ["operations"])
         self.assertEqual(recovery["network_mode"], "none")
         self.assertTrue(recovery["read_only"])
+        publisher = compose["services"]["recovery-evidence-publisher"]
+        self.assertEqual(publisher["network_mode"], "none")
+        self.assertTrue(publisher["read_only"])
+        self.assertEqual(
+            compose["services"]["worker"]["stop_grace_period"],
+            "${WORKER_STOP_GRACE_PERIOD:-150s}",
+        )
         self.assertIn("release-images.next.env", workflow)
         self.assertIn("deploy_transaction.sh", workflow)
         self.assertIn("release-images.previous.env", script)
+        self.assertIn('run --rm --no-deps recovery-evidence-publisher', script)
         self.assertIn('run --rm --no-deps recovery-check', script)
         self.assertIn('run --rm migration', script)
         self.assertIn('rolling back to previous image digests', script)
         self.assertIn('RECOVERY_EVIDENCE_PATH=', script)
         self.assertIn("check_expand_contract_migrations.py", ci)
+        self.assertIn("source_commit", workflow)
+        self.assertIn("X-Expected-Release", script)
+        self.assertLess(
+            script.index('run --rm --no-deps recovery-evidence-publisher'),
+            script.index('run --rm --no-deps recovery-check'),
+        )
         self.assertLess(
             script.index('run --rm --no-deps recovery-check'),
             script.index('run --rm migration'),

@@ -345,6 +345,11 @@ REDIS_WORKER_ACTIVE = Gauge(
     'Number of jobs currently executing in this Redis worker process.',
     ['namespace'],
 )
+REDIS_WORKER_DRAINING = Gauge(
+    'bio_agent_redis_worker_draining',
+    'Whether a Redis worker is draining and no longer claiming new jobs.',
+    ['namespace', 'worker_id'],
+)
 FILE_OPERATIONS = Counter(
     'bio_agent_file_operations_total',
     'File storage operations by backend and outcome.',

@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -117,6 +117,8 @@ class FastApiAppTests(unittest.TestCase):
                     })
                     self.assertEqual(health.status_code, 200)
                     self.assertEqual(health.json()['database'], 'ok')
+                    self.assertEqual(health.json()['dependencies']['job_backend'], 'ok')
+                    self.assertEqual(health.json()['dependencies']['storage'], 'ok')
                     self.assertEqual(health.json()['storage_backend'], 'local')
                     self.assertEqual(health.headers['x-request-id'], 'interview-trace-001')
                     self.assertEqual(
@@ -147,6 +149,55 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(job['request_id'], 'job-request-001')
                     completed = self._wait_for_job(client, job['job_id'])
                     self.assertEqual(completed['trace_id'], 'job-trace-001')
+            finally:
+                self._close_app(app)
+
+    def test_live_and_ready_verify_deployment_identity(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_readiness_') as raw, patch.dict(
+            os.environ,
+            {
+                'APP_RELEASE_TAG': 'v0.2.0-rc.1',
+                'APP_GIT_SHA': 'a' * 40,
+                'APP_IMAGE_REFERENCE': 'backend@sha256:' + 'b' * 64,
+            },
+        ):
+            app = self._app(raw)
+            try:
+                with TestClient(app) as client:
+                    live = client.get('/live')
+                    ready = client.get(
+                        '/ready',
+                        headers={
+                            'X-Expected-Release': 'v0.2.0-rc.1',
+                            'X-Expected-Commit': 'a' * 40,
+                        },
+                    )
+                    mismatch = client.get(
+                        '/ready',
+                        headers={'X-Expected-Release': 'v0.1.0'},
+                    )
+                self.assertEqual(live.status_code, 200)
+                self.assertEqual(live.json()['deployment']['git_sha'], 'a' * 40)
+                self.assertEqual(ready.status_code, 200)
+                self.assertEqual(ready.json()['deployment']['release_tag'], 'v0.2.0-rc.1')
+                self.assertEqual(mismatch.status_code, 409)
+                self.assertEqual(mismatch.json()['status'], 'version_mismatch')
+            finally:
+                self._close_app(app)
+
+    def test_readiness_failure_is_sanitized(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_readiness_failure_') as raw:
+            app = self._app(raw)
+            app.state.database.ping = AsyncMock(
+                side_effect=RuntimeError('postgresql://user:secret@database/internal')
+            )
+            try:
+                with TestClient(app) as client:
+                    response = client.get('/ready')
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(response.json()['dependencies']['database'], 'unavailable')
+                self.assertNotIn('secret', response.text)
+                self.assertNotIn('database/internal', response.text)
             finally:
                 self._close_app(app)
 

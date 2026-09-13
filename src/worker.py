@@ -2,6 +2,8 @@
 
 import argparse
 import os
+import signal
+from threading import Event
 
 try:
     from .job_execution import build_tool_executor_from_env
@@ -24,6 +26,17 @@ def main(argv=None):
     parser.add_argument('--metrics-host', default=os.environ.get('WORKER_METRICS_HOST', '0.0.0.0'))
     parser.add_argument('--metrics-port', type=int, default=int(os.environ.get('WORKER_METRICS_PORT', '9000')))
     args = parser.parse_args(argv)
+    try:
+        drain_timeout = max(float(os.environ.get('WORKER_DRAIN_TIMEOUT_SECONDS', '120')), 0.0)
+    except ValueError:
+        drain_timeout = 120.0
+    stop_event = Event()
+
+    def request_stop(_signum, _frame):
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
     configure_logging('bio-research-agent-worker')
     if args.metrics_port > 0:
         from prometheus_client import start_http_server
@@ -47,7 +60,16 @@ def main(argv=None):
             max_concurrency=manager.max_concurrency,
             max_attempts=manager.max_attempts,
         )
-        manager.run_forever()
+        drained = manager.run_forever(
+            stop_event=stop_event,
+            drain_timeout_seconds=drain_timeout,
+        )
+        if not drained:
+            log_event(
+                'worker.drain_timeout',
+                worker_id=manager.worker_id,
+                drain_timeout_seconds=drain_timeout,
+            )
     except KeyboardInterrupt:
         return 0
     finally:
@@ -56,6 +78,7 @@ def main(argv=None):
                 'worker.stopped',
                 worker_id=manager.worker_id,
                 namespace=args.namespace,
+                drained=locals().get('drained'),
             )
             manager.shutdown()
         state_writer.close()

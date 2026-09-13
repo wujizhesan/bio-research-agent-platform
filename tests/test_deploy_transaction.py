@@ -23,7 +23,11 @@ class DeployTransactionTests(unittest.TestCase):
                     "POSTGRES_PASSWORD=production-password",
                     f"CADD_JWT_SECRET={'a' * 32}",
                     f"PLUGIN_SANDBOX_TOKEN={'b' * 32}",
-                    "RECOVERY_EVIDENCE_PATH=/var/lib/bioagent/recovery.json",
+                    "RECOVERY_EVIDENCE_PATH=/var/lib/bioagent/latest-production.json",
+                    "RECOVERY_EVIDENCE_DIRECTORY=/var/lib/bioagent",
+                    "RECOVERY_BACKUP_MANIFEST_PATH=/var/lib/bioagent/latest-backup.json",
+                    "RECOVERY_RESTORE_REPORT_PATH=/var/lib/bioagent/latest-restore.json",
+                    "RECOVERY_EVIDENCE_HMAC_KEY_PATH=/var/lib/bioagent/evidence.key",
                     "RECOVERY_POINT_MAX_AGE_SECONDS=900",
                     "RECOVERY_VERIFICATION_MAX_AGE_SECONDS=604800",
                 ]
@@ -38,12 +42,14 @@ class DeployTransactionTests(unittest.TestCase):
         ):
             (deploy / name).write_text("services: {}\n", encoding="utf-8")
         (deploy / "release-images.next.env").write_text(
-            "BACKEND_IMAGE=next-backend\nFRONTEND_IMAGE=next-frontend\n",
+            "BACKEND_IMAGE=next-backend\nFRONTEND_IMAGE=next-frontend\n"
+            "RELEASE_TAG=v0.2.0-rc.1\nGIT_SHA=" + "a" * 40 + "\n",
             encoding="utf-8",
         )
         if current:
             (deploy / "release-images.env").write_text(
-                "BACKEND_IMAGE=current-backend\nFRONTEND_IMAGE=current-frontend\n",
+                "BACKEND_IMAGE=current-backend\nFRONTEND_IMAGE=current-frontend\n"
+                "RELEASE_TAG=v0.1.0-rc.1\nGIT_SHA=" + "b" * 40 + "\n",
                 encoding="utf-8",
             )
         docker = binaries / "docker"
@@ -102,6 +108,8 @@ exit "${CURL_EXIT:-0}"
             self.assertLess(recovery, migration)
             self.assertLess(migration, rollout)
             self.assertLess(rollout, health)
+            self.assertIn("X-Expected-Release: v0.2.0-rc.1", commands[health])
+            self.assertIn("X-Expected-Commit: " + "a" * 40, commands[health])
 
     def test_restores_previous_digests_when_candidate_start_fails(self):
         with tempfile.TemporaryDirectory() as directory:

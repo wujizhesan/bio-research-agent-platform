@@ -33,6 +33,7 @@ jobs:
     outputs:
       backend_image: ${{ steps.images.outputs.backend_image }}
       frontend_image: ${{ steps.images.outputs.frontend_image }}
+      source_commit: ${{ steps.release.outputs.source_commit }}
     steps:
       - name: Validate digest-pinned inputs
         id: images
@@ -52,6 +53,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
       - name: Require a published release
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
@@ -61,6 +63,9 @@ jobs:
             --json isDraft,tagName \
             | jq -e --arg tag "$RELEASE_TAG" '.isDraft == false and .tagName == $tag' \
             > /dev/null
+          source_commit=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_TAG}" --jq .sha)
+          [[ "$source_commit" =~ ^[a-f0-9]{40}$ ]]
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
       - name: Resolve immutable manifests
         env:
           BACKEND_IMAGE: ${{ steps.images.outputs.backend_image }}
@@ -148,6 +153,7 @@ jobs:
           BACKEND_IMAGE: ${{ needs.verify.outputs.backend_image }}
           DEPLOY_PATH: ${{ vars.PRODUCTION_DEPLOY_PATH }}
           FRONTEND_IMAGE: ${{ needs.verify.outputs.frontend_image }}
+          GIT_SHA: ${{ needs.verify.outputs.source_commit }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           SSH_HOST: ${{ secrets.PRODUCTION_SSH_HOST }}
           SSH_PORT: ${{ vars.PRODUCTION_SSH_PORT }}
@@ -155,8 +161,8 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          printf 'BACKEND_IMAGE=%s\nFRONTEND_IMAGE=%s\nRELEASE_TAG=%s\n' \
-            "$BACKEND_IMAGE" "$FRONTEND_IMAGE" "$RELEASE_TAG" \
+          printf 'BACKEND_IMAGE=%s\nFRONTEND_IMAGE=%s\nRELEASE_TAG=%s\nGIT_SHA=%s\n' \
+            "$BACKEND_IMAGE" "$FRONTEND_IMAGE" "$RELEASE_TAG" "$GIT_SHA" \
             > release-images.next.env
           printf -v prepare_command 'mkdir -p %q' "$DEPLOY_PATH"
           ssh -i "$HOME/.ssh/id_deploy" -p "$SSH_PORT" \

@@ -56,6 +56,9 @@ class FakeS3Client:
     def download_file(self, bucket, key, filename):
         Path(filename).write_bytes(self.objects[(bucket, key)])
 
+    def head_bucket(self, Bucket):
+        return {'Bucket': Bucket}
+
 
 class S3FileStorageTests(unittest.TestCase):
     def test_upload_and_cache_miss_download(self):
@@ -73,6 +76,7 @@ class S3FileStorageTests(unittest.TestCase):
                 restored = asyncio.run(storage.aget(stored.file_id))
                 self.assertEqual(restored.storage_key, stored.storage_key)
                 self.assertEqual(restored.path.read_bytes(), b'@read1\nACGT\n')
+                self.assertIsNone(storage.ping())
 
 
 class LocalFileStorageSecurityTests(unittest.TestCase):

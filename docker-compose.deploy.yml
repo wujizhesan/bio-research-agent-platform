@@ -15,6 +15,10 @@ services:
     image: ${BACKEND_IMAGE:?required}
     pull_policy: always
 
+  recovery-evidence-publisher:
+    image: ${BACKEND_IMAGE:?required}
+    pull_policy: always
+
   web:
     image: ${FRONTEND_IMAGE:?required}
     pull_policy: always
