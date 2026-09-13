@@ -1,10 +1,11 @@
+import hashlib
 import os
-from pathlib import Path
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import patch
 
 from src.job_execution import (
@@ -20,7 +21,7 @@ from src.job_execution import (
 from src.job_manager import JobManager
 from src.observability import bind_context
 from src.run_context import bind_run_context, build_run_context
-
+from src.storage_workspace import S3ObjectReference
 
 HELPER = """import json
 from pathlib import Path
@@ -30,6 +31,15 @@ request = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
 arguments = request.get('arguments', {})
 time.sleep(float(arguments.get('sleep', 0)))
 result = {'status': 'ok', 'value': arguments.get('value'), 'blob': 'x' * int(arguments.get('blob', 0)), 'observability': request.get('observability', {}), 'run_context': request.get('run_context')}
+Path(sys.argv[2]).write_text(json.dumps({'ok': True, 'result': result}), encoding='utf-8')
+"""
+
+INPUT_HELPER = """import json
+from pathlib import Path
+import sys
+request = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+path = Path(request['arguments']['input_path'])
+result = {'path': str(path), 'content': path.read_text(encoding='utf-8')}
 Path(sys.argv[2]).write_text(json.dumps({'ok': True, 'result': result}), encoding='utf-8')
 """
 
@@ -58,6 +68,44 @@ class JobExecutionTests(unittest.TestCase):
         with self.assertRaises(JobExecutionCancelled):
             executor.execute('tool', {}, cancelled=lambda: True)
 
+    def test_inline_executor_materializes_versioned_input_in_temporary_workspace(self):
+        content = b'@read1\nACGT\n'
+        digest = hashlib.sha256(content).hexdigest()
+
+        class Client:
+            def head_object(self, **_request):
+                return {
+                    'VersionId': 'version-1',
+                    'ContentLength': len(content),
+                    'Metadata': {'sha256': digest},
+                }
+
+            def download_file(self, _bucket, _key, filename, ExtraArgs=None):
+                Path(filename).write_bytes(content)
+
+        client = Client()
+        observed = {}
+
+        def run(_tool, arguments):
+            path = Path(arguments['input_path'])
+            observed['path'] = path
+            observed['content'] = path.read_bytes()
+            return {'status': 'ok'}
+
+        reference = S3ObjectReference(
+            'bio-test',
+            'research/file/reads.fastq',
+            'version-1',
+            digest,
+            len(content),
+        ).serialize()
+        with patch.dict(os.environ, {'S3_BUCKET': 'bio-test', 'S3_PREFIX': 'research'}):
+            InlineToolExecutor(run, storage_client=client).execute(
+                'tool', {'input_path': reference}
+            )
+        self.assertEqual(observed['content'], b'@read1\nACGT\n')
+        self.assertFalse(observed['path'].exists())
+
     def test_process_executor_returns_result(self):
         with tempfile.TemporaryDirectory(prefix='job_execution_') as raw:
             with bind_context(trace_id='process-trace', job_id='process-job'):
@@ -65,6 +113,49 @@ class JobExecutionTests(unittest.TestCase):
         self.assertEqual(result['value'], 42)
         self.assertEqual(result['observability']['trace_id'], 'process-trace')
         self.assertEqual(result['observability']['job_id'], 'process-job')
+
+    def test_process_executor_materializes_and_cleans_versioned_input(self):
+        content = b'gene,value\nTP53,12\n'
+        digest = hashlib.sha256(content).hexdigest()
+
+        class Client:
+            def head_object(self, **_request):
+                return {
+                    'VersionId': 'version-1',
+                    'ContentLength': len(content),
+                    'Metadata': {'sha256': digest},
+                }
+
+            def download_file(self, _bucket, _key, filename, ExtraArgs=None):
+                Path(filename).write_bytes(content)
+
+        reference = S3ObjectReference(
+            'bio-test',
+            'research/file/expression.csv',
+            'version-1',
+            digest,
+            len(content),
+        ).serialize()
+        with tempfile.TemporaryDirectory(prefix='job_execution_') as raw:
+            runner = Path(raw) / 'input_helper.py'
+            runner.write_text(INPUT_HELPER, encoding='utf-8')
+            executor = ProcessToolExecutor(
+                ExecutionLimits(
+                    timeout_seconds=5,
+                    memory_limit_mb=0,
+                    cpu_time_seconds=0,
+                    max_result_bytes=1024 * 1024,
+                    poll_interval_seconds=0.01,
+                    terminate_grace_seconds=1,
+                ),
+                python_executable=sys.executable,
+                runner_path=runner,
+                storage_client=Client(),
+            )
+            with patch.dict(os.environ, {'S3_BUCKET': 'bio-test', 'S3_PREFIX': 'research'}):
+                result = executor.execute('tool', {'input_path': reference})
+        self.assertEqual(result['content'], content.decode('utf-8'))
+        self.assertFalse(Path(result['path']).exists())
 
     def test_process_executor_enforces_timeout(self):
         with tempfile.TemporaryDirectory(prefix='job_execution_') as raw:

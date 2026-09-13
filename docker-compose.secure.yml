@@ -24,6 +24,7 @@ services:
       PLUGIN_SANDBOX_URL: http://plugin-sandbox:8081
       PLUGIN_SANDBOX_TOKEN_FILE: /run/secrets/plugin_sandbox_token
       PLUGIN_SANDBOX_CLIENT_CONCURRENCY: ${PLUGIN_SANDBOX_CLIENT_CONCURRENCY:-8}
+      JOB_INPUT_WORKSPACE_ROOT: /app/output/.job-inputs
     secrets:
       - plugin_sandbox_token
     networks:

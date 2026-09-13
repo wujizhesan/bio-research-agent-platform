@@ -98,6 +98,8 @@ export type UploadedFile = {
   sha256: string
   path: string
   download_url: string
+  storage_key?: string | null
+  version_id?: string | null
 }
 
 export type Project = {

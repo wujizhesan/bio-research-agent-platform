@@ -162,6 +162,7 @@ py-modules = [
   "sequence_plugin",
   "sequence_builtin",
   "streamlit_chat",
+  "storage_workspace",
   "visualize",
   "redis_job_coordinator",
   "redis_job_manager",

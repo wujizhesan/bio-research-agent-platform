@@ -259,6 +259,7 @@ jobs:
           import research_protocol
           import research_workflow_builder
           import run_context
+          import storage_workspace
           import tool_contracts
 
           assert version('bio-research-agent-platform')
@@ -271,6 +272,7 @@ jobs:
           assert omics_protocol.build_omics_tools is not None
           assert research_protocol.build_research_tools is not None
           assert research_workflow_builder._build_workflow is not None
+          assert storage_workspace.materialize_storage_references is not None
           assert tool_contracts.bind_tool_contracts is not None
           PY
           "$GITHUB_WORKSPACE/.venv-package/bin/bio-agent-domains" --domain all > installed_domains.json

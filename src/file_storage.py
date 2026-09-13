@@ -1,16 +1,32 @@
 """Secure local storage for uploaded research inputs."""
 
 import asyncio
-from dataclasses import dataclass
-from dataclasses import replace
 import gzip
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
+import shutil
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 from uuid import uuid4
+
+try:
+    from .storage_workspace import (
+        SHA256_PATTERN,
+        S3ObjectReference,
+        StorageIntegrityError,
+        materialize_storage_references,
+    )
+except ImportError:
+    from storage_workspace import (
+        SHA256_PATTERN,
+        S3ObjectReference,
+        StorageIntegrityError,
+        materialize_storage_references,
+    )
 
 
 DEFAULT_ALLOWED_EXTENSIONS = frozenset({
@@ -53,6 +69,7 @@ class StoredFile:
     sha256: str
     path: Path
     storage_key: str | None = None
+    version_id: str | None = None
     security: dict | None = None
 
 
@@ -260,6 +277,7 @@ class LocalFileStorage:
                     'size_bytes': stored.size_bytes,
                     'sha256': stored.sha256,
                     'storage_key': stored.storage_key,
+                    'version_id': stored.version_id,
                     'security': stored.security,
                 }, ensure_ascii=False), encoding='utf-8')
                 return stored
@@ -270,7 +288,9 @@ class LocalFileStorage:
                     directory.rmdir()
                 raise
 
-    def get(self, file_id: str) -> StoredFile:
+    def get(self, file_id: str, reference=None) -> StoredFile:
+        if reference is not None:
+            raise FileNotFoundError(file_id)
         if not FILE_ID_PATTERN.fullmatch(file_id):
             raise FileNotFoundError(file_id)
         directory = (self.root / file_id).resolve()
@@ -292,6 +312,7 @@ class LocalFileStorage:
                 sha256=str(payload['sha256']),
                 path=directory / filename,
                 storage_key=payload.get('storage_key'),
+                version_id=payload.get('version_id'),
                 security=payload.get('security'),
             )
             path = self._resolve_file_path(stored)
@@ -316,6 +337,7 @@ class LocalFileStorage:
             'path': tool_path,
             'download_url': download_url,
             'storage_key': stored.storage_key,
+            'version_id': stored.version_id,
             'security': stored.security,
         }
 
@@ -407,6 +429,18 @@ class S3FileStorage(LocalFileStorage):
                     ),
                 },
             )
+            head = await asyncio.to_thread(
+                self.client.head_object,
+                **self._bucket_request(Key=storage_key),
+            )
+            version_id = str(head.get('VersionId') or '')
+            remote_sha256 = str((head.get('Metadata') or {}).get('sha256') or '').lower()
+            if not version_id or version_id == 'null':
+                raise StorageIntegrityError('S3 upload did not return a durable VersionId')
+            if remote_sha256 != stored.sha256:
+                raise StorageIntegrityError('S3 upload checksum metadata verification failed')
+            if int(head.get('ContentLength') or 0) != stored.size_bytes:
+                raise StorageIntegrityError('S3 upload size verification failed')
         except Exception:
             for child in stored.path.parent.iterdir():
                 child.unlink(missing_ok=True)
@@ -415,8 +449,10 @@ class S3FileStorage(LocalFileStorage):
         metadata_path = stored.path.parent / 'metadata.json'
         metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
         metadata['storage_key'] = storage_key
+        metadata['version_id'] = version_id
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=False), encoding='utf-8')
-        return replace(stored, storage_key=storage_key)
+        stored.path.unlink(missing_ok=True)
+        return replace(stored, storage_key=storage_key, version_id=version_id)
 
     def _find_remote_object(self, file_id):
         response = self.client.list_objects_v2(
@@ -431,63 +467,119 @@ class S3FileStorage(LocalFileStorage):
                 return key
         raise FileNotFoundError(file_id)
 
-    def get(self, file_id: str) -> StoredFile:
-        try:
-            return super().get(file_id)
-        except FileNotFoundError:
-            pass
-        storage_key = self._find_remote_object(file_id)
-        filename = self._safe_filename(Path(storage_key).name)
+    def get(self, file_id: str, reference=None) -> StoredFile:
+        if not FILE_ID_PATTERN.fullmatch(file_id):
+            raise FileNotFoundError(file_id)
         directory = self.root / file_id
-        directory.mkdir(parents=True, exist_ok=True)
-        target = directory / filename
+        metadata_path = directory / 'metadata.json'
         try:
-            head = self.client.head_object(**self._bucket_request(Key=storage_key))
-            download_args = (
-                {'ExpectedBucketOwner': self.expected_bucket_owner}
-                if self.expected_bucket_owner else None
-            )
-            if download_args:
-                self.client.download_file(
-                    self.bucket,
-                    storage_key,
-                    str(target),
-                    ExtraArgs=download_args,
-                )
+            parsed_reference = S3ObjectReference.parse(reference) if reference else None
+            if parsed_reference is not None:
+                expected_prefix = self._object_key(file_id, '')
+                if (
+                    parsed_reference.bucket != self.bucket
+                    or not parsed_reference.key.startswith(f'{expected_prefix}/')
+                ):
+                    raise StorageIntegrityError('storage reference does not match the requested file')
+                storage_key = parsed_reference.key
+                filename = self._safe_filename(Path(storage_key).name)
+                version_id = parsed_reference.version_id
+                sha256 = parsed_reference.sha256
+                size_bytes = parsed_reference.size_bytes
+                head = self.client.head_object(**self._bucket_request(
+                    Key=storage_key,
+                    VersionId=version_id,
+                ))
+                content_type = str(head.get('ContentType') or 'application/octet-stream')
+                security_status = (head.get('Metadata') or {}).get('security-status')
+                security = {'status': security_status} if security_status else None
+            elif metadata_path.is_file():
+                metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+                storage_key = str(metadata['storage_key'])
+                filename = self._safe_filename(metadata['filename'])
+                version_id = str(metadata['version_id'])
+                sha256 = str(metadata['sha256']).lower()
+                size_bytes = int(metadata['size_bytes'])
+                content_type = str(metadata.get('content_type') or 'application/octet-stream')
+                security = metadata.get('security')
             else:
-                self.client.download_file(self.bucket, storage_key, str(target))
-            digest = hashlib.sha256()
-            with target.open('rb') as source:
-                for chunk in iter(lambda: source.read(CHUNK_SIZE), b''):
-                    digest.update(chunk)
+                storage_key = self._find_remote_object(file_id)
+                filename = self._safe_filename(Path(storage_key).name)
+                head = self.client.head_object(**self._bucket_request(Key=storage_key))
+                version_id = str(head.get('VersionId') or '')
+                sha256 = str((head.get('Metadata') or {}).get('sha256') or '').lower()
+                size_bytes = int(head.get('ContentLength') or 0)
+                content_type = str(head.get('ContentType') or 'application/octet-stream')
+                security_status = (head.get('Metadata') or {}).get('security-status')
+                security = {'status': security_status} if security_status else None
+                if not version_id or version_id == 'null' or not SHA256_PATTERN.fullmatch(sha256):
+                    raise StorageIntegrityError('remote object lacks version or checksum metadata')
+                directory.mkdir(parents=True, exist_ok=True)
+                metadata_path.write_text(json.dumps({
+                    'file_id': file_id,
+                    'filename': filename,
+                    'content_type': content_type,
+                    'size_bytes': size_bytes,
+                    'sha256': sha256,
+                    'storage_key': storage_key,
+                    'version_id': version_id,
+                    'security': security,
+                }, ensure_ascii=False), encoding='utf-8')
+            reference = S3ObjectReference(
+                self.bucket,
+                storage_key,
+                version_id,
+                sha256,
+                size_bytes,
+            )
+            download_root = self.root / '.downloads' / uuid4().hex
+            target = Path(materialize_storage_references(
+                reference.serialize(),
+                download_root,
+                client=self.client,
+                configured_bucket=self.bucket,
+                configured_prefix=self.prefix,
+                expected_owner=self.expected_bucket_owner or '',
+            ))
             stored = StoredFile(
                 file_id=file_id,
                 filename=filename,
-                content_type=str(head.get('ContentType') or 'application/octet-stream'),
-                size_bytes=int(head.get('ContentLength') or target.stat().st_size),
-                sha256=str((head.get('Metadata') or {}).get('sha256') or digest.hexdigest()),
+                content_type=content_type,
+                size_bytes=size_bytes,
+                sha256=sha256,
                 path=target,
                 storage_key=storage_key,
-                security=(head.get('Metadata') or {}).get('security-status') and {
-                    'status': (head.get('Metadata') or {}).get('security-status')
-                },
+                version_id=version_id,
+                security=security,
             )
-            (directory / 'metadata.json').write_text(json.dumps({
-                'file_id': stored.file_id,
-                'filename': stored.filename,
-                'content_type': stored.content_type,
-                'size_bytes': stored.size_bytes,
-                'sha256': stored.sha256,
-                'storage_key': stored.storage_key,
-                'security': stored.security,
-            }, ensure_ascii=False), encoding='utf-8')
             return stored
         except Exception:
-            if directory.exists():
-                for child in directory.iterdir():
-                    child.unlink(missing_ok=True)
-                directory.rmdir()
+            if 'download_root' in locals():
+                shutil.rmtree(download_root, ignore_errors=True)
             raise
 
-    async def aget(self, file_id: str) -> StoredFile:
-        return await asyncio.to_thread(self.get, file_id)
+    def payload(self, stored, project_root, download_url):
+        payload = super().payload(stored, project_root, download_url)
+        reference = S3ObjectReference(
+            self.bucket,
+            stored.storage_key,
+            stored.version_id,
+            stored.sha256,
+            stored.size_bytes,
+        )
+        payload['path'] = reference.serialize()
+        payload['download_url'] = (
+            f'{download_url}?{urlencode({"storage_reference": reference.serialize()})}'
+        )
+        return payload
+
+    def release(self, stored):
+        downloads_root = (self.root / '.downloads').resolve()
+        path = stored.path.resolve()
+        if downloads_root in path.parents:
+            relative = path.relative_to(downloads_root)
+            if relative.parts:
+                shutil.rmtree(downloads_root / relative.parts[0], ignore_errors=True)
+
+    async def aget(self, file_id: str, reference=None) -> StoredFile:
+        return await asyncio.to_thread(self.get, file_id, reference)
