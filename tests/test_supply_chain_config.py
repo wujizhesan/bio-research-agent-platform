@@ -26,6 +26,7 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         files = [
             ROOT / "docker-compose.yml",
             ROOT / "docker-compose.secure.yml",
+            ROOT / "docker-compose.recovery.yml",
             ROOT / ".github" / "workflows" / "ci.yml",
         ]
         references = []
@@ -114,6 +115,21 @@ class SupplyChainConfigurationTests(unittest.TestCase):
             "${BACKEND_IMAGE:?required}",
         )
         self.assertEqual(compose["services"]["web"]["image"], "${FRONTEND_IMAGE:?required}")
+
+    def test_recovery_drill_restores_durable_state_and_discards_redis(self):
+        workflow = (
+            ROOT / ".github" / "workflows" / "recovery-drill.yml"
+        ).read_text(encoding="utf-8")
+        script = (ROOT / "scripts" / "recovery_drill.py").read_text(encoding="utf-8")
+        self.assertIn('cron: "37 2 * * 0"', workflow)
+        self.assertIn("--volumes", script)
+        self.assertIn("pg_dump", script)
+        self.assertIn("pg_restore", script)
+        self.assertIn('"alembic", "upgrade", "head"', script)
+        self.assertIn("backup_objects", script)
+        self.assertIn("restore_objects", script)
+        self.assertIn('"backed_up": False', script)
+        self.assertIn("verify_redis_is_disposable", script)
 
     def test_third_party_image_vulnerabilities_use_expiring_baselines(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
