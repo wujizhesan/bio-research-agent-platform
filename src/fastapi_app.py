@@ -29,6 +29,7 @@ try:
     from .api_dependencies import ApiDependencies
     from .api_file_routes import register_file_routes
     from .api_runtime import build_api_runtime
+    from .settings import PlatformSettings
     from .auth import AuthService, AuthenticationError, Principal
     from .domain_registry import active_tool_specs
     from .observability import (
@@ -56,6 +57,7 @@ except ImportError:
     from api_dependencies import ApiDependencies
     from api_file_routes import register_file_routes
     from api_runtime import build_api_runtime
+    from settings import PlatformSettings
     from auth import AuthService, AuthenticationError, Principal
     from domain_registry import active_tool_specs
     from observability import (
@@ -106,10 +108,11 @@ def _public_specs(domain=None):
 
 
 def _deployment_identity():
+    settings = PlatformSettings.from_env()
     return {
-        'release_tag': os.environ.get('APP_RELEASE_TAG', 'development'),
-        'git_sha': os.environ.get('APP_GIT_SHA', 'unknown'),
-        'image_reference': os.environ.get('APP_IMAGE_REFERENCE', 'unknown'),
+        'release_tag': settings.release_tag,
+        'git_sha': settings.git_sha,
+        'image_reference': settings.image_reference,
     }
 
 
@@ -124,10 +127,7 @@ async def _dependency_probe(component):
 
 
 def _readiness_timeout():
-    try:
-        return min(max(float(os.environ.get('READINESS_TIMEOUT_SECONDS', '2')), 0.1), 30.0)
-    except ValueError:
-        return 2.0
+    return PlatformSettings.from_env().readiness_timeout_seconds
 
 
 def _register_core_routes(
@@ -153,6 +153,9 @@ def _register_core_routes(
     @app.get('/health', tags=['system'])
     async def health(request: Request):
         deployment = _deployment_identity()
+        configuration = getattr(app.state, 'configuration', None)
+        if configuration is None:
+            configuration = PlatformSettings.from_env().public_snapshot()
         expected_release = request.headers.get('x-expected-release')
         expected_commit = request.headers.get('x-expected-commit')
         if (
@@ -166,6 +169,7 @@ def _register_core_routes(
                     'status': 'version_mismatch',
                     'service': API_NAME,
                     'deployment': deployment,
+                    'configuration': configuration,
                 },
             )
         components = {
@@ -195,6 +199,7 @@ def _register_core_routes(
                     'status': 'degraded',
                     'service': API_NAME,
                     'deployment': deployment,
+                    'configuration': configuration,
                     'dependencies': checks,
                 },
             )
@@ -203,6 +208,7 @@ def _register_core_routes(
             'service': API_NAME,
             'version': API_VERSION,
             'deployment': deployment,
+            'configuration': configuration,
             'dependencies': checks,
             'database': checks['database'],
             'job_backend': app.state.job_backend,

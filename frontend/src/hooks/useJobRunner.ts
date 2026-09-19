@@ -3,7 +3,7 @@ import { useCallback, useState } from 'react'
 import { apiFetch, followJob } from '../app/api'
 import { statusLabels } from '../app/constants'
 import { parseJob, parseJobPayload } from '../app/platformPayloadValidation'
-import type { EventItem, Job } from '../app/types'
+import type { EventItem, Job, JobResolutionDecision } from '../app/types'
 import { useManagedJobStream } from './useManagedJobStream'
 
 export function formatTime(value?: string) {
@@ -114,7 +114,7 @@ export function useJobRunner({ apiBase, token, selectedProjectId, refresh, upser
   }
 
   async function retryJob(sourceJob: Job) {
-    if (!['failed', 'cancelled'].includes(sourceJob.status)) return
+    if (!['failed', 'cancelled', 'indeterminate'].includes(sourceJob.status)) return
     const controller = beginJobStream()
     setLoading(true)
     setError('')
@@ -135,6 +135,37 @@ export function useJobRunner({ apiBase, token, selectedProjectId, refresh, upser
         setLoading(false)
         void refresh()
       }
+    }
+  }
+
+  async function resolveIndeterminateJob(
+    sourceJob: Job,
+    decision: JobResolutionDecision,
+    reason: string,
+  ) {
+    if (sourceJob.status !== 'indeterminate' || sourceJob.resolution) return
+    setLoading(true)
+    setError('')
+    try {
+      const response = await apiFetch<unknown>(apiBase, token, `/api/v1/jobs/${sourceJob.job_id}/resolve`, {
+        method: 'POST',
+        body: JSON.stringify({ decision, reason, evidence: {} }),
+      })
+      const jobResult = parseJobPayload(response)
+      if (!jobResult.value) throw new Error(jobResult.issues.join('；'))
+      const resolvedJob = jobResult.value
+      updateJob(resolvedJob)
+      setEvents((current) => [...current, {
+        at: formatTime(new Date().toISOString()),
+        type: 'resolution',
+        status: resolvedJob.status,
+        detail: `人工裁决：${decision}`,
+      }])
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '任务裁决失败')
+    } finally {
+      setLoading(false)
+      void refresh()
     }
   }
 
@@ -196,6 +227,7 @@ export function useJobRunner({ apiBase, token, selectedProjectId, refresh, upser
     submitToolJob,
     cancelSelectedJob,
     retryJob,
+    resolveIndeterminateJob,
     downloadJobArtifact,
     previewJobArtifact,
     selectJob,

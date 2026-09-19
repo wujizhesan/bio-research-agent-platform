@@ -5,10 +5,21 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from src.auth import AuthService, hash_password
+from src.auth import AuthService, Principal, hash_password
 
 
 class AuthConfigurationTests(unittest.TestCase):
+    def test_only_admin_can_approve_indeterminate_jobs(self):
+        service = AuthService()
+        self.assertTrue(service.has_permission(
+            Principal('admin-user', ('admin',), 'jwt'),
+            'jobs:approve',
+        ))
+        self.assertFalse(service.has_permission(
+            Principal('researcher-user', ('researcher',), 'jwt'),
+            'jobs:approve',
+        ))
+
     def test_production_rejects_legacy_token(self):
         environment = {
             'APP_ENV': 'production',

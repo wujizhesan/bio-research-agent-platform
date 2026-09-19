@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from typing import Any
 
 try:
+    from .execution_semantics import normalize_artifact_contracts, normalize_execution_semantics
     from .plugin_manifest import build_manifest, validate_json_schema
     from .resource_scheduling import ResourceRequest
     from .plugin_security import normalize_permissions
 except ImportError:
+    from execution_semantics import normalize_artifact_contracts, normalize_execution_semantics
     from plugin_manifest import build_manifest, validate_json_schema
     from resource_scheduling import ResourceRequest
     from plugin_security import normalize_permissions
@@ -35,6 +37,13 @@ def validate_tool_map(domain: str, tools: object, *, allow_empty: bool = False) 
         validate_json_schema(output_schema, f"{domain}.{name} output schema")
         ResourceRequest.from_mapping(spec.get("resources"))
         normalize_permissions(spec.get("permissions"), spec["parameters"])
+        normalize_artifact_contracts(spec.get("artifacts"), spec["parameters"])
+        normalize_execution_semantics(
+            spec.get("execution_semantics"),
+            spec["parameters"],
+            normalize_permissions(spec.get("permissions"), spec["parameters"]),
+            spec.get("artifacts"),
+        )
         if not callable(spec.get("function")):
             raise ValueError(f"domain {domain} tool {name} needs a callable function")
     return tools
@@ -175,6 +184,12 @@ class DomainRegistry:
                 "permissions": dict(
                     self._domains[domain_key].manifest["tool_contracts"][name]["permissions"]
                 ),
+                "execution_semantics": self._domains[domain_key].manifest[
+                    "tool_contracts"
+                ][name]["execution_semantics"],
+                "artifacts": list(self._domains[domain_key].manifest[
+                    "tool_contracts"
+                ][name]["artifacts"]),
                 "function": spec["function"],
             }
             for domain_key in selected

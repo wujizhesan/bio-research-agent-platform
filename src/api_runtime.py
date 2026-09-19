@@ -2,7 +2,6 @@
 
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-import os
 from pathlib import Path
 
 try:
@@ -15,6 +14,7 @@ try:
     from .job_execution import build_tool_executor_from_env, job_max_workers_from_env
     from .plugin_manager import PluginManager
     from .redis_job_manager import RedisJobManager
+    from .settings import PlatformSettings
 except ImportError:
     from audit_log import AuditLogger
     from auth import AuthService, LoginRateLimiter
@@ -25,6 +25,7 @@ except ImportError:
     from job_execution import build_tool_executor_from_env, job_max_workers_from_env
     from plugin_manager import PluginManager
     from redis_job_manager import RedisJobManager
+    from settings import PlatformSettings
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class ApiRuntime:
     storage_backend: str
     owns_jobs: bool
     owns_database: bool
+    settings: object = None
 
     def bind(self, app):
         app.state.job_manager = self.jobs
@@ -50,6 +52,9 @@ class ApiRuntime:
         app.state.storage_backend = self.storage_backend
         app.state.audit_log = self.audit
         app.state.auth_service = self.auth
+        app.state.configuration = (
+            self.settings.public_snapshot() if self.settings else None
+        )
 
     @asynccontextmanager
     async def lifespan(self, _app):
@@ -63,13 +68,15 @@ class ApiRuntime:
                 await self.database.close()
 
 
-def _build_jobs(output_root, job_manager):
+def _build_jobs(output_root, job_manager, settings=None):
     if job_manager is not None:
         return job_manager
-    if os.environ.get('JOB_BACKEND', 'local').lower() == 'redis':
+    settings = settings or PlatformSettings.from_env()
+    if settings.job_backend == 'redis':
         return RedisJobManager(
-            redis_url=os.environ.get('REDIS_URL', 'redis://127.0.0.1:6379/0'),
-            namespace=os.environ.get('REDIS_NAMESPACE', 'bioagent'),
+            redis_url=settings.redis_url,
+            namespace=settings.redis_namespace,
+            settings=settings,
         )
     return JobManager(
         max_workers=job_max_workers_from_env(),
@@ -78,32 +85,23 @@ def _build_jobs(output_root, job_manager):
     )
 
 
-def _build_storage(project_root, output_root, file_storage):
-    configured_backend = os.environ.get('STORAGE_BACKEND', 'local').strip().lower()
+def _build_storage(project_root, output_root, file_storage, settings=None):
+    settings = settings or PlatformSettings.from_env()
+    configured_backend = settings.storage_backend
     if file_storage is not None:
         return file_storage, getattr(file_storage, 'backend', configured_backend)
-    if os.environ.get('APP_ENV', 'development').strip().lower() == 'production':
+    if settings.app_env == 'production':
         if configured_backend != 's3':
             raise ValueError('production requires STORAGE_BACKEND=s3')
-    configured_root = os.environ.get('UPLOAD_ROOT')
+    configured_root = settings.upload_root
     upload_root = Path(configured_root) if configured_root else output_root / 'uploads'
     if not upload_root.is_absolute():
         upload_root = project_root / upload_root
-    max_bytes = int(os.environ.get('UPLOAD_MAX_BYTES', str(50 * 1024 * 1024)))
-    total_quota_bytes = int(os.environ.get(
-        'UPLOAD_TOTAL_QUOTA_BYTES', str(10 * 1024 * 1024 * 1024)
-    ))
-    max_decompressed_bytes = int(os.environ.get(
-        'UPLOAD_MAX_DECOMPRESSED_BYTES', str(200 * 1024 * 1024)
-    ))
-    max_compression_ratio = float(os.environ.get(
-        'UPLOAD_MAX_COMPRESSION_RATIO', '100'
-    ))
     storage_limits = {
-        'max_bytes': max_bytes,
-        'total_quota_bytes': total_quota_bytes,
-        'max_decompressed_bytes': max_decompressed_bytes,
-        'max_compression_ratio': max_compression_ratio,
+        'max_bytes': settings.upload_max_bytes,
+        'total_quota_bytes': settings.upload_total_quota_bytes,
+        'max_decompressed_bytes': settings.upload_max_decompressed_bytes,
+        'max_compression_ratio': settings.upload_max_compression_ratio,
         'security_pipeline': build_file_security_pipeline_from_env(),
     }
     if configured_backend == 'local':
@@ -111,14 +109,14 @@ def _build_storage(project_root, output_root, file_storage):
     elif configured_backend == 's3':
         storage = S3FileStorage(
             upload_root,
-            bucket=os.environ.get('S3_BUCKET', ''),
-            prefix=os.environ.get('S3_PREFIX', 'bio-agent'),
-            endpoint_url=os.environ.get('S3_ENDPOINT_URL') or None,
-            region_name=os.environ.get('S3_REGION') or None,
-            expected_bucket_owner=os.environ.get('S3_EXPECTED_BUCKET_OWNER') or None,
-            access_key_id=os.environ.get('AWS_ACCESS_KEY_ID') or None,
-            secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY') or None,
-            session_token=os.environ.get('AWS_SESSION_TOKEN') or None,
+            bucket=settings.s3_bucket,
+            prefix=settings.s3_prefix,
+            endpoint_url=settings.s3_endpoint_url or None,
+            region_name=settings.s3_region or None,
+            expected_bucket_owner=settings.s3_expected_bucket_owner or None,
+            access_key_id=settings.aws_access_key_id or None,
+            secret_access_key=settings.aws_secret_access_key or None,
+            session_token=settings.aws_session_token or None,
             **storage_limits,
         )
     else:
@@ -135,14 +133,18 @@ def build_api_runtime(
     database=None,
     file_storage=None,
     audit_log=None,
+    settings=None,
 ):
     project_root = Path(project_root)
     output_root = Path(output_root)
+    settings = settings or PlatformSettings.from_env()
     storage, storage_backend = _build_storage(
         project_root,
         output_root,
         file_storage,
+        settings,
     )
+    settings.validate('api')
     plugins = plugin_manager or PluginManager(
         state_path=output_root / 'plugin_state.json'
     )
@@ -150,7 +152,7 @@ def build_api_runtime(
     audit = audit_log or AuditLogger(output_root / 'audit.jsonl')
     auth = AuthService.from_env()
     login_rate_limiter = LoginRateLimiter.from_env()
-    jobs = _build_jobs(output_root, job_manager)
+    jobs = _build_jobs(output_root, job_manager, settings)
     return ApiRuntime(
         jobs=jobs,
         plugins=plugins,
@@ -163,4 +165,5 @@ def build_api_runtime(
         storage_backend=storage_backend,
         owns_jobs=job_manager is None,
         owns_database=database is None,
+        settings=settings,
     )

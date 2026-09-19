@@ -40,6 +40,13 @@ class RedisReadJobManager:
     def shutdown(self):
         return None
 
+    def list_workers(self):
+        return [{
+            'worker_id': 'worker-1',
+            'draining': False,
+            'active_jobs': 0,
+        }]
+
 
 class RedisEventPubSub:
     def __init__(self):
@@ -81,6 +88,84 @@ class RedisEventJobManager(RedisReadJobManager):
         return self.pubsub
 
 
+class RedisReplayJobManager(RedisReadJobManager):
+    def __init__(self):
+        super().__init__()
+        self.cursors = []
+
+    def get(self, job_id):
+        self.read_count += 1
+        return {
+            'job_id': job_id,
+            'tool': 'research_catalog',
+            'status': 'running',
+            'created_at': '2026-08-23T00:00:00+00:00',
+            'attempts': 1,
+        }
+
+    def read_job_events(self, job_id, last_event_id, block_ms, count):
+        self.cursors.append(last_event_id)
+        return [('2-0', {
+            'job_id': job_id,
+            'tool': 'research_catalog',
+            'status': 'completed',
+            'created_at': '2026-08-23T00:00:00+00:00',
+            'result': {'status': 'ok'},
+            'attempts': 1,
+        })]
+
+
+class RedisLostEventJobManager(RedisReadJobManager):
+    def get(self, _job_id):
+        self.read_count += 1
+        return None
+
+    def read_job_events(self, *_args, **_kwargs):
+        return []
+
+
+class RedisDurableSubmitJobManager(RedisReadJobManager):
+    def __init__(self):
+        super().__init__()
+        self.order = []
+        self.record = None
+
+    def prepare(self, tool, arguments, **_kwargs):
+        self.order.append('prepare')
+        self.record = {
+            'job_id': 'durable-submit-job',
+            'tool': tool,
+            'status': 'queued',
+            'created_at': '2026-09-15T00:00:00+00:00',
+            '_arguments': dict(arguments),
+            '_attempts': 0,
+            '_cancel_requested': False,
+            'resources': {},
+            'priority': 0,
+        }
+        return {
+            key: value
+            for key, value in self.record.items()
+            if not key.startswith('_')
+        }
+
+    def durable_record(self, job_id):
+        return dict(self.record) if self.record and self.record['job_id'] == job_id else None
+
+    def dispatch(self, job_id):
+        self.order.append('dispatch')
+        return self.get(job_id)
+
+    def get(self, job_id):
+        if self.record is None or self.record['job_id'] != job_id:
+            return None
+        return {
+            key: value
+            for key, value in self.record.items()
+            if not key.startswith('_')
+        }
+
+
 class FastApiAppTests(unittest.TestCase):
     def _app(self, root, file_storage=None, audit_log=None):
         app = create_app(
@@ -120,6 +205,8 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(health.json()['dependencies']['job_backend'], 'ok')
                     self.assertEqual(health.json()['dependencies']['storage'], 'ok')
                     self.assertEqual(health.json()['storage_backend'], 'local')
+                    self.assertEqual(health.json()['configuration']['schema_version'], 1)
+                    self.assertEqual(len(health.json()['configuration']['fingerprint']), 64)
                     self.assertEqual(health.headers['x-request-id'], 'interview-trace-001')
                     self.assertEqual(
                         health.headers['x-trace-id'],
@@ -149,6 +236,43 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(job['request_id'], 'job-request-001')
                     completed = self._wait_for_job(client, job['job_id'])
                     self.assertEqual(completed['trace_id'], 'job-trace-001')
+            finally:
+                self._close_app(app)
+
+    def test_redis_submission_commits_outbox_before_dispatch(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_outbox_') as raw:
+            manager = RedisDurableSubmitJobManager()
+            database = Database(
+                f"sqlite+aiosqlite:///{(Path(raw) / 'api.sqlite3').as_posix()}"
+            )
+            original_stage = database.stage_job
+
+            async def stage(record):
+                manager.order.append('stage')
+                await original_stage(record)
+
+            database.stage_job = stage
+            app = create_app(
+                job_manager=manager,
+                plugin_manager=PluginManager(
+                    state_path=Path(raw) / 'plugins.json'
+                ),
+                database=database,
+                audit_log=AuditLogger(Path(raw) / 'audit.jsonl'),
+            )
+            try:
+                with TestClient(app) as client:
+                    response = client.post('/api/v1/jobs', json={
+                        'tool': 'research_catalog',
+                        'arguments': {},
+                    })
+                self.assertEqual(response.status_code, 202)
+                self.assertEqual(manager.order[:3], ['prepare', 'stage', 'dispatch'])
+                dispatchable = asyncio.run(database.list_dispatchable_jobs())
+                self.assertEqual(
+                    [item['job_id'] for item in dispatchable],
+                    ['durable-submit-job'],
+                )
             finally:
                 self._close_app(app)
 
@@ -405,6 +529,12 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(response.status_code, 200)
                     self.assertEqual(response.json()['job']['status'], 'completed')
                     self.assertEqual(manager.read_count, 1)
+                    workers = client.get('/api/v1/workers')
+                    self.assertEqual(workers.status_code, 200)
+                    self.assertEqual(
+                        workers.json()['workers'][0]['worker_id'],
+                        'worker-1',
+                    )
             finally:
                 self._close_app(app)
 
@@ -424,6 +554,68 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(events.status_code, 200)
                     self.assertIn('"status": "completed"', body)
                     self.assertTrue(manager.pubsub.closed)
+            finally:
+                self._close_app(app)
+
+    def test_redis_sse_replays_from_last_event_id(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_redis_replay_') as raw:
+            manager = RedisReplayJobManager()
+            app = create_app(
+                job_manager=manager,
+                plugin_manager=PluginManager(state_path=Path(raw) / 'plugins.json'),
+                database=Database(f"sqlite+aiosqlite:///{(Path(raw) / 'api.sqlite3').as_posix()}"),
+                audit_log=AuditLogger(Path(raw) / 'audit.jsonl'),
+            )
+            try:
+                with TestClient(app) as client:
+                    with client.stream(
+                        'GET',
+                        '/api/v1/jobs/redis-job/events',
+                        headers={'Last-Event-ID': '1-0'},
+                    ) as events:
+                        body = ''.join(events.iter_text())
+                    self.assertEqual(events.status_code, 200)
+                    self.assertIn('id: 2-0', body)
+                    self.assertIn('"status": "completed"', body)
+                    self.assertEqual(manager.cursors, ['1-0'])
+            finally:
+                self._close_app(app)
+
+    def test_redis_sse_falls_back_to_durable_terminal_event(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_durable_sse_') as raw:
+            manager = RedisLostEventJobManager()
+            database = Database(
+                f"sqlite+aiosqlite:///{(Path(raw) / 'api.sqlite3').as_posix()}"
+            )
+            asyncio.run(database.init_schema())
+            asyncio.run(database.upsert_job({
+                'job_id': 'durable-event-job',
+                'tool': 'research_catalog',
+                'status': 'completed',
+                'created_at': '2026-09-16T00:00:00+00:00',
+                'finished_at': '2026-09-16T00:00:01+00:00',
+                'result': {'status': 'ok'},
+                '_revision': 4,
+                '_event_id': '4000-0',
+            }))
+            app = create_app(
+                job_manager=manager,
+                plugin_manager=PluginManager(state_path=Path(raw) / 'plugins.json'),
+                database=database,
+                audit_log=AuditLogger(Path(raw) / 'audit.jsonl'),
+            )
+            try:
+                with TestClient(app) as client:
+                    with client.stream(
+                        'GET',
+                        '/api/v1/jobs/durable-event-job/events',
+                        headers={'Last-Event-ID': '3999-0'},
+                    ) as events:
+                        body = ''.join(events.iter_text())
+                    self.assertEqual(events.status_code, 200)
+                    self.assertIn('id: 4000-0', body)
+                    self.assertIn('"status": "completed"', body)
+                    self.assertIn('"replay_gap": true', body)
             finally:
                 self._close_app(app)
 
@@ -729,6 +921,82 @@ class FastApiAppTests(unittest.TestCase):
                     child = retried.json()['job']
                     self.assertEqual(child['retry_of'], job_id)
                     self.assertEqual(child['tool'], 'research_catalog')
+            finally:
+                self._close_app(app)
+
+    def test_required_artifact_argument_is_rejected_before_queueing(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_artifact_contract_') as raw:
+            app = self._app(raw)
+            try:
+                with TestClient(app) as client:
+                    response = client.post(
+                        '/api/v1/jobs',
+                        json={'tool': 'cadd_run_screening', 'arguments': {}},
+                    )
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn('artifact argument is required: out', response.json()['detail'])
+                    self.assertEqual(
+                        client.get('/api/v1/jobs').json()['jobs'],
+                        [],
+                    )
+            finally:
+                self._close_app(app)
+
+    def test_indeterminate_job_requires_resolution_before_retry(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_resolution_') as raw:
+            app = self._app(raw)
+            try:
+                with TestClient(app) as client:
+                    submitted = client.post(
+                        '/api/v1/jobs',
+                        json={'tool': 'research_catalog', 'arguments': {}},
+                    ).json()['job']
+                    self._wait_for_job(client, submitted['job_id'])
+                    manager = app.state.job_manager
+                    with manager._lock:
+                        record = manager._jobs[submitted['job_id']]
+                        record['status'] = 'indeterminate'
+                        record['error'] = 'commit outcome is unknown'
+                        record['indeterminate'] = {'requires_manual_review': True}
+                        record.pop('resolution', None)
+                        manager._persist(record)
+
+                    rejected = client.post(
+                        f"/api/v1/jobs/{submitted['job_id']}/retry"
+                    )
+                    self.assertEqual(rejected.status_code, 400)
+                    self.assertIn('approve_retry', rejected.json()['detail'])
+
+                    resolved = client.post(
+                        f"/api/v1/jobs/{submitted['job_id']}/resolve",
+                        json={
+                            'decision': 'approve_retry',
+                            'reason': 'external system confirms no result was committed',
+                            'evidence': {'ticket': 'INC-42'},
+                        },
+                    )
+                    self.assertEqual(resolved.status_code, 200)
+                    source = resolved.json()['job']
+                    self.assertEqual(source['resolution']['decision'], 'approve_retry')
+                    self.assertEqual(source['resolution']['reviewer'], 'local-dev')
+
+                    duplicate = client.post(
+                        f"/api/v1/jobs/{submitted['job_id']}/resolve",
+                        json={
+                            'decision': 'approve_retry',
+                            'reason': 'attempt to approve twice',
+                        },
+                    )
+                    self.assertEqual(duplicate.status_code, 409)
+
+                    retried = client.post(
+                        f"/api/v1/jobs/{submitted['job_id']}/retry"
+                    )
+                    self.assertEqual(retried.status_code, 202)
+                    self.assertEqual(
+                        retried.json()['job']['retry_of'],
+                        submitted['job_id'],
+                    )
             finally:
                 self._close_app(app)
 

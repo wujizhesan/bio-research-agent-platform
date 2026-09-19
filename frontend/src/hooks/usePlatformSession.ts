@@ -9,7 +9,7 @@ import {
 } from '../app/platformPayloadValidation'
 import type { Capabilities, Job, Plugin, Project } from '../app/types'
 
-const terminalJobStatuses = new Set<Job['status']>(['completed', 'failed', 'cancelled'])
+const terminalJobStatuses = new Set<Job['status']>(['completed', 'failed', 'cancelled', 'indeterminate'])
 
 function mergeJobState(previous: Job | undefined, next: Job) {
   if (previous && terminalJobStatuses.has(previous.status) && !terminalJobStatuses.has(next.status)) return previous

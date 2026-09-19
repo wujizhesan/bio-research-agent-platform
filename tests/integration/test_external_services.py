@@ -9,11 +9,13 @@ from threading import Event
 import time
 from uuid import uuid4
 import unittest
+from unittest.mock import patch
 
 from sqlalchemy import text
 
 from src.database import Database
 from src.job_execution import InlineToolExecutor
+from src.job_state_store import DatabaseStateWriter
 from src.redis_job_manager import RedisJobManager
 
 
@@ -47,6 +49,80 @@ class ExternalServiceTests(unittest.TestCase):
     def test_postgres_migration_and_job_round_trip(self):
         asyncio.run(self._postgres_round_trip())
 
+    def test_postgres_read_only_backpressures_then_recovers(self):
+        asyncio.run(self._postgres_read_only_backpressure())
+
+    async def _postgres_read_only_backpressure(self):
+        import asyncpg
+
+        raw_url = os.environ['DATABASE_URL'].replace(
+            'postgresql+asyncpg://',
+            'postgresql://',
+        )
+        admin = await asyncpg.connect(raw_url)
+        database_name = await admin.fetchval('SELECT current_database()')
+        if not database_name.replace('_', '').replace('-', '').isalnum():
+            self.fail(f'unsafe PostgreSQL database name: {database_name}')
+        quoted_database = '"' + database_name.replace('"', '""') + '"'
+        job_id = f'ci-read-only-{uuid4().hex}'
+        writer = None
+        read_only_enabled = False
+        try:
+            await admin.execute(
+                f'ALTER DATABASE {quoted_database} SET default_transaction_read_only TO on'
+            )
+            read_only_enabled = True
+            with patch.dict(os.environ, {
+                'AUTO_CREATE_SCHEMA': 'false',
+                'STATE_WRITER_MAX_RETRIES': '20',
+                'STATE_WRITER_RETRY_BASE_SECONDS': '0.05',
+                'STATE_WRITER_QUEUE_MAXSIZE': '4',
+                'STATE_WRITER_PAUSE_THRESHOLD': '0.5',
+                'STATE_WRITER_RESUME_THRESHOLD': '0.25',
+            }, clear=False):
+                writer = DatabaseStateWriter(os.environ['DATABASE_URL'])
+                writer.save({
+                    'job_id': job_id,
+                    'tool': 'research_catalog',
+                    'status': 'running',
+                    'created_at': '2026-09-16T00:00:00+00:00',
+                    '_revision': 1,
+                })
+                await asyncio.sleep(0.2)
+                self.assertGreaterEqual(writer.pending(), 1)
+                await admin.execute(
+                    f'ALTER DATABASE {quoted_database} RESET default_transaction_read_only'
+                )
+                read_only_enabled = False
+                await asyncio.to_thread(writer.flush)
+                self.assertTrue(writer.health()['healthy'])
+            database = Database(os.environ['DATABASE_URL'])
+            try:
+                stored = await database.get_job(job_id)
+                self.assertEqual(stored['status'], 'running')
+            finally:
+                await database.close()
+        finally:
+            if read_only_enabled:
+                await admin.execute(
+                    f'ALTER DATABASE {quoted_database} RESET default_transaction_read_only'
+                )
+            await admin.close()
+            if writer is not None:
+                try:
+                    await asyncio.to_thread(writer.close)
+                except RuntimeError:
+                    pass
+            database = Database(os.environ['DATABASE_URL'])
+            try:
+                async with database.engine.begin() as connection:
+                    await connection.execute(
+                        text('DELETE FROM job_records WHERE job_id = :job_id'),
+                        {'job_id': job_id},
+                    )
+            finally:
+                await database.close()
+
     async def _postgres_round_trip(self):
         database = Database(os.environ['DATABASE_URL'])
         job_id = f'ci-postgres-{uuid4().hex}'
@@ -67,8 +143,14 @@ class ExternalServiceTests(unittest.TestCase):
                     text('SELECT run_context FROM job_records WHERE job_id = :job_id'),
                     {'job_id': os.environ['CI_LEGACY_JOB_ID']},
                 )
-            self.assertEqual(revision, '0006_job_run_context')
+            self.assertEqual(revision, '0011_job_resolution')
             self.assertIn('run_context', columns)
+            self.assertTrue({
+                'execution_identity',
+                'routing',
+                'execution',
+                'resolution',
+            }.issubset(columns))
             self.assertIsNone(legacy_context)
 
             run_context = {
@@ -78,6 +160,7 @@ class ExternalServiceTests(unittest.TestCase):
                 'tool': 'research_catalog',
                 'domain': 'research',
             }
+            execution_identity = {'fingerprint': uuid4().hex}
             await database.upsert_job({
                 'job_id': job_id,
                 'tool': 'research_catalog',
@@ -86,10 +169,13 @@ class ExternalServiceTests(unittest.TestCase):
                 '_arguments': {},
                 'run_context': run_context,
                 'trace_id': run_context['trace_id'],
+                'execution_identity': execution_identity,
+                'routing': {'route_id': 'postgres-route'},
             })
             stored = await database.get_job(job_id)
             self.assertEqual(stored['run_context'], run_context)
             self.assertEqual(stored['trace_id'], run_context['trace_id'])
+            self.assertEqual(stored['execution_identity'], execution_identity)
         finally:
             async with database.engine.begin() as connection:
                 await connection.execute(
@@ -139,11 +225,240 @@ class ExternalServiceTests(unittest.TestCase):
             self.assertEqual(stored['run_context']['job_id'], submitted['job_id'])
             self.assertEqual(stored['run_context']['trace_id'], stored['trace_id'])
             self.assertGreaterEqual(client.zcard(f'{namespace}:jobs:index'), 1)
+            events = manager.read_job_events(
+                submitted['job_id'],
+                last_event_id='0-0',
+                block_ms=0,
+            )
+            self.assertGreaterEqual(len(events), 3)
+            self.assertEqual(events[-1][1]['status'], 'completed')
+            replay = manager.read_job_events(
+                submitted['job_id'],
+                last_event_id=events[-2][0],
+                block_ms=0,
+            )
+            self.assertEqual(replay[-1][0], events[-1][0])
         finally:
             keys = list(client.scan_iter(f'{namespace}:*'))
             if keys:
                 client.delete(*keys)
             manager.shutdown()
+
+    def test_real_redis_routes_pinned_job_only_to_matching_worker(self):
+        import redis
+
+        namespace = f'ci:{uuid4().hex}'
+        managers = [
+            RedisJobManager(
+                redis_client=redis.Redis.from_url(
+                    os.environ['REDIS_URL'],
+                    decode_responses=True,
+                ),
+                namespace=namespace,
+                worker_id=worker_id,
+                capability_routing=True,
+                enforce_capacity=worker_id != 'api',
+            )
+            for worker_id in ('api', 'old-worker', 'new-worker')
+        ]
+        api, old, new = managers
+        try:
+            expected = api._execution_identity('research_catalog')
+            incompatible = dict(expected)
+            incompatible['fingerprint'] = 'old-implementation'
+            old._execution_catalog['research_catalog'] = incompatible
+            new._execution_catalog['research_catalog'] = dict(expected)
+            old.heartbeat_worker()
+            submitted = api.submit('research_catalog', {})
+            self.assertEqual(
+                submitted['scheduling']['status'],
+                'waiting_for_capability',
+            )
+            self.assertIsNone(old._next_job())
+            new.heartbeat_worker()
+            self.assertEqual(new._next_job(), submitted['job_id'])
+            completed = new.run_job(submitted['job_id'])
+            self.assertEqual(completed['status'], 'completed')
+            self.assertEqual(completed['execution']['worker_id'], 'new-worker')
+            self.assertEqual(
+                completed['execution']['identity']['fingerprint'],
+                expected['fingerprint'],
+            )
+        finally:
+            keys = list(api.redis.scan_iter(f'{namespace}:*'))
+            if keys:
+                api.redis.delete(*keys)
+            for manager in managers:
+                manager.shutdown()
+
+    def test_postgres_outbox_rebuilds_queue_after_redis_namespace_loss(self):
+        client, namespace = self._real_redis()
+        original = RedisJobManager(
+            redis_client=client,
+            namespace=namespace,
+            tool_executor=InlineToolExecutor(
+                lambda tool, arguments: {
+                    'status': 'ok',
+                    'tool': tool,
+                    'arguments': arguments,
+                }
+            ),
+        )
+        job_id = None
+        writer = None
+        recovered = None
+        try:
+            submitted = original.submit('research_catalog', {})
+            job_id = submitted['job_id']
+
+            async def stage_job():
+                database = Database(os.environ['DATABASE_URL'])
+                try:
+                    await database.stage_job(original.durable_record(job_id))
+                finally:
+                    await database.close()
+
+            asyncio.run(stage_job())
+            keys = list(client.scan_iter(f'{namespace}:*'))
+            if keys:
+                client.delete(*keys)
+            writer = DatabaseStateWriter(os.environ['DATABASE_URL'])
+            recovered = RedisJobManager(
+                redis_url=os.environ['REDIS_URL'],
+                namespace=namespace,
+                state_store=writer,
+                tool_executor=InlineToolExecutor(
+                    lambda tool, arguments: {
+                        'status': 'ok',
+                        'tool': tool,
+                        'arguments': arguments,
+                    }
+                ),
+            )
+            self.assertEqual(recovered.rebuild_durable_queue(), [job_id])
+            self.assertEqual(recovered._next_job(), job_id)
+            recovered._complete_queued_item(job_id, 0.05)
+            writer.flush()
+            self.assertEqual(recovered.get(job_id)['status'], 'completed')
+
+            async def verify_job():
+                database = Database(os.environ['DATABASE_URL'])
+                try:
+                    return await database.get_job(job_id)
+                finally:
+                    await database.close()
+
+            self.assertEqual(asyncio.run(verify_job())['status'], 'completed')
+            async def verify_events():
+                database = Database(os.environ['DATABASE_URL'])
+                try:
+                    return await database.list_job_events(job_id)
+                finally:
+                    await database.close()
+
+            durable_events = asyncio.run(verify_events())
+            self.assertEqual(durable_events[-1]['status'], 'completed')
+            self.assertTrue(durable_events[-1]['terminal'])
+        finally:
+            if recovered is not None:
+                recovered.shutdown()
+            if writer is not None:
+                writer.close()
+            original.shutdown()
+            if job_id is not None:
+                async def cleanup_job():
+                    database = Database(os.environ['DATABASE_URL'])
+                    try:
+                        async with database.engine.begin() as connection:
+                            await connection.execute(
+                                text('DELETE FROM job_records WHERE job_id = :job_id'),
+                                {'job_id': job_id},
+                            )
+                    finally:
+                        await database.close()
+
+                asyncio.run(cleanup_job())
+
+    def test_postgres_execution_result_prevents_reexecution_after_redis_loss(self):
+        import redis
+
+        namespace = f'ci:{uuid4().hex}'
+        client = redis.Redis.from_url(os.environ['REDIS_URL'], decode_responses=True)
+        original = RedisJobManager(
+            redis_client=client,
+            namespace=namespace,
+            worker_id='original-worker',
+        )
+        job_id = None
+        writer = None
+        recovered = None
+        executions = []
+        try:
+            submitted = original.submit('research_catalog', {})
+            job_id = submitted['job_id']
+
+            async def stage_job():
+                database = Database(os.environ['DATABASE_URL'])
+                try:
+                    await database.stage_job(original.durable_record(job_id))
+                finally:
+                    await database.close()
+
+            asyncio.run(stage_job())
+            claimed = original._claim(original._load(job_id))
+            writer = DatabaseStateWriter(os.environ['DATABASE_URL'])
+            attempt = writer.begin_execution_attempt(
+                claimed['_execution_key'],
+                job_id,
+                claimed['_fencing_token'],
+                claimed['_attempts'],
+            )
+            self.assertEqual(attempt['status'], 'running')
+            writer.store_execution_result(
+                claimed['_execution_key'],
+                job_id,
+                {'status': 'ok', 'source': 'durable-result'},
+                claimed['_fencing_token'],
+            )
+
+            keys = list(client.scan_iter(f'{namespace}:*'))
+            if keys:
+                client.delete(*keys)
+            recovered = RedisJobManager(
+                redis_url=os.environ['REDIS_URL'],
+                namespace=namespace,
+                state_store=writer,
+                worker_id='replacement-worker',
+                tool_executor=InlineToolExecutor(
+                    lambda tool, arguments: executions.append((tool, arguments))
+                ),
+            )
+            self.assertEqual(recovered.rebuild_durable_queue(), [job_id])
+            result = recovered.run_job(job_id)
+            writer.flush()
+            self.assertEqual(result['status'], 'completed')
+            self.assertEqual(result['result']['source'], 'durable-result')
+            self.assertEqual(executions, [])
+        finally:
+            if recovered is not None:
+                recovered.shutdown()
+            if writer is not None:
+                writer.close()
+            original.shutdown()
+            client.close()
+            if job_id is not None:
+                async def cleanup_job():
+                    database = Database(os.environ['DATABASE_URL'])
+                    try:
+                        async with database.engine.begin() as connection:
+                            await connection.execute(
+                                text('DELETE FROM job_records WHERE job_id = :job_id'),
+                                {'job_id': job_id},
+                            )
+                    finally:
+                        await database.close()
+
+                asyncio.run(cleanup_job())
 
     def test_killed_worker_job_is_recovered_after_lease_expiry(self):
         import redis
@@ -355,6 +670,62 @@ time.sleep(60)
         self.assertEqual(completed['status'], 'completed')
         self.assertTrue(completed['result']['arguments']['reconnect'])
 
+    def test_network_partition_during_cancel_is_observed_after_reconnect(self):
+        import redis
+
+        client, namespace = self._real_redis()
+        control_client = redis.Redis.from_url(
+            os.environ['REDIS_URL'],
+            decode_responses=True,
+        )
+        started = Event()
+
+        class CancellableExecutor:
+            def execute(self, _tool, _arguments, cancelled=None, heartbeat=None):
+                started.set()
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if cancelled and cancelled():
+                        return {'status': 'ok', 'cancel_observed': True}
+                    if heartbeat:
+                        heartbeat()
+                    time.sleep(0.05)
+                raise RuntimeError('cancellation was not observed after reconnect')
+
+        worker = RedisJobManager(
+            redis_client=client,
+            namespace=namespace,
+            worker_id='partitioned-worker',
+            tool_executor=CancellableExecutor(),
+        )
+        control = RedisJobManager(
+            redis_client=control_client,
+            namespace=namespace,
+            worker_id='control-worker',
+        )
+        self.addCleanup(worker.shutdown)
+        self.addCleanup(control.shutdown)
+        submitted = worker.submit('research_catalog', {'cancel': 'during-partition'})
+        job_id = worker._next_job()
+        original_load = worker._load
+
+        def disconnected_load(_job_id):
+            raise ConnectionError('simulated worker network partition')
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(worker._complete_queued_item, job_id, 0.05)
+            self.assertTrue(started.wait(10))
+            worker._load = disconnected_load
+            cancelled = control.cancel(submitted['job_id'])
+            self.assertTrue(cancelled['cancel_requested'])
+            time.sleep(0.6)
+            self.assertFalse(future.done())
+            client.connection_pool.disconnect()
+            worker._load = original_load
+            future.result(timeout=10)
+        completed = control.get(submitted['job_id'])
+        self.assertEqual(completed['status'], 'cancelled')
+
     def test_dead_letter_job_can_be_retried_and_completed(self):
         client, namespace = self._real_redis()
 
@@ -391,6 +762,45 @@ time.sleep(60)
         self.assertEqual(completed['status'], 'completed')
         self.assertEqual(completed['retry_of'], submitted['job_id'])
         self.assertTrue(completed['result']['recovered'])
+
+    def test_indeterminate_resolution_is_persisted_before_retry(self):
+        client, namespace = self._real_redis()
+        writer = DatabaseStateWriter(os.environ['DATABASE_URL'])
+        manager = RedisJobManager(
+            redis_client=client,
+            namespace=namespace,
+            state_store=writer,
+        )
+        self.addCleanup(manager.shutdown)
+        self.addCleanup(writer.close)
+        submitted = manager.submit('research_catalog', {})
+        record = manager._load(submitted['job_id'])
+        record.update({
+            'status': 'indeterminate',
+            'error': 'external commit outcome is unknown',
+            'indeterminate': {'requires_manual_review': True},
+        })
+        manager._save(record)
+        with self.assertRaisesRegex(ValueError, 'approve_retry'):
+            manager.retry(submitted['job_id'])
+
+        resolved = manager.resolve_indeterminate(
+            submitted['job_id'],
+            'approve_retry',
+            'external system confirms no result was committed',
+            'integration-reviewer',
+            evidence={'ticket': 'CI-1'},
+        )
+        writer.flush()
+        self.assertEqual(resolved['resolution']['decision'], 'approve_retry')
+        database = Database(os.environ['DATABASE_URL'])
+        try:
+            stored = asyncio.run(database.get_job(submitted['job_id']))
+        finally:
+            asyncio.run(database.close())
+        self.assertEqual(stored['resolution']['reviewer'], 'integration-reviewer')
+        retried = manager.retry(submitted['job_id'])
+        self.assertEqual(retried['retry_of'], submitted['job_id'])
 
 
 if __name__ == '__main__':

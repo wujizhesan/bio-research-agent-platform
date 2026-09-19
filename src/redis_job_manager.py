@@ -2,15 +2,20 @@
 
 from datetime import datetime, timezone
 from contextlib import nullcontext
-import os
-from threading import Lock
-from time import time
+from threading import RLock
 from uuid import uuid4
 
 try:
     from .domain_registry import active_tool_specs, run_tool, tool_specs
+    from .execution_semantics import validate_required_artifacts
     from .job_execution import InlineToolExecutor
     from .job_manager import TERMINAL_STATUSES
+    from .execution_identity import (
+        build_execution_identity,
+        external_toolchain_snapshot,
+        identity_mismatches,
+        routing_descriptor,
+    )
     from .resource_scheduling import (
         ResourceCapacity,
         ResourcePool,
@@ -24,11 +29,20 @@ try:
     from .redis_job_recovery import RedisLeaseRecovery
     from .redis_job_store import RedisQueueStore
     from .redis_job_worker import RedisJobWorkerRuntime
+    from .redis_worker_registry import RedisWorkerRegistry
     from .run_context import build_run_context
+    from .settings import PlatformSettings
 except ImportError:
     from domain_registry import active_tool_specs, run_tool, tool_specs
+    from execution_semantics import validate_required_artifacts
     from job_execution import InlineToolExecutor
     from job_manager import TERMINAL_STATUSES
+    from execution_identity import (
+        build_execution_identity,
+        external_toolchain_snapshot,
+        identity_mismatches,
+        routing_descriptor,
+    )
     from resource_scheduling import (
         ResourceCapacity,
         ResourcePool,
@@ -42,7 +56,9 @@ except ImportError:
     from redis_job_recovery import RedisLeaseRecovery
     from redis_job_store import RedisQueueStore
     from redis_job_worker import RedisJobWorkerRuntime
+    from redis_worker_registry import RedisWorkerRegistry
     from run_context import build_run_context
+    from settings import PlatformSettings
 
 
 def _now():
@@ -67,33 +83,34 @@ class RedisJobManager:
         enforce_capacity=False,
         max_attempts=None,
         max_concurrency=None,
+        capability_routing=None,
+        require_execution_fingerprint=None,
+        settings=None,
     ):
+        self.settings = settings or PlatformSettings.from_env()
         if redis_client is None:
             try:
                 import redis
             except ImportError as exc:
                 raise RuntimeError('Redis backend requires the redis package') from exc
-            configured_socket_timeout = (
-                redis_socket_timeout
-                or os.environ.get('REDIS_SOCKET_TIMEOUT', '15')
-            )
+            configured_socket_timeout = redis_socket_timeout or self.settings.redis_socket_timeout
             try:
                 socket_timeout = max(float(configured_socket_timeout), 6.0)
             except (TypeError, ValueError):
                 socket_timeout = 15.0
             redis_client = redis.Redis.from_url(
-                redis_url or os.environ.get('REDIS_URL', 'redis://127.0.0.1:6379/0'),
+                redis_url or self.settings.redis_url,
                 decode_responses=True,
                 socket_timeout=socket_timeout,
             )
         self.redis = redis_client
-        self.namespace = namespace or os.environ.get('REDIS_NAMESPACE', 'bioagent')
-        configured_lease = lease_seconds or os.environ.get('JOB_LEASE_SECONDS', '300')
+        self.namespace = namespace or self.settings.redis_namespace
+        configured_lease = lease_seconds or self.settings.job_lease_seconds
         try:
             self.lease_seconds = max(int(configured_lease), 1)
         except (TypeError, ValueError):
             self.lease_seconds = 300
-        configured_ttl = result_ttl_seconds or os.environ.get('JOB_RESULT_TTL_SECONDS', '86400')
+        configured_ttl = result_ttl_seconds or self.settings.job_result_ttl_seconds
         try:
             self.result_ttl_seconds = max(int(configured_ttl), 60)
         except (TypeError, ValueError):
@@ -105,21 +122,31 @@ class RedisJobManager:
         )
         self.resource_capacity = resource_capacity or ResourceCapacity.from_env()
         self.enforce_capacity = bool(enforce_capacity)
+        self.capability_routing = (
+            self.settings.worker_capability_routing
+            if capability_routing is None else bool(capability_routing)
+        )
+        self.require_execution_fingerprint = (
+            self.settings.worker_require_execution_fingerprint
+            if require_execution_fingerprint is None
+            else bool(require_execution_fingerprint)
+        )
         self.resource_pool = ResourcePool(self.resource_capacity)
+        self._execution_catalog = {}
         self._worker_executor = None
         try:
             self.max_attempts = max(int(
-                max_attempts or os.environ.get('JOB_MAX_ATTEMPTS', '3')
+                max_attempts or self.settings.job_max_attempts
             ), 1)
         except (TypeError, ValueError):
             self.max_attempts = 3
         try:
             self.max_concurrency = max(int(
-                max_concurrency or os.environ.get('WORKER_MAX_CONCURRENCY', '2')
+                max_concurrency or self.settings.worker_max_concurrency
             ), 1)
         except (TypeError, ValueError):
             self.max_concurrency = 2
-        self._lock = Lock()
+        self._lock = RLock()
         self._store = RedisQueueStore(
             self.redis,
             self.namespace,
@@ -127,6 +154,11 @@ class RedisJobManager:
             result_ttl_seconds=self.result_ttl_seconds,
         )
         self._metrics = RedisJobMetrics(self.namespace, self.backend)
+        self._worker_registry = RedisWorkerRegistry(
+            self.redis,
+            self.namespace,
+            ttl_seconds=self.settings.worker_registry_ttl_seconds,
+        )
         self._recovery = RedisLeaseRecovery(
             self._store,
             self._metrics,
@@ -210,9 +242,115 @@ class RedisJobManager:
             raise ValueError(f'plugin domain is disabled for tool: {tool}')
         return active[tool]
 
+    def _execution_identity(self, tool, spec=None):
+        if tool not in self._execution_catalog:
+            selected = spec or self._validate_tool_state(tool)
+            self._execution_catalog[tool] = build_execution_identity(selected)
+        return dict(self._execution_catalog[tool])
+
+    def execution_catalog(self):
+        for spec in active_tool_specs():
+            self._execution_identity(spec['name'], spec)
+        return {
+            tool: dict(identity)
+            for tool, identity in self._execution_catalog.items()
+        }
+
+    def worker_registry_record(self, active_jobs=0, draining=False):
+        snapshot = self.resource_pool.snapshot()
+        admission_reader = getattr(self.state_store, 'admission', None)
+        admission = admission_reader() if admission_reader else {'accepting_work': True}
+        domains = sorted({
+            str(spec.get('domain') or 'unknown')
+            for spec in active_tool_specs()
+        })
+        return {
+            'worker_id': self.worker_id,
+            'release_tag': self.settings.release_tag,
+            'git_commit': self.settings.git_sha,
+            'image_reference': self.settings.image_reference,
+            'configuration': self.settings.public_snapshot(),
+            'capacity': self.resource_capacity.as_dict(),
+            'available_resources': snapshot['available'],
+            'labels': list(self.resource_capacity.labels),
+            'active_jobs': int(active_jobs),
+            'max_concurrency': self.max_concurrency,
+            'draining': bool(draining),
+            'accepting_work': bool(admission.get('accepting_work')),
+            'state_writer': admission,
+            'execution_catalog': self.execution_catalog(),
+            'toolchains': {
+                domain: external_toolchain_snapshot(domain)
+                for domain in domains
+            },
+        }
+
+    def heartbeat_worker(self, active_jobs=0, draining=False):
+        return self._worker_registry.heartbeat(
+            self.worker_registry_record(active_jobs, draining),
+            now=self._store.server_time(),
+        )
+
+    def list_workers(self):
+        return self._worker_registry.list_active(
+            now=self._store.server_time(),
+        )
+
+    def compatible_route_ids(self):
+        compatible = []
+        catalog = self.execution_catalog()
+        for route_id in self._store.registered_route_ids():
+            route = self._store.load_route(route_id)
+            if not route:
+                continue
+            identity = catalog.get(route.get('tool')) or {}
+            request = ResourceRequest.from_mapping(route.get('resources'))
+            if (
+                identity.get('fingerprint') == route.get('execution_fingerprint')
+                and self.resource_capacity.fits(request)
+            ):
+                compatible.append(route_id)
+        return tuple(compatible)
+
+    def verify_execution_identity(self, record):
+        expected = record.get('execution_identity')
+        if not isinstance(expected, dict):
+            return (
+                not self.require_execution_fingerprint,
+                ['missing_execution_identity'],
+                None,
+            )
+        actual = self._execution_identity(record['tool'])
+        mismatches = identity_mismatches(expected, actual)
+        return not mismatches, mismatches, actual
+
+    def defer_incompatible_execution(self, record, mismatches, actual):
+        expected = record.get('execution_identity') or {}
+
+        def defer(current, _server_now):
+            if current.get('status') in TERMINAL_STATUSES:
+                return None
+            current['status'] = 'queued'
+            current['scheduling'] = {
+                'status': 'waiting_for_implementation',
+                'worker_id': self.worker_id,
+                'mismatches': list(mismatches),
+                'expected_fingerprint': expected.get('fingerprint'),
+                'actual_fingerprint': (actual or {}).get('fingerprint'),
+            }
+            return current
+
+        updated, _ = self._store.atomic_update(record['job_id'], defer)
+        return updated
+
     def _create_job(self, tool, arguments, resources, priority, retry_of=None,
-                    idempotency_key=None, spec=None, parent_context=None):
+                    idempotency_key=None, spec=None, parent_context=None,
+                    dispatch=True, execution_identity=None):
         job_id = uuid4().hex
+        execution_key = uuid4().hex
+        identity = dict(
+            execution_identity or self._execution_identity(tool, spec)
+        )
         run_context = build_run_context(
             tool,
             arguments,
@@ -223,7 +361,24 @@ class RedisJobManager:
             retry_of=retry_of,
             parent=parent_context,
             run_id=uuid4().hex if parent_context is not None else None,
+            execution={
+                'execution_key': execution_key,
+                'idempotency_key': f'{job_id}:{execution_key}',
+                'semantics': str((spec or {}).get('execution_semantics') or 'pure'),
+            },
         ).as_dict()
+        run_context['plugin'].update({
+            'git_commit': identity.get('git_commit'),
+            'worker_image_digest': identity.get('worker_image_digest'),
+            'implementation_sha256': identity.get(
+                'plugin_implementation_sha256'
+            ),
+            'external_toolchain_fingerprint': identity.get(
+                'external_toolchain_fingerprint'
+            ),
+            'execution_fingerprint': identity.get('fingerprint'),
+        })
+        routing = routing_descriptor(tool, resources.as_dict(), identity)
         record = {
             'job_id': job_id,
             'tool': tool,
@@ -231,13 +386,28 @@ class RedisJobManager:
             'created_at': _now(),
             '_arguments': dict(arguments),
             '_cancel_requested': False,
-            '_created_score': time(),
-            '_execution_key': uuid4().hex,
+            '_created_score': self._store.server_time(),
+            '_execution_key': execution_key,
+            'execution_semantics': str(
+                (spec or {}).get('execution_semantics') or 'pure'
+            ),
             'resources': resources.as_dict(),
             'priority': priority,
             'trace_id': run_context['trace_id'],
             'run_context': run_context,
+            'execution_identity': identity,
+            'routing': routing,
+            '_capability_routing': self.capability_routing,
         }
+        if self.capability_routing and not self._worker_registry.compatible_workers(
+            record,
+            now=self._store.server_time(),
+        ):
+            record['scheduling'] = {
+                'status': 'waiting_for_capability',
+                'route_id': routing['route_id'],
+                'reason': 'no active worker advertises the pinned implementation and resources',
+            }
         if run_context.get('request_id'):
             record['request_id'] = run_context['request_id']
         if retry_of:
@@ -245,14 +415,13 @@ class RedisJobManager:
         if idempotency_key:
             record['idempotency_key'] = idempotency_key
             self._store.set_idempotent_job(idempotency_key, job_id)
-        self._save(record)
-        self._store.enqueue(job_id, priority)
-        self._refresh_queue_metrics()
-        self._metrics.queued(record)
+        self._store.save(record, persist_state=dispatch)
+        if dispatch:
+            self.dispatch(job_id)
         return self._public_record(record)
 
-    def submit(self, tool, arguments, idempotency_key=None, resources=None,
-               priority=0):
+    def _submit(self, tool, arguments, idempotency_key=None, resources=None,
+                priority=0, dispatch=True):
         if not isinstance(tool, str) or not tool:
             raise ValueError('tool is required')
         if not isinstance(arguments, dict):
@@ -264,6 +433,7 @@ class RedisJobManager:
             if len(idempotency_key) > 128:
                 raise ValueError('idempotency key is too long')
         spec = self._validate_tool_state(tool)
+        validate_required_artifacts(arguments, spec)
         request = merge_requests(spec.get('resources'), resources)
         priority = normalize_priority(priority)
         distributed_lock = getattr(self.redis, 'lock', None)
@@ -301,34 +471,186 @@ class RedisJobManager:
                 priority,
                 idempotency_key=idempotency_key,
                 spec=spec,
+                dispatch=dispatch,
             )
+
+    def submit(self, tool, arguments, idempotency_key=None, resources=None,
+               priority=0):
+        return self._submit(
+            tool,
+            arguments,
+            idempotency_key=idempotency_key,
+            resources=resources,
+            priority=priority,
+            dispatch=True,
+        )
+
+    def prepare(self, tool, arguments, idempotency_key=None, resources=None,
+                priority=0):
+        return self._submit(
+            tool,
+            arguments,
+            idempotency_key=idempotency_key,
+            resources=resources,
+            priority=priority,
+            dispatch=False,
+        )
+
+    def dispatch(self, job_id):
+        job_id = str(job_id)
+        distributed_lock = getattr(self.redis, 'lock', None)
+        guard = (
+            distributed_lock(
+                f'{self.namespace}:jobs:rebuild:{job_id}',
+                timeout=10,
+                blocking_timeout=1,
+            )
+            if distributed_lock else nullcontext()
+        )
+        with self._lock, guard:
+            record = self._load(job_id)
+            if record is None:
+                raise ValueError(f'job not found: {job_id}')
+            if record.get('status') != 'queued':
+                return self._public_record(record)
+            route_id = None
+            if record.get('_capability_routing'):
+                route_id = self._store.register_route(record)
+            if (
+                not self._store.queue_contains(job_id)
+                and not self._store.processing_contains(job_id)
+            ):
+                self._store.enqueue(
+                    job_id,
+                    int(record.get('priority', 0)),
+                    route_id=route_id,
+                )
+                self._metrics.queued(record)
+        self._refresh_queue_metrics()
+        return self._public_record(record)
 
     def get(self, job_id):
         record = self._load(str(job_id))
         return self._public_record(record) if record else None
 
+    def durable_record(self, job_id):
+        record = self._load(str(job_id))
+        return dict(record) if record is not None else None
+
+    def rebuild_durable_queue(self, limit=1000):
+        loader = getattr(self.state_store, 'load_dispatchable', None)
+        if loader is None:
+            return []
+        rebuilt = []
+        for durable in loader(limit=limit):
+            job_id = str(durable.get('job_id', ''))
+            if not job_id:
+                continue
+            distributed_lock = getattr(self.redis, 'lock', None)
+            guard = (
+                distributed_lock(
+                    f'{self.namespace}:jobs:rebuild:{job_id}',
+                    timeout=10,
+                    blocking_timeout=1,
+                )
+                if distributed_lock else nullcontext()
+            )
+            with self._lock, guard:
+                existing = self._load(job_id)
+                if existing is not None:
+                    saver = getattr(self.state_store, 'save', None)
+                    if saver is not None:
+                        saver(existing)
+                    if (
+                        existing.get('status') == 'queued'
+                        and not self._store.queue_contains(job_id)
+                        and not self._store.processing_contains(job_id)
+                    ):
+                        route_id = (
+                            self._store.register_route(existing)
+                            if existing.get('_capability_routing') else None
+                        )
+                        self._store.enqueue(
+                            job_id,
+                            int(existing.get('priority', 0)),
+                            route_id=route_id,
+                        )
+                        rebuilt.append(job_id)
+                    continue
+                record = dict(durable)
+                record.update({
+                    'status': 'queued',
+                    'recovered_at': _now(),
+                })
+                for key in (
+                    'started_at', 'finished_at', 'error', '_worker_id',
+                    '_lease_until', '_fencing_token', '_started_epoch',
+                ):
+                    record.pop(key, None)
+                record.setdefault('_execution_key', uuid4().hex)
+                record.setdefault('_attempts', 0)
+                record.setdefault('_cancel_requested', False)
+                record.setdefault('_created_score', self._store.server_time())
+                self._save(record)
+                route_id = (
+                    self._store.register_route(record)
+                    if record.get('_capability_routing') else None
+                )
+                self._store.enqueue(
+                    job_id,
+                    int(record.get('priority', 0)),
+                    route_id=route_id,
+                )
+                rebuilt.append(job_id)
+        self._refresh_queue_metrics()
+        return rebuilt
+
     def subscribe_job_events(self, job_id):
         return self._store.subscribe_job_events(job_id)
+
+    def read_job_events(self, job_id, last_event_id='0-0', block_ms=1000, count=100):
+        return self._store.read_job_events(
+            job_id,
+            last_event_id=last_event_id,
+            block_ms=block_ms,
+            count=count,
+        )
 
     def list(self, limit=20):
         return self._store.list_records(limit)
 
     def cancel(self, job_id):
-        record = self._load(str(job_id))
+        job_id = str(job_id)
+        record = self._load(job_id)
         if record is None:
             raise ValueError(f'job not found: {job_id}')
         if record.get('status') in TERMINAL_STATUSES:
             return self._public_record(record)
-        record['_cancel_requested'] = True
-        self._save(record)
+
+        def request_cancel(current, _server_now):
+            if current.get('status') in TERMINAL_STATUSES:
+                return None
+            current['_cancel_requested'] = True
+            return current
+
+        record, _ = self._store.atomic_update(job_id, request_cancel)
         return self._public_record(record)
 
-    def retry(self, job_id):
+    def _retry(self, job_id, migrate_implementation=False, dispatch=True):
         record = self._load(str(job_id))
         if record is None:
             raise ValueError(f'job not found: {job_id}')
         if record.get('status') not in TERMINAL_STATUSES:
-            raise ValueError('only completed, failed or cancelled jobs can be retried')
+            raise ValueError(
+                'only completed, failed, cancelled or indeterminate jobs can be retried'
+            )
+        if (
+            record.get('status') == 'indeterminate'
+            and (record.get('resolution') or {}).get('decision') != 'approve_retry'
+        ):
+            raise ValueError(
+                'indeterminate job requires an approve_retry resolution before retry'
+            )
         arguments = record.get('_arguments')
         if arguments is None:
             raise ValueError('job arguments are unavailable')
@@ -342,11 +664,40 @@ class RedisJobManager:
             retry_of=record['job_id'],
             spec=spec,
             parent_context=record.get('run_context'),
+            execution_identity=(
+                None
+                if migrate_implementation
+                else record.get('execution_identity')
+            ),
+            dispatch=dispatch,
         )
 
-    @staticmethod
-    def _lease_active(record, now=None):
-        return RedisLeaseRecovery.lease_active(record, now)
+    def retry(self, job_id, migrate_implementation=False):
+        return self._retry(
+            job_id,
+            migrate_implementation=migrate_implementation,
+            dispatch=True,
+        )
+
+    def prepare_retry(self, job_id, migrate_implementation=False):
+        return self._retry(
+            job_id,
+            migrate_implementation=migrate_implementation,
+            dispatch=False,
+        )
+
+    def resolve_indeterminate(self, job_id, decision, reason, reviewer, evidence=None):
+        return self._coordinator.resolve_indeterminate(
+            str(job_id),
+            decision,
+            reason,
+            reviewer,
+            evidence=evidence,
+        )
+
+    def _lease_active(self, record, now=None):
+        lease_now = self._store.server_time() if now is None else now
+        return RedisLeaseRecovery.lease_active(record, lease_now)
 
     def _claim(self, record):
         return self._coordinator.claim(record)
@@ -364,14 +715,54 @@ class RedisJobManager:
     def _dead_letter(self, record, reason):
         return self._recovery.dead_letter(record, reason)
 
-    def _load_execution_result(self, execution_key):
-        return self._store.load_execution_result(execution_key)
+    def _load_execution_result(self, execution_key, job_id=None, fencing_token=None):
+        return self._store.load_execution_result(
+            execution_key,
+            job_id=job_id,
+            fencing_token=fencing_token,
+        )
 
-    def _store_execution_result(self, execution_key, result):
-        return self._store.store_execution_result(execution_key, result)
+    def _begin_execution_attempt(
+        self,
+        execution_key,
+        job_id,
+        fencing_token,
+        attempt,
+        semantics='pure',
+    ):
+        begin = getattr(self.state_store, 'begin_execution_attempt', None)
+        if begin is None:
+            return None
+        return begin(
+            execution_key,
+            job_id,
+            fencing_token,
+            attempt,
+            semantics,
+        )
 
-    def _finish(self, job_id, result, failed=False):
-        return self._coordinator.finish(job_id, result, failed=failed)
+    def _store_execution_result(self, execution_key, result, job_id=None, fencing_token=None):
+        return self._store.store_execution_result(
+            execution_key,
+            result,
+            job_id=job_id,
+            fencing_token=fencing_token,
+        )
+
+    def _finish(self, job_id, result, failed=False, fencing_token=None):
+        return self._coordinator.finish(
+            job_id,
+            result,
+            failed=failed,
+            fencing_token=fencing_token,
+        )
+
+    def _mark_indeterminate(self, job_id, reason, fencing_token=None):
+        return self._coordinator.mark_indeterminate(
+            job_id,
+            reason,
+            fencing_token=fencing_token,
+        )
 
     def recover_stale_jobs(self):
         return self._recovery.recover_stale_jobs()
@@ -417,6 +808,10 @@ class RedisJobManager:
             raise RuntimeError('Redis is unavailable')
 
     def shutdown(self):
+        try:
+            self._worker_registry.unregister(self.worker_id)
+        except Exception:
+            pass
         shutdown = getattr(self._tool_executor, 'shutdown', None)
         if shutdown:
             shutdown()

@@ -16,6 +16,7 @@ import jwt
 ROLE_PERMISSIONS = {
     'admin': frozenset({
         'catalog:read', 'files:read', 'files:write', 'jobs:read', 'jobs:write',
+        'jobs:approve',
         'metrics:read', 'members:write', 'plugins:write', 'projects:read',
         'projects:write', 'runs:read', 'telemetry:write',
     }),

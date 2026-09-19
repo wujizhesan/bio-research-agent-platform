@@ -95,6 +95,18 @@ def _sandbox_environment(tool, temporary_root):
             'TMPDIR': str(plugin_temp),
         })
         environment['PLUGIN_SANDBOX_DOMAIN'] = spec['domain']
+        context = current_run_context(as_dict=True) or {}
+        execution = context.get('execution') or {}
+        environment['BIO_AGENT_JOB_ID'] = str(context.get('job_id') or '')
+        environment['BIO_AGENT_EXECUTION_KEY'] = str(
+            execution.get('execution_key') or ''
+        )
+        environment['BIO_AGENT_IDEMPOTENCY_KEY'] = str(
+            execution.get('idempotency_key') or ''
+        )
+        environment['BIO_AGENT_EXECUTION_SEMANTICS'] = str(
+            execution.get('semantics') or spec.get('execution_semantics') or 'pure'
+        )
     return environment
 
 

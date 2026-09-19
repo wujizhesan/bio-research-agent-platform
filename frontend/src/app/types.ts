@@ -26,7 +26,7 @@ export type Capabilities = {
 export type Job = {
   job_id: string
   tool: string
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'indeterminate'
   created_at: string
   started_at?: string
   finished_at?: string
@@ -35,7 +35,21 @@ export type Job = {
   cancel_requested?: boolean
   trace_id?: string
   request_id?: string
+  execution_identity?: Record<string, unknown>
+  routing?: Record<string, unknown>
+  execution?: Record<string, unknown>
+  scheduling?: Record<string, unknown>
+  indeterminate?: Record<string, unknown>
+  resolution?: {
+    decision: 'confirm_succeeded' | 'confirm_failed' | 'approve_retry'
+    reason: string
+    reviewer: string
+    resolved_at: string
+    evidence?: Record<string, unknown>
+  }
 }
+
+export type JobResolutionDecision = 'confirm_succeeded' | 'confirm_failed' | 'approve_retry'
 
 export type EventItem = {
   at: string

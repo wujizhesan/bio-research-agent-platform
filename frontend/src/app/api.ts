@@ -1,7 +1,7 @@
 import type { Job, UploadedFile } from './types'
 import { recordResponseTrace } from './frontendObservability'
 
-const terminalJobStatuses = new Set<Job['status']>(['completed', 'failed', 'cancelled'])
+const terminalJobStatuses = new Set<Job['status']>(['completed', 'failed', 'cancelled', 'indeterminate'])
 
 export async function apiFetch<T>(base: string, token: string, path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`${base}${path}`, {

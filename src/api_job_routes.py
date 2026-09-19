@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 try:
     from .api_contracts import (
         JobCreate,
+        JobResolution,
         iter_artifact_values,
         resolve_artifact_path,
     )
@@ -19,7 +20,7 @@ try:
     from .observability import JOB_STATUS, JOB_SUBMISSIONS
     from .run_context import bind_run_actor
 except ImportError:
-    from api_contracts import JobCreate, iter_artifact_values, resolve_artifact_path
+    from api_contracts import JobCreate, JobResolution, iter_artifact_values, resolve_artifact_path
     from auth import Principal
     from observability import JOB_STATUS, JOB_SUBMISSIONS
     from run_context import bind_run_actor
@@ -124,6 +125,7 @@ def _register_job_event_routes(
     app,
     *,
     jobs,
+    database,
     output_root,
     audit,
     require_permission,
@@ -191,6 +193,12 @@ def _register_job_event_routes(
         job_id: str,
         interval_seconds: float = Query(default=0.2, ge=0.05, le=5),
         timeout_seconds: float = Query(default=60, ge=1, le=300),
+        last_event_id: str | None = Header(
+            default=None,
+            alias='Last-Event-ID',
+            max_length=128,
+            pattern=r'^[0-9]+-[0-9]+$',
+        ),
         principal: Principal = Depends(stream_principal),
     ):
         if await read_job(job_id) is None:
@@ -200,18 +208,106 @@ def _register_job_event_routes(
             )
         await job_access(job_id, principal, {'owner', 'editor', 'viewer'})
         subscriber = None
+        event_reader = None
+        durable_event_reader = None
         if app.state.job_backend == 'redis':
-            subscribe = getattr(jobs, 'subscribe_job_events', None)
-            if subscribe is not None:
-                subscriber = subscribe(job_id)
+            event_reader = getattr(jobs, 'read_job_events', None)
+            durable_event_reader = getattr(database, 'list_job_events', None)
+            if event_reader is None:
+                subscribe = getattr(jobs, 'subscribe_job_events', None)
+                if subscribe is not None:
+                    subscriber = subscribe(job_id)
 
         async def stream():
             last_signature = None
+            event_cursor = last_event_id or '0-0'
             deadline = monotonic() + timeout_seconds
             try:
                 while True:
                     record = None
-                    if subscriber is not None:
+                    if event_reader is not None:
+                        events = await asyncio.to_thread(
+                            event_reader,
+                            job_id,
+                            event_cursor,
+                            1000,
+                            100,
+                        )
+                        for record_event_id, event_record in events:
+                            event_cursor = record_event_id
+                            signature = json.dumps(
+                                event_record,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                default=str,
+                            )
+                            if signature == last_signature:
+                                continue
+                            payload = {'status': 'ok', 'job': event_record}
+                            yield (
+                                f'id: {record_event_id}\n'
+                                'event: job\n'
+                                'data: '
+                                + json.dumps(
+                                    payload,
+                                    ensure_ascii=False,
+                                    default=str,
+                                )
+                                + '\n\n'
+                            )
+                            last_signature = signature
+                            if event_record.get('status') in {
+                                'completed', 'failed', 'cancelled', 'indeterminate',
+                            }:
+                                return
+                        if events:
+                            continue
+                        if durable_event_reader is not None:
+                            try:
+                                durable_events = await durable_event_reader(
+                                    job_id,
+                                    after_event_id=event_cursor,
+                                    limit=100,
+                                )
+                            except Exception:
+                                durable_events = []
+                            for durable_event in durable_events:
+                                durable_event_id = durable_event['event_id']
+                                durable_record = durable_event['job']
+                                event_cursor = durable_event_id
+                                signature = json.dumps(
+                                    durable_record,
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                    default=str,
+                                )
+                                if signature == last_signature:
+                                    continue
+                                payload = {
+                                    'status': 'ok',
+                                    'job': durable_record,
+                                    **(
+                                        {'replay_gap': True}
+                                        if durable_event.get('replay_gap') else {}
+                                    ),
+                                }
+                                yield (
+                                    f'id: {durable_event_id}\n'
+                                    'event: job\n'
+                                    'data: '
+                                    + json.dumps(
+                                        payload,
+                                        ensure_ascii=False,
+                                        default=str,
+                                    )
+                                    + '\n\n'
+                                )
+                                last_signature = signature
+                                if durable_event.get('terminal'):
+                                    return
+                            if durable_events:
+                                continue
+                    elif subscriber is not None:
                         message = await asyncio.to_thread(
                             subscriber.get_message,
                             ignore_subscribe_messages=True,
@@ -258,6 +354,7 @@ def _register_job_event_routes(
                         'completed',
                         'failed',
                         'cancelled',
+                        'indeterminate',
                     }:
                         return
                     if monotonic() >= deadline:
@@ -275,7 +372,7 @@ def _register_job_event_routes(
                         return
                     if not emitted:
                         yield ': keep-alive\n\n'
-                    if subscriber is None:
+                    if subscriber is None and event_reader is None:
                         await asyncio.sleep(interval_seconds)
             finally:
                 if subscriber is not None:
@@ -321,7 +418,7 @@ def _register_job_mutation_routes(
             job_id,
             {'status': record['status']},
         )
-        if record['status'] in {'completed', 'failed', 'cancelled'}:
+        if record['status'] in {'completed', 'failed', 'cancelled', 'indeterminate'}:
             response_status = 'already_terminal'
         elif record['status'] == 'cancelled':
             response_status = 'cancelled'
@@ -329,18 +426,92 @@ def _register_job_mutation_routes(
             response_status = 'cancellation_requested'
         return {'status': response_status, 'job': record}
 
+    @app.post('/api/v1/jobs/{job_id}/resolve', tags=['jobs'])
+    async def resolve_indeterminate_job(
+        job_id: str,
+        payload: JobResolution,
+        principal: Principal = Depends(require_permission('jobs:approve')),
+    ):
+        await job_access(job_id, principal, {'owner', 'editor'})
+        resolver = getattr(jobs, 'resolve_indeterminate', None)
+        if resolver is None:
+            raise HTTPException(
+                status_code=501,
+                detail='job resolution is unavailable for this backend',
+            )
+        try:
+            record = resolver(
+                job_id,
+                payload.decision,
+                payload.reason,
+                principal.subject,
+                evidence=payload.evidence,
+            )
+        except ValueError as exc:
+            status_code = 404 if str(exc).startswith('job not found:') else 409
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        durable_reader = getattr(jobs, 'durable_record', None)
+        durable = durable_reader(job_id) if durable_reader else None
+        await database.upsert_job(durable or record)
+        JOB_STATUS.labels(record['tool'], record['status']).set(1)
+        audit.record(
+            principal,
+            'job.resolve',
+            'job',
+            job_id,
+            {
+                'decision': payload.decision,
+                'reason': payload.reason,
+                'evidence_keys': sorted(payload.evidence),
+                'status': record['status'],
+            },
+        )
+        return {'status': 'resolved', 'job': await expose_job(record)}
+
     @app.post('/api/v1/jobs/{job_id}/retry', status_code=202, tags=['jobs'])
     async def retry_job(
         job_id: str,
+        migrate_implementation: bool = Query(default=False),
         principal: Principal = Depends(require_permission('jobs:write')),
     ):
         project_id = await job_access(job_id, principal, {'owner', 'editor'})
+        source_status = (jobs.get(job_id) or {}).get('status')
         try:
             with bind_run_actor(principal):
-                record = jobs.retry(job_id)
+                durable_dispatch = (
+                    app.state.job_backend == 'redis'
+                    and hasattr(jobs, 'prepare_retry')
+                    and hasattr(database, 'stage_job')
+                )
+                record = (
+                    jobs.prepare_retry(
+                        job_id,
+                        migrate_implementation=migrate_implementation,
+                    )
+                    if durable_dispatch
+                    else jobs.retry(job_id)
+                )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        await database.upsert_job(record)
+        if durable_dispatch:
+            durable_reader = getattr(jobs, 'durable_record', None)
+            durable = durable_reader(record['job_id']) if durable_reader else None
+            await database.stage_job(durable or record)
+            try:
+                jobs.dispatch(record['job_id'])
+            except Exception as exc:
+                marker = getattr(database, 'mark_job_dispatch_failed', None)
+                if marker is not None:
+                    await marker(record['job_id'], str(exc))
+            else:
+                marker = getattr(database, 'mark_job_dispatched', None)
+                if marker is not None:
+                    await marker(
+                        record['job_id'],
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+        else:
+            await database.upsert_job(record)
         if project_id:
             await database.assign_job_project(
                 record['job_id'],
@@ -355,7 +526,11 @@ def _register_job_mutation_routes(
             'job.retry',
             'job',
             record['job_id'],
-            {'retry_of': job_id},
+            {
+                'retry_of': job_id,
+                'migrate_implementation': migrate_implementation,
+                'source_status': source_status,
+            },
         )
         return {'status': 'accepted', 'job': record}
 
@@ -405,6 +580,14 @@ def register_job_routes(
         read_job=read_job,
     )
 
+    @app.get('/api/v1/workers', tags=['jobs'])
+    async def list_workers(
+        _principal: Principal = Depends(require_permission('jobs:read')),
+    ):
+        reader = getattr(jobs, 'list_workers', None)
+        workers = await asyncio.to_thread(reader) if reader is not None else []
+        return {'status': 'ok', 'workers': workers}
+
     @app.post('/api/v1/jobs', status_code=202, tags=['jobs'])
     async def submit_job(
         payload: JobCreate,
@@ -422,7 +605,13 @@ def register_job_routes(
             )
         try:
             with bind_run_actor(principal):
-                record = jobs.submit(
+                durable_dispatch = (
+                    app.state.job_backend == 'redis'
+                    and hasattr(jobs, 'prepare')
+                    and hasattr(database, 'stage_job')
+                )
+                submitter = jobs.prepare if durable_dispatch else jobs.submit
+                record = submitter(
                     payload.tool,
                     payload.arguments,
                     idempotency_key=idempotency_key,
@@ -435,7 +624,25 @@ def register_job_routes(
                 )
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        await database.upsert_job(record)
+        if durable_dispatch:
+            durable_reader = getattr(jobs, 'durable_record', None)
+            durable = durable_reader(record['job_id']) if durable_reader else None
+            await database.stage_job(durable or record)
+            try:
+                jobs.dispatch(record['job_id'])
+            except Exception as exc:
+                marker = getattr(database, 'mark_job_dispatch_failed', None)
+                if marker is not None:
+                    await marker(record['job_id'], str(exc))
+            else:
+                marker = getattr(database, 'mark_job_dispatched', None)
+                if marker is not None:
+                    await marker(
+                        record['job_id'],
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+        else:
+            await database.upsert_job(record)
         if payload.project_id:
             await database.assign_job_project(
                 record['job_id'],
@@ -466,6 +673,7 @@ def register_job_routes(
     _register_job_event_routes(
         app,
         jobs=jobs,
+        database=database,
         output_root=output_root,
         audit=audit,
         require_permission=require_permission,

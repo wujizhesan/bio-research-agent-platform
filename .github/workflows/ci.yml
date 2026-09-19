@@ -44,6 +44,8 @@ jobs:
           uv sync --locked --all-extras
       - name: Enforce expand-contract migrations
         run: uv run python scripts/check_expand_contract_migrations.py
+      - name: Validate typed deployment settings
+        run: uv run python scripts/check_settings_consistency.py
       - name: Run unit tests
         run: |
           uv run coverage run --source=src -m pytest -q --ignore=tests/integration
@@ -250,6 +252,7 @@ jobs:
           from pathlib import Path
           import database
           import domain_registry
+          import execution_semantics
           import fastapi_app
           import omics_protocol
           import redis_job_manager
@@ -265,6 +268,7 @@ jobs:
           assert version('bio-research-agent-platform')
           assert 'site-packages' in Path(run_context.__file__).as_posix()
           assert domain_registry.active_tool_specs()
+          assert execution_semantics.VALID_EXECUTION_SEMANTICS
           assert fastapi_app.app is not None
           assert database.Database is not None
           assert redis_job_manager.RedisJobManager is not None

@@ -5,7 +5,8 @@ export type ValidationResult<T> = {
   issues: string[]
 }
 
-const jobStatuses = new Set<Job['status']>(['queued', 'running', 'completed', 'failed', 'cancelled'])
+const jobStatuses = new Set<Job['status']>(['queued', 'running', 'completed', 'failed', 'cancelled', 'indeterminate'])
+const resolutionDecisions = new Set(['confirm_succeeded', 'confirm_failed', 'approve_retry'])
 const interfaceStringFields = ['docs', 'openapi', 'endpoint', 'transport', 'entrypoint'] as const
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -57,6 +58,7 @@ export function parsePlugin(value: unknown): Plugin | null {
 }
 
 export function parseJob(value: unknown): Job | null {
+  const resolution = isRecord(value) ? value.resolution : undefined
   if (!isRecord(value)
     || !isNonEmptyString(value.job_id)
     || !isNonEmptyString(value.tool)
@@ -68,6 +70,19 @@ export function parseJob(value: unknown): Job | null {
     || !optionalStringIsValid(value.trace_id)
     || !optionalStringIsValid(value.request_id)
     || (value.result !== undefined && value.result !== null && !isRecord(value.result))
+    || (value.execution_identity !== undefined && value.execution_identity !== null && !isRecord(value.execution_identity))
+    || (value.routing !== undefined && value.routing !== null && !isRecord(value.routing))
+    || (value.execution !== undefined && value.execution !== null && !isRecord(value.execution))
+    || (value.scheduling !== undefined && value.scheduling !== null && !isRecord(value.scheduling))
+    || (value.indeterminate !== undefined && value.indeterminate !== null && !isRecord(value.indeterminate))
+    || (resolution !== undefined && resolution !== null && (
+      !isRecord(resolution)
+      || !resolutionDecisions.has(resolution.decision as string)
+      || !isNonEmptyString(resolution.reason)
+      || !isNonEmptyString(resolution.reviewer)
+      || !isNonEmptyString(resolution.resolved_at)
+      || (resolution.evidence !== undefined && !isRecord(resolution.evidence))
+    ))
     || (value.cancel_requested !== undefined && typeof value.cancel_requested !== 'boolean')) return null
   return {
     job_id: value.job_id,
@@ -81,6 +96,12 @@ export function parseJob(value: unknown): Job | null {
     ...(typeof value.cancel_requested === 'boolean' ? { cancel_requested: value.cancel_requested } : {}),
     ...(typeof value.trace_id === 'string' ? { trace_id: value.trace_id } : {}),
     ...(typeof value.request_id === 'string' ? { request_id: value.request_id } : {}),
+    ...(isRecord(value.execution_identity) ? { execution_identity: value.execution_identity } : {}),
+    ...(isRecord(value.routing) ? { routing: value.routing } : {}),
+    ...(isRecord(value.execution) ? { execution: value.execution } : {}),
+    ...(isRecord(value.scheduling) ? { scheduling: value.scheduling } : {}),
+    ...(isRecord(value.indeterminate) ? { indeterminate: value.indeterminate } : {}),
+    ...(isRecord(resolution) ? { resolution: resolution as Job['resolution'] } : {}),
   }
 }
 

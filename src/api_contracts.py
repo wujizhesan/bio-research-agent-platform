@@ -29,6 +29,12 @@ class JobCreate(BaseModel):
     priority: int = Field(default=0, ge=-100, le=100)
 
 
+class JobResolution(BaseModel):
+    decision: Literal['confirm_succeeded', 'confirm_failed', 'approve_retry']
+    reason: str = Field(min_length=3, max_length=2000)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
 class PluginStateUpdate(BaseModel):
     enabled: bool
 
@@ -107,6 +113,7 @@ def a2a_task(record, context_id, history=None):
         'completed': 'completed',
         'failed': 'failed',
         'cancelled': 'canceled',
+        'indeterminate': 'failed',
     }.get(record.get('status'), 'unknown')
     status_payload = {
         'state': state,

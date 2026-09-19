@@ -8,6 +8,7 @@ from jsonschema.validators import validator_for
 from packaging.requirements import InvalidRequirement, Requirement
 
 try:
+    from .execution_semantics import normalize_artifact_contracts, normalize_execution_semantics
     from .resource_scheduling import ResourceRequest
     from .plugin_security import (
         normalize_permissions,
@@ -16,6 +17,7 @@ try:
         validate_security_profile,
     )
 except ImportError:
+    from execution_semantics import normalize_artifact_contracts, normalize_execution_semantics
     from resource_scheduling import ResourceRequest
     from plugin_security import (
         normalize_permissions,
@@ -156,6 +158,13 @@ def validate_manifest(manifest):
         validate_json_schema(contract.get('output'), f'{name} output schema')
         ResourceRequest.from_mapping(contract.get('resources'))
         normalize_permissions(contract.get('permissions'), contract.get('input'))
+        normalize_artifact_contracts(contract.get('artifacts'), contract.get('input'))
+        normalize_execution_semantics(
+            contract.get('execution_semantics'),
+            contract.get('input'),
+            contract.get('permissions'),
+            contract.get('artifacts'),
+        )
     digest = manifest.get('contract_digest')
     if not isinstance(digest, str) or digest != _contract_digest(manifest):
         raise ValueError('plugin manifest contract_digest is invalid')
@@ -184,6 +193,19 @@ def build_manifest(key, plugin, tools, kind, status='available', domains=None,
             'permissions': normalize_permissions(
                 spec.get('permissions'),
                 spec.get('parameters'),
+            ),
+            'artifacts': list(normalize_artifact_contracts(
+                spec.get('artifacts'),
+                spec.get('parameters'),
+            )),
+            'execution_semantics': normalize_execution_semantics(
+                spec.get('execution_semantics'),
+                spec.get('parameters'),
+                normalize_permissions(
+                    spec.get('permissions'),
+                    spec.get('parameters'),
+                ),
+                spec.get('artifacts'),
             ),
         }
         for name, spec in tools.items()

@@ -133,6 +133,7 @@ function App() {
     submitToolJob,
     cancelSelectedJob,
     retryJob,
+    resolveIndeterminateJob,
     downloadJobArtifact,
     previewJobArtifact,
     selectJob,
@@ -381,7 +382,7 @@ function App() {
                 </summary>
                 <div className="px-5 pb-1"><CapabilityStrip capabilities={capabilities} /></div>
               </details>
-              <JobControl job={selectedJob} loading={loading} onCancel={() => void cancelSelectedJob()} onRetry={(job) => void retryJob(job)} />
+              <JobControl job={selectedJob} loading={loading} onCancel={() => void cancelSelectedJob()} onRetry={(job) => void retryJob(job)} onResolve={(job, decision, reason) => void resolveIndeterminateJob(job, decision, reason)} />
 
               <section className={`grid gap-5 xl:grid-cols-[1.08fr_0.92fr] ${mode === 'sequence' ? 'xl:items-start' : ''}`}>
                 <div className="panel p-5 sm:p-6">
