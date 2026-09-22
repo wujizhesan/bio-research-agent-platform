@@ -8,14 +8,6 @@ services:
     group_add:
       - "${MONITORING_SECRET_GID:?required}"
 
-  prometheus:
-    group_add:
-      - "${MONITORING_SECRET_GID:?required}"
-
-  alertmanager:
-    group_add:
-      - "${MONITORING_SECRET_GID:?required}"
-
   alert-webhook-sink:
     profiles: ["monitoring"]
     image: ${COMPOSE_PROJECT_NAME:?required}-api
