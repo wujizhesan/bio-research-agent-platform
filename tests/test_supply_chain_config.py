@@ -468,6 +468,8 @@ class SupplyChainConfigurationTests(unittest.TestCase):
             'sudo chmod 0400 \\"$PLUGIN_SANDBOX_TOKEN_FILE\\"', rendered
         )
         self.assertIn('sudo rm -f \\"$PLUGIN_SANDBOX_TOKEN_FILE\\"', rendered)
+        self.assertIn('for attempt in 1 2 3', rendered)
+        self.assertIn('sleep $((attempt * 10))', rendered)
         self.assertIn('JOB_EXECUTION_MODE', (
             ROOT / 'docker-compose.secure.yml'
         ).read_text(encoding='utf-8'))

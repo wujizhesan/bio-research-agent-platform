@@ -345,9 +345,17 @@ jobs:
           mkdir -p output
           chmod 0777 output
       - name: Build secure full stack
-        run: >-
-          docker compose -f docker-compose.yml -f docker-compose.secure.yml
-          build api migration dispatcher worker plugin-sandbox
+        run: |
+          for attempt in 1 2 3; do
+            if docker compose -f docker-compose.yml -f docker-compose.secure.yml \
+              build api migration dispatcher worker plugin-sandbox; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
       - name: Migrate database and start secure stack
         run: |
           docker compose -f docker-compose.yml -f docker-compose.secure.yml up -d --wait db redis
