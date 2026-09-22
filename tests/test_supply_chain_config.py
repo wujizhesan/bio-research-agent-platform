@@ -383,7 +383,10 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn("check_container_vulnerability_baseline.py", workflow)
         self.assertIn("format: json", workflow)
         self.assertIn("retention-days: 90", workflow)
-        self.assertEqual(set(baseline["images"]), {"redis", "postgres", "clamav"})
+        self.assertEqual(
+            set(baseline["images"]),
+            {"redis", "postgres", "clamav", "prometheus", "alertmanager"},
+        )
         for image in baseline["images"].values():
             self.assertRegex(image["image_ref"], SHA256_REFERENCE)
         self.assertEqual(baseline["policy"]["max_exception_days"], {"HIGH": 30, "CRITICAL": 7})
@@ -450,6 +453,7 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         job = yaml.safe_load(workflow)['jobs']['secure-plugin-e2e']
         rendered = json.dumps(job)
         self.assertIn('docker-compose.secure.yml', rendered)
+        self.assertIn('up -d --wait db redis', rendered)
         self.assertIn('verify_secure_fullstack_e2e.py', rendered)
         self.assertIn('plugin-sandbox', rendered)
         self.assertIn('migration', rendered)

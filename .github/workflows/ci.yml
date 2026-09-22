@@ -97,7 +97,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+        image: postgres:16.15-alpine3.24@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
         env:
           POSTGRES_DB: bioagent_ci
           POSTGRES_USER: bioagent
@@ -110,7 +110,7 @@ jobs:
           --health-timeout 5s
           --health-retries 20
       redis:
-        image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+        image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
         ports:
           - 6379:6379
         options: >-
@@ -348,7 +348,7 @@ jobs:
           build api migration dispatcher worker plugin-sandbox
       - name: Migrate database and start secure stack
         run: |
-          docker compose -f docker-compose.yml -f docker-compose.secure.yml up -d db redis
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml up -d --wait db redis
           docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T db psql -v ON_ERROR_STOP=1 -U bioagent -d bioagent <<'SQL'
           DO $roles$
           BEGIN
@@ -578,13 +578,13 @@ jobs:
             dockerfile: frontend/Dockerfile
             exit_code: '1'
           - name: redis
-            image_ref: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
-            pull_image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+            image_ref: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+            pull_image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
             baseline_name: redis
             exit_code: '0'
           - name: postgres
-            image_ref: postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
-            pull_image: postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+            image_ref: postgres:16.15-alpine3.24@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+            pull_image: postgres:16.15-alpine3.24@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
             baseline_name: postgres
             exit_code: '0'
           - name: clamav
@@ -595,11 +595,13 @@ jobs:
           - name: prometheus
             image_ref: prom/prometheus@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
             pull_image: prom/prometheus@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
-            exit_code: '1'
+            baseline_name: prometheus
+            exit_code: '0'
           - name: alertmanager
             image_ref: prom/alertmanager@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
             pull_image: prom/alertmanager@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
-            exit_code: '1'
+            baseline_name: alertmanager
+            exit_code: '0'
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
