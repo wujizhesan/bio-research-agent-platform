@@ -13,6 +13,16 @@ class SecureFullStackE2ETests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'secure-fullstack-e2e'):
                 prepare_fixture(root / 'other', root)
 
+    def test_fixture_prepares_cross_uid_artifact_directory(self):
+        with tempfile.TemporaryDirectory() as raw:
+            artifact_root = Path(raw) / 'output'
+            host_root = artifact_root / 'secure-fullstack-e2e'
+            artifact_root.mkdir()
+            output_path = prepare_fixture(host_root, artifact_root)
+            self.assertEqual(output_path.parent, host_root / 'artifacts')
+            self.assertTrue(output_path.parent.is_dir())
+            self.assertTrue(output_path.parent.stat().st_mode & 0o002)
+
     def test_verifier_submits_authenticated_container_job(self):
         with tempfile.TemporaryDirectory() as raw:
             artifact_root = Path(raw) / 'output'
@@ -42,7 +52,7 @@ class SecureFullStackE2ETests(unittest.TestCase):
                     job_id = f'job-{len(submissions)}'
                     if job_id == 'job-1':
                         target = host_root / 'artifacts' / 'knowledge-index.json'
-                        target.parent.mkdir(parents=True)
+                        target.parent.mkdir(parents=True, exist_ok=True)
                         target.write_text(json.dumps({
                             'documents': [{'text': MARKER}],
                         }), encoding='utf-8')

@@ -35,7 +35,10 @@ def prepare_fixture(host_root, artifact_root):
         '{invalid secure e2e fixture',
         encoding='utf-8',
     )
-    return host_root / 'artifacts' / 'knowledge-index.json'
+    artifacts_dir = host_root / 'artifacts'
+    artifacts_dir.mkdir()
+    artifacts_dir.chmod(0o777)
+    return artifacts_dir / 'knowledge-index.json'
 
 
 def request_json(base_url, path, method='GET', data=None, token=None, form=False):
