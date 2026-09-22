@@ -99,6 +99,75 @@ class ExecutionSemanticsTests(unittest.TestCase):
             self.assertFalse(staged.exists())
             self.assertFalse(target.exists())
 
+    def test_required_artifact_must_be_generated_before_commit(self):
+        with tempfile.TemporaryDirectory(prefix='artifact_required_') as raw:
+            target = Path(raw) / 'result.json'
+            spec = {
+                'parameters': {
+                    'type': 'object',
+                    'properties': {'output_path': {'type': 'string'}},
+                    'required': ['output_path'],
+                },
+                'artifacts': [{
+                    'argument': 'output_path',
+                    'kind': 'file',
+                    'required': True,
+                }],
+            }
+            transaction = ArtifactTransaction.prepare(
+                {'output_path': str(target)},
+                spec,
+                'execution-key',
+            )
+            with self.assertRaisesRegex(RuntimeError, 'was not generated'):
+                transaction.commit({'status': 'ok'})
+
+    def test_required_directory_cannot_be_empty(self):
+        with tempfile.TemporaryDirectory(prefix='artifact_empty_dir_') as raw:
+            target = Path(raw) / 'dataset'
+            spec = {
+                'parameters': {
+                    'type': 'object',
+                    'properties': {'output_dir': {'type': 'string'}},
+                    'required': ['output_dir'],
+                },
+                'artifacts': [{
+                    'argument': 'output_dir',
+                    'kind': 'directory',
+                    'required': True,
+                }],
+            }
+            transaction = ArtifactTransaction.prepare(
+                {'output_dir': str(target)},
+                spec,
+                'execution-key',
+            )
+            with self.assertRaisesRegex(RuntimeError, 'directory is empty'):
+                transaction.commit({'status': 'ok'})
+
+    def test_artifact_kind_must_match_contract(self):
+        with tempfile.TemporaryDirectory(prefix='artifact_kind_') as raw:
+            target = Path(raw) / 'result.json'
+            spec = {
+                'parameters': {
+                    'type': 'object',
+                    'properties': {'output_path': {'type': 'string'}},
+                },
+                'artifacts': [{
+                    'argument': 'output_path',
+                    'kind': 'file',
+                }],
+            }
+            transaction = ArtifactTransaction.prepare(
+                {'output_path': str(target)},
+                spec,
+                'execution-key',
+            )
+            staged = Path(transaction.arguments['output_path'])
+            staged.mkdir()
+            with self.assertRaisesRegex(RuntimeError, 'must be a file'):
+                transaction.commit({'status': 'ok'})
+
 
 if __name__ == '__main__':
     unittest.main()

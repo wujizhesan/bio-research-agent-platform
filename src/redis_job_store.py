@@ -1,6 +1,7 @@
 """Redis queue keys, records, events, and execution-result storage."""
 
 import json
+from inspect import Parameter, signature
 import os
 from threading import Lock
 from time import time
@@ -135,6 +136,24 @@ class RedisQueueStore:
     def set_idempotent_job(self, value, job_id):
         self.redis.set(self.idempotency_key(value), job_id)
 
+    def discard_prepared(self, job_id, idempotency_key=None, replacement_job_id=None):
+        job_id = str(job_id)
+        for queue_key in (*self.queue_keys, self.processing_key, self.dead_letter_key):
+            self.redis.lrem(queue_key, 0, job_id)
+        self.redis.delete(self.key(job_id))
+        self.redis.delete(self.event_stream_key(job_id))
+        self.redis.zrem(self.index_key, job_id)
+        if idempotency_key:
+            key = self.idempotency_key(idempotency_key)
+            mapped = self.redis.get(key)
+            if isinstance(mapped, bytes):
+                mapped = mapped.decode('utf-8')
+            if str(mapped or '') == job_id:
+                if replacement_job_id:
+                    self.redis.set(key, str(replacement_job_id))
+                else:
+                    self.redis.delete(key)
+
     def execution_result_key(self, value):
         return f'{self.namespace}:jobs:execution:{value}'
 
@@ -159,6 +178,8 @@ class RedisQueueStore:
         output.pop('_lease_until', None)
         output.pop('_fencing_token', None)
         output.pop('_execution_key', None)
+        output.pop('_claim_ticket', None)
+        output.pop('_dispatch_generation', None)
         output.pop('_started_epoch', None)
         output.pop('_capability_routing', None)
         revision = output.pop('_revision', None)
@@ -443,10 +464,38 @@ class RedisQueueStore:
             payload = payload.decode('utf-8')
         return json.loads(payload)
 
-    def load_execution_result(self, execution_key, job_id=None, fencing_token=None):
+    @staticmethod
+    def _call_with_supported_keywords(callable_value, *args, **kwargs):
+        parameters = signature(callable_value).parameters.values()
+        accepts_kwargs = any(
+            parameter.kind == Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        supported = kwargs if accepts_kwargs else {
+            key: value
+            for key, value in kwargs.items()
+            if key in signature(callable_value).parameters
+        }
+        return callable_value(*args, **supported)
+
+    def load_execution_result(
+        self,
+        execution_key,
+        job_id=None,
+        fencing_token=None,
+        worker_id=None,
+        attempt=None,
+    ):
         durable_loader = getattr(self.state_store, 'load_execution_result', None)
         if durable_loader is not None:
-            durable = durable_loader(execution_key)
+            durable = self._call_with_supported_keywords(
+                durable_loader,
+                execution_key,
+                job_id=job_id,
+                fencing_token=fencing_token,
+                worker_id=worker_id,
+                attempt=attempt,
+            )
             if durable is not None and durable.get('status') == 'completed':
                 payload = {
                     'result': durable['result'],
@@ -470,22 +519,80 @@ class RedisQueueStore:
             cached = None
         durable_saver = getattr(self.state_store, 'store_execution_result', None)
         if cached is not None and durable_saver is not None and job_id is not None:
-            durable = durable_saver(
+            publications = [
+                str(item['publication_id'])
+                for item in (
+                    cached.get('result', {}).get('artifacts', [])
+                    if isinstance(cached.get('result'), dict) else []
+                )
+                if isinstance(item, dict) and item.get('publication_id')
+            ]
+            if publications:
+                durable_saver = getattr(
+                    self.state_store,
+                    'store_execution_result_with_artifacts',
+                    durable_saver,
+                )
+            durable = self._call_with_supported_keywords(
+                durable_saver,
                 execution_key,
                 job_id,
                 cached['result'],
-                fencing_token,
+                publication_ids=publications,
+                fencing_token=fencing_token,
+                worker_id=worker_id,
+                attempt=attempt,
             )
             return {'result': durable['result']}
         return cached
 
-    def store_execution_result(self, execution_key, result, job_id=None, fencing_token=None):
+    def store_execution_result(
+        self,
+        execution_key,
+        result,
+        job_id=None,
+        fencing_token=None,
+        worker_id=None,
+        attempt=None,
+        publication_ids=None,
+    ):
+        publication_ids = [str(value) for value in (publication_ids or [])]
         payload = json.dumps({
             'result': result,
             'job_id': job_id,
             'fencing_token': fencing_token,
         }, ensure_ascii=False, default=str)
         key = self.execution_result_key(execution_key)
+        durable_saver = getattr(self.state_store, 'store_execution_result', None)
+        if durable_saver is not None and job_id is not None:
+            if publication_ids:
+                durable_saver = getattr(
+                    self.state_store,
+                    'store_execution_result_with_artifacts',
+                    None,
+                )
+                if durable_saver is None:
+                    raise RuntimeError(
+                        'durable artifact transaction is unavailable'
+                    )
+            durable = self._call_with_supported_keywords(
+                durable_saver,
+                execution_key,
+                job_id,
+                result,
+                publication_ids=publication_ids,
+                fencing_token=fencing_token,
+                worker_id=worker_id,
+                attempt=attempt,
+            )
+            result = durable['result']
+            payload = json.dumps({
+                'result': result,
+                'job_id': job_id,
+                'fencing_token': durable.get('fencing_token', fencing_token),
+            }, ensure_ascii=False, default=str)
+            self.redis.set(key, payload, ex=self.result_ttl_seconds)
+            return result
         try:
             stored = self.redis.set(
                 key,
@@ -498,13 +605,4 @@ class RedisQueueStore:
         if stored is False or stored is None:
             cached = self._load_redis_execution_result(execution_key)
             result = cached['result'] if cached else result
-        durable_saver = getattr(self.state_store, 'store_execution_result', None)
-        if durable_saver is not None and job_id is not None:
-            durable = durable_saver(
-                execution_key,
-                job_id,
-                result,
-                fencing_token,
-            )
-            return durable['result']
         return result

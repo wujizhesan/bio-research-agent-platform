@@ -1,12 +1,18 @@
+import asyncio
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import json
+from pathlib import Path
 from threading import Event
 from time import time
+import tempfile
 import unittest
 from unittest.mock import patch
 from prometheus_client import generate_latest
 
+from src.artifact_store import LocalArtifactStore
+from src.database import Database
+from src.job_state_store import DatabaseStateWriter
 from src.redis_job_coordinator import RedisExecutionCoordinator
 from src.redis_job_manager import RedisJobManager
 from src.redis_job_metrics import RedisJobMetrics
@@ -574,6 +580,10 @@ class RedisJobManagerTests(unittest.TestCase):
             manager._save(record)
             result = manager.run_job(submitted['job_id'])
             self.assertEqual(result['status'], 'indeterminate')
+            self.assertEqual(
+                result['error_code'],
+                'execution_indeterminate',
+            )
             self.assertTrue(result['indeterminate']['requires_manual_review'])
             self.assertEqual(executions, [])
             with self.assertRaisesRegex(ValueError, 'approve_retry'):
@@ -647,6 +657,8 @@ class RedisJobManagerTests(unittest.TestCase):
             submitted = manager.submit('research_catalog', {})
             failed = manager.run_job(submitted['job_id'])
             self.assertEqual(failed['status'], 'failed')
+            self.assertEqual(failed['error'], 'tool execution failed')
+            self.assertEqual(failed['error_code'], 'tool_execution_failed')
             self.assertEqual(failed['dead_letter_reason'], 'execution_failed')
             self.assertEqual(
                 redis.lists['test:jobs:dead-letter'], [submitted['job_id']]
@@ -729,6 +741,182 @@ class RedisJobManagerTests(unittest.TestCase):
         finally:
             release.set()
             manager.shutdown()
+
+
+    def test_database_claim_provider_controls_attempt_and_fencing_token(self):
+        class ClaimStore:
+            require_job_scope = True
+
+            def __init__(self):
+                self.saved = []
+                self.claims = 0
+
+            def save(self, record):
+                self.saved.append(dict(record))
+
+            def claim_job(
+                self,
+                job_id,
+                capability,
+                worker_id,
+                claim_ticket,
+                lease_seconds,
+            ):
+                self.claims += 1
+                self.claim_ticket = claim_ticket
+                self.lease_seconds = lease_seconds
+                return {
+                    'job_id': job_id,
+                    'worker_id': worker_id,
+                    'attempt': 7,
+                    'fencing_token': 'db-7',
+                }
+
+        state_store = ClaimStore()
+        manager = RedisJobManager(
+            redis_client=InMemoryRedis(),
+            namespace='db-claim',
+            state_store=state_store,
+            worker_id='worker-db-claim',
+        )
+        try:
+            submitted = manager.prepare('research_catalog', {})
+            queued = manager._load(submitted['job_id'])
+            queued['_claim_ticket'] = 'claim-ticket-7'
+            manager._save(queued)
+            claimed = manager._claim(manager._load(submitted['job_id']))
+            self.assertEqual(claimed['_attempts'], 7)
+            self.assertEqual(claimed['_fencing_token'], 'db-7')
+            self.assertEqual(state_store.claims, 1)
+            self.assertEqual(state_store.claim_ticket, 'claim-ticket-7')
+            self.assertEqual(state_store.lease_seconds, manager.lease_seconds)
+        finally:
+            manager.shutdown()
+
+    def test_prepare_durable_does_not_write_redis(self):
+        redis_client = InMemoryRedis()
+        manager = RedisJobManager(
+            redis_client=redis_client,
+            namespace='durable-api-boundary',
+        )
+        try:
+            record = manager.prepare_durable(
+                'research_catalog',
+                {},
+                idempotency_key='scoped:key',
+                project_id='project-a',
+            )
+            self.assertIn('_execution_key', record)
+            self.assertIsNone(manager._load(record['job_id']))
+            self.assertFalse(manager._store.queue_contains(record['job_id']))
+            self.assertIsNone(
+                redis_client.get(manager._idempotency_key('scoped:key'))
+            )
+        finally:
+            manager.shutdown()
+
+    def test_worker_publishes_artifact_manifest_before_completion(self):
+        class ArtifactExecutor:
+            def execute(self, _tool, arguments, **_kwargs):
+                target = Path(arguments['output_path'])
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text('{"status":"ok"}\n', encoding='utf-8')
+                return {'status': 'ok', 'output_path': str(target)}
+
+            def shutdown(self):
+                return None
+
+        with tempfile.TemporaryDirectory(prefix='redis_artifact_') as raw:
+            root = Path(raw)
+            input_dir = root / 'input'
+            input_dir.mkdir()
+            output_path = root / 'output' / 'index.json'
+            manager = RedisJobManager(
+                redis_client=InMemoryRedis(),
+                namespace='artifact-publish',
+                tool_executor=ArtifactExecutor(),
+                artifact_store=LocalArtifactStore(),
+                capability_routing=False,
+                require_execution_fingerprint=False,
+            )
+            try:
+                submitted = manager.submit('knowledge_ingest_directory', {
+                    'input_dir': str(input_dir),
+                    'output_path': str(output_path),
+                })
+                completed = manager.run_job(submitted['job_id'])
+                self.assertEqual(completed['status'], 'completed')
+                self.assertEqual(completed['result']['output_path'], str(output_path))
+                self.assertEqual(len(completed['artifacts']), 1)
+                artifact = completed['artifacts'][0]
+                self.assertEqual(artifact['storage_backend'], 'local')
+                self.assertEqual(artifact['path'], str(output_path))
+                self.assertTrue(output_path.is_file())
+                cached = manager._load_execution_result(
+                    manager._load(submitted['job_id'])['_execution_key']
+                )
+                self.assertEqual(
+                    cached['result']['schema'],
+                    'bioagent.execution-result.v1',
+                )
+                self.assertEqual(cached['result']['result']['status'], 'ok')
+            finally:
+                manager.shutdown()
+
+    def test_worker_commits_durable_artifact_lifecycle(self):
+        class ArtifactExecutor:
+            def execute(self, _tool, arguments, **_kwargs):
+                target = Path(arguments['output_path'])
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text('{"status":"ok"}\n', encoding='utf-8')
+                return {'status': 'ok', 'output_path': str(target)}
+
+            def shutdown(self):
+                return None
+
+        with tempfile.TemporaryDirectory(prefix='redis_artifact_db_') as raw:
+            root = Path(raw)
+            database_url = (
+                f"sqlite+aiosqlite:///{(root / 'artifacts.sqlite3').as_posix()}"
+            )
+            input_dir = root / 'input'
+            input_dir.mkdir()
+            output_path = root / 'output' / 'index.json'
+            writer = DatabaseStateWriter(database_url)
+            manager = RedisJobManager(
+                redis_client=InMemoryRedis(),
+                namespace='artifact-lifecycle',
+                state_store=writer,
+                tool_executor=ArtifactExecutor(),
+                artifact_store=LocalArtifactStore(),
+                capability_routing=False,
+                require_execution_fingerprint=False,
+            )
+            try:
+                submitted = manager.submit('knowledge_ingest_directory', {
+                    'input_dir': str(input_dir),
+                    'output_path': str(output_path),
+                })
+                writer.flush()
+                completed = manager.run_job(submitted['job_id'])
+                writer.flush()
+                database = Database(database_url)
+                try:
+                    artifacts = asyncio.run(
+                        database.list_job_artifacts(submitted['job_id'])
+                    )
+                finally:
+                    asyncio.run(database.close())
+                self.assertEqual(completed['status'], 'completed')
+                self.assertEqual(len(artifacts), 1)
+                self.assertEqual(artifacts[0]['status'], 'committed')
+                self.assertEqual(
+                    artifacts[0]['publication_id'],
+                    completed['artifacts'][0]['publication_id'],
+                )
+            finally:
+                manager.shutdown()
+                writer.close()
 
 
 if __name__ == '__main__':

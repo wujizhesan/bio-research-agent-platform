@@ -22,6 +22,7 @@ describe('usePlatformSession', () => {
     localStorage.clear()
     remoteJobs = [job('running')]
     vi.mocked(apiFetch).mockReset().mockImplementation(async (_base, _token, path) => {
+      if (path === '/api/v1/auth/session') return { status: 'ok' }
       if (path === '/api/v1/plugins') return { plugins: [{ domain: 'sequence', name: 'Sequence', status: 'available', tool_count: 2, tools: ['sequence_workbench'] }] }
       if (path.startsWith('/api/v1/jobs')) return { jobs: remoteJobs }
       if (path === '/api/v1/capabilities') return { tool_count: 2, interfaces: {} }
@@ -47,16 +48,25 @@ describe('usePlatformSession', () => {
     expect(apiFetch).toHaveBeenCalledWith('https://api.example.test', 'token-1', '/api/v1/jobs?limit=8')
   })
 
-  it('保存规范化令牌并以新令牌重新刷新', async () => {
+  it('把临时令牌交换成浏览器会话并立即从内存清除', async () => {
     const { result } = renderHook(() => usePlatformSession('https://api.example.test', 'token-1'))
     await waitFor(() => expect(result.current.connected).toBe(true))
 
     act(() => result.current.setTokenDraft('  token-2  '))
-    act(() => result.current.saveToken())
+    await act(async () => {
+      await result.current.saveToken()
+    })
 
-    await waitFor(() => expect(result.current.token).toBe('token-2'))
-    await waitFor(() => expect(apiFetch).toHaveBeenCalledWith('https://api.example.test', 'token-2', '/api/v1/plugins'))
-    expect(localStorage.getItem('bio-agent-token')).toBe('token-2')
+    await waitFor(() => expect(result.current.token).toBe(''))
+    expect(result.current.tokenDraft).toBe('')
+    expect(apiFetch).toHaveBeenCalledWith(
+      'https://api.example.test',
+      'token-2',
+      '/api/v1/auth/session',
+      { method: 'POST' },
+    )
+    await waitFor(() => expect(apiFetch).toHaveBeenCalledWith('https://api.example.test', '', '/api/v1/plugins'))
+    expect(localStorage.getItem('bio-agent-token')).toBeNull()
   })
 
   it('隔离畸形 API 数据并保留可用记录', async () => {

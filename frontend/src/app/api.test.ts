@@ -84,16 +84,16 @@ describe('apiFetch', () => {
     })
 
     expect(payload).toEqual({ job_id: 'job-1' })
-    expect(fetchMock).toHaveBeenCalledWith('https://api.example.test/api/v1/jobs', {
+    expect(fetchMock).toHaveBeenCalledWith('https://api.example.test/api/v1/jobs', expect.objectContaining({
       method: 'POST',
       body: JSON.stringify({ tool: 'demo' }),
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: 'Bearer secret',
-        'X-Trace-Id': 'trace-1',
-      },
+      credentials: 'include',
       signal: controller.signal,
-    })
+    }))
+    const headers = new Headers(fetchMock.mock.calls[0][1]?.headers)
+    expect(headers.get('Content-Type')).toBe('application/json')
+    expect(headers.get('Authorization')).toBe('Bearer secret')
+    expect(headers.get('X-Trace-Id')).toBe('trace-1')
   })
 
   it('允许调用方覆盖默认请求头且空令牌不发送 Authorization', async () => {
@@ -107,8 +107,11 @@ describe('apiFetch', () => {
     })
 
     expect(fetchMock).toHaveBeenCalledWith('https://api.example.test/api/v1/import', expect.objectContaining({
-      headers: { 'Content-Type': 'text/plain' },
+      credentials: 'include',
     }))
+    const headers = new Headers(fetchMock.mock.calls[0][1]?.headers)
+    expect(headers.get('Content-Type')).toBe('text/plain')
+    expect(headers.has('Authorization')).toBe(false)
   })
 
   it.each([
@@ -161,13 +164,15 @@ describe('uploadFile', () => {
     expect(url).toBe('https://api.example.test/api/v1/files')
     expect(init).toMatchObject({
       method: 'POST',
-      headers: { Authorization: 'Bearer secret' },
+      credentials: 'include',
     })
+    const headers = new Headers(init?.headers)
+    expect(headers.get('Authorization')).toBe('Bearer secret')
     expect(init?.body).toBeInstanceOf(FormData)
     const body = init?.body as FormData
     expect(body.get('upload')).toBe(file)
     expect(body.get('project_id')).toBe('project-1')
-    expect(Object.keys(init?.headers as Record<string, string>)).not.toContain('Content-Type')
+    expect(headers.has('Content-Type')).toBe(false)
   })
 
   it('上传失败时优先返回服务端错误', async () => {
@@ -196,8 +201,10 @@ describe('followJob', () => {
 
     expect(fetch).toHaveBeenCalledWith('https://api.example.test/api/v1/jobs/job/1/events/ticket', expect.objectContaining({
       method: 'POST',
-      headers: { Authorization: 'Bearer secret' },
+      credentials: 'include',
     }))
+    const headers = new Headers(vi.mocked(fetch).mock.calls[0][1]?.headers)
+    expect(headers.get('Authorization')).toBe('Bearer secret')
     expect(MockEventSource.instances[0].url).toBe(
       'https://api.example.test/api/v1/jobs/job/1/events?ticket=ticket%20%2B%2F%3D%3F&interval_seconds=0.15&timeout_seconds=300',
     )

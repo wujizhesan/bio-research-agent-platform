@@ -18,6 +18,11 @@ _OUTPUT_PARAMETERS = frozenset({
     'output_alignment_paths',
     'report_path',
 })
+_PATH_PARAMETER_NAMES = frozenset({'path'})
+_PATH_PARAMETER_SUFFIXES = (
+    '_path', '_paths', '_dir', '_directory', '_csv', '_tsv', '_gtf',
+    '_fasta', '_vcf', '_bam', '_mtx', '_html', '_md',
+)
 
 
 def output_parameters(parameters):
@@ -25,6 +30,33 @@ def output_parameters(parameters):
     if not isinstance(properties, dict):
         return ()
     return tuple(sorted(set(properties) & _OUTPUT_PARAMETERS))
+
+
+def workspace_path_contract(spec):
+    spec = spec or {}
+    filesystem = (spec.get('permissions') or {}).get('filesystem') or {}
+    reads = set(filesystem.get('read') or ())
+    writes = set(filesystem.get('write') or ())
+    artifacts = {
+        item['argument']: item['kind']
+        for item in normalize_artifact_contracts(
+            spec.get('artifacts'), spec.get('parameters')
+        )
+    }
+    writes.update(artifacts)
+    properties = (spec.get('parameters') or {}).get('properties') or {}
+    for name in properties:
+        lowered = name.lower()
+        if (
+            name not in writes
+            and name not in reads
+            and (
+                lowered in _PATH_PARAMETER_NAMES
+                or lowered.endswith(_PATH_PARAMETER_SUFFIXES)
+            )
+        ):
+            reads.add(name)
+    return reads, artifacts, writes
 
 
 def normalize_artifact_contracts(value=None, parameters=None):
@@ -147,10 +179,34 @@ def _replace_paths(value, replacements):
 
 @dataclass(frozen=True)
 class StagedArtifact:
+    ordinal: int
     parameter: str
     target: Path
     staged: Path
     directory: bool
+    required: bool
+
+
+class ArtifactCommit:
+    def __init__(self, result, handles):
+        self.result = result
+        self._handles = tuple(handles)
+        self.artifacts = tuple(dict(handle.record) for handle in self._handles)
+        self._closed = False
+
+    def finalize(self):
+        if self._closed:
+            return
+        for handle in self._handles:
+            handle.finalize()
+        self._closed = True
+
+    def rollback(self):
+        if self._closed:
+            return
+        for handle in reversed(self._handles):
+            handle.rollback()
+        self._closed = True
 
 
 class ArtifactTransaction:
@@ -198,18 +254,76 @@ class ArtifactTransaction:
                 staged.parent.mkdir(parents=True, exist_ok=True)
                 if directory:
                     staged.mkdir(parents=True)
-                artifacts.append(StagedArtifact(parameter, target, staged, directory))
+                artifacts.append(StagedArtifact(
+                    len(artifacts),
+                    parameter,
+                    target,
+                    staged,
+                    directory,
+                    bool(contract['required']),
+                ))
                 staged_values.append(str(staged))
             selected[parameter] = staged_values if isinstance(raw, list) else staged_values[0]
         return cls(selected, artifacts)
+
+    def _validated_artifacts(self):
+        selected = []
+        for artifact in self.artifacts:
+            if not artifact.staged.exists():
+                if artifact.required:
+                    raise RuntimeError(
+                        f'required artifact was not generated: {artifact.parameter}'
+                    )
+                continue
+            if artifact.staged.is_symlink():
+                raise RuntimeError(
+                    f'artifact cannot be a symbolic link: {artifact.parameter}'
+                )
+            if artifact.directory:
+                if not artifact.staged.is_dir():
+                    raise RuntimeError(
+                        f'artifact must be a directory: {artifact.parameter}'
+                    )
+                files = [
+                    entry for entry in artifact.staged.rglob('*')
+                    if entry.is_file() and not entry.is_symlink()
+                ]
+                if not files:
+                    if artifact.required:
+                        raise RuntimeError(
+                            f'required artifact directory is empty: {artifact.parameter}'
+                        )
+                    continue
+            else:
+                if not artifact.staged.is_file():
+                    raise RuntimeError(
+                        f'artifact must be a file: {artifact.parameter}'
+                    )
+                if artifact.staged.stat().st_size < 1:
+                    raise RuntimeError(
+                        f'artifact file is empty: {artifact.parameter}'
+                    )
+            selected.append(artifact)
+        return tuple(selected)
+
+    def plan(self, store, context):
+        return tuple(
+            store.plan(
+                artifact.staged,
+                artifact.target,
+                artifact.parameter,
+                'directory' if artifact.directory else 'file',
+                context,
+                artifact.ordinal,
+            )
+            for artifact in self._validated_artifacts()
+        )
 
     def commit(self, result):
         replacements = []
         committed = []
         try:
-            for artifact in self.artifacts:
-                if not artifact.staged.exists():
-                    continue
+            for artifact in self._validated_artifacts():
                 if artifact.target.exists():
                     raise RuntimeError(
                         f'artifact target already exists: {artifact.target}'
@@ -228,6 +342,32 @@ class ArtifactTransaction:
             raise
         self._finished = True
         return _replace_paths(result, replacements)
+
+    def publish(self, result, store, context):
+        handles = []
+        replacements = []
+        try:
+            for artifact in self._validated_artifacts():
+                handle = store.publish(
+                    artifact.staged,
+                    artifact.target,
+                    artifact.parameter,
+                    'directory' if artifact.directory else 'file',
+                    context,
+                    artifact.ordinal,
+                )
+                handles.append(handle)
+                replacements.append((
+                    str(artifact.staged),
+                    str(handle.reference),
+                ))
+        except Exception:
+            for handle in reversed(handles):
+                handle.rollback()
+            self.rollback()
+            raise
+        self._finished = True
+        return ArtifactCommit(_replace_paths(result, replacements), handles)
 
     def rollback(self):
         if self._finished:

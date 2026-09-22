@@ -1,21 +1,107 @@
 services:
+  db:
+    environment:
+      POSTGRES_PASSWORD: ""
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+
   api:
     image: ${BACKEND_IMAGE:?required}
     pull_policy: always
+    ports: !reset []
     environment:
-      DATABASE_URL: ${DATABASE_URL:?required}
+      DATABASE_URL: ""
+      DATABASE_URL_FILE: /run/secrets/api_database_url
+      DATABASE_ROLE: api
+      REDIS_URL: ""
+      REDIS_URL_FILE: /run/secrets/api_redis_url
+      CADD_JWT_SECRET: ""
+      CADD_JWT_SECRET_FILE: /run/secrets/cadd_jwt_secret
+      RLS_CONTEXT_SIGNING_KEY: ""
+      RLS_CONTEXT_SIGNING_KEY_FILE: /run/secrets/rls_context_signing_key
+      CADD_AUTH_USERS_JSON: ""
+      CADD_AUTH_USERS_FILE: /run/secrets/cadd_auth_users
+      METRICS_SCRAPE_TOKEN: ""
+      METRICS_SCRAPE_TOKEN_FILE: /run/secrets/metrics_scrape_token
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:?required}
+      ALLOW_LEGACY_ARTIFACT_PATHS: "false"
+    secrets:
+      - api_database_url
+      - api_redis_url
+      - cadd_jwt_secret
+      - rls_context_signing_key
+      - cadd_auth_users
+      - metrics_scrape_token
 
   worker:
     image: ${BACKEND_IMAGE:?required}
     pull_policy: always
+    ports: !reset []
+    expose:
+      - "9000"
     environment:
-      DATABASE_URL: ${DATABASE_URL:?required}
+      DATABASE_URL: ""
+      DATABASE_URL_FILE: /run/secrets/worker_database_url
+      DATABASE_ROLE: worker
+      REDIS_URL: ""
+      REDIS_URL_FILE: /run/secrets/worker_redis_url
+      RLS_CONTEXT_SIGNING_KEY: ""
+      RLS_CONTEXT_SIGNING_KEY_FILE: /run/secrets/rls_context_signing_key
+    secrets: !override
+      - source: plugin_sandbox_token_production
+        target: plugin_sandbox_token
+      - worker_database_url
+      - worker_redis_url
+      - rls_context_signing_key
+
+  dispatcher:
+    image: ${BACKEND_IMAGE:?required}
+    pull_policy: always
+    environment:
+      DATABASE_URL: ""
+      DATABASE_URL_FILE: /run/secrets/dispatcher_database_url
+      DATABASE_ROLE: dispatcher
+      REDIS_URL: ""
+      REDIS_URL_FILE: /run/secrets/dispatcher_redis_url
+    secrets:
+      - dispatcher_database_url
+      - dispatcher_redis_url
+
+  artifact-maintenance:
+    image: ${BACKEND_IMAGE:?required}
+    pull_policy: always
+    environment:
+      DATABASE_URL: ""
+      DATABASE_URL_FILE: /run/secrets/maintenance_database_url
+      DATABASE_ROLE: maintenance
+    secrets:
+      - maintenance_database_url
 
   migration:
     image: ${BACKEND_IMAGE:?required}
     pull_policy: always
     environment:
-      DATABASE_URL: ${DATABASE_URL:?required}
+      DATABASE_URL: ""
+      DATABASE_URL_FILE: /run/secrets/migration_database_url
+      DATABASE_ROLE: migration
+      API_DATABASE_URL: ""
+      API_DATABASE_URL_FILE: /run/secrets/api_database_url
+      DISPATCHER_DATABASE_URL: ""
+      DISPATCHER_DATABASE_URL_FILE: /run/secrets/dispatcher_database_url
+      WORKER_DATABASE_URL: ""
+      WORKER_DATABASE_URL_FILE: /run/secrets/worker_database_url
+      MAINTENANCE_DATABASE_URL: ""
+      MAINTENANCE_DATABASE_URL_FILE: /run/secrets/maintenance_database_url
+      RLS_CONTEXT_SIGNING_KEY: ""
+      RLS_CONTEXT_SIGNING_KEY_FILE: /run/secrets/rls_context_signing_key
+    secrets:
+      - migration_database_url
+      - api_database_url
+      - dispatcher_database_url
+      - worker_database_url
+      - maintenance_database_url
+      - rls_context_signing_key
 
   storage-check:
     image: ${BACKEND_IMAGE:?required}
@@ -25,7 +111,10 @@ services:
     image: ${BACKEND_IMAGE:?required}
     pull_policy: always
     environment:
-      PITR_DATABASE_URL: ${PITR_DATABASE_URL:?required}
+      PITR_DATABASE_URL: ""
+      PITR_DATABASE_URL_FILE: /run/secrets/pitr_database_url
+    secrets:
+      - pitr_database_url
 
   recovery-check:
     image: ${BACKEND_IMAGE:?required}
@@ -38,7 +127,56 @@ services:
   web:
     image: ${FRONTEND_IMAGE:?required}
     pull_policy: always
+    ports: !override
+      - "127.0.0.1:${WEB_PUBLISHED_PORT:?required}:80"
 
   plugin-sandbox:
     image: ${BACKEND_IMAGE:?required}
     pull_policy: always
+    secrets: !override
+      - source: plugin_sandbox_token_production
+        target: plugin_sandbox_token
+
+  prometheus:
+    ports: !reset []
+    secrets:
+      - metrics_scrape_token
+
+  alertmanager:
+    ports: !reset []
+    secrets:
+      - alertmanager_webhook_url
+
+secrets:
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_FILE:?required}
+  api_database_url:
+    file: ${API_DATABASE_URL_FILE:?required}
+  dispatcher_database_url:
+    file: ${DISPATCHER_DATABASE_URL_FILE:?required}
+  worker_database_url:
+    file: ${WORKER_DATABASE_URL_FILE:?required}
+  maintenance_database_url:
+    file: ${MAINTENANCE_DATABASE_URL_FILE:?required}
+  migration_database_url:
+    file: ${MIGRATION_DATABASE_URL_FILE:?required}
+  pitr_database_url:
+    file: ${PITR_DATABASE_URL_FILE:?required}
+  api_redis_url:
+    file: ${API_REDIS_URL_FILE:?required}
+  dispatcher_redis_url:
+    file: ${DISPATCHER_REDIS_URL_FILE:?required}
+  worker_redis_url:
+    file: ${WORKER_REDIS_URL_FILE:?required}
+  cadd_jwt_secret:
+    file: ${CADD_JWT_SECRET_FILE:?required}
+  rls_context_signing_key:
+    file: ${RLS_CONTEXT_SIGNING_KEY_FILE:?required}
+  cadd_auth_users:
+    file: ${CADD_AUTH_USERS_FILE:?required}
+  plugin_sandbox_token_production:
+    file: ${PLUGIN_SANDBOX_TOKEN_FILE:?required}
+  metrics_scrape_token:
+    file: ${METRICS_SCRAPE_TOKEN_FILE:?required}
+  alertmanager_webhook_url:
+    file: ${ALERTMANAGER_WEBHOOK_URL_FILE:?required}

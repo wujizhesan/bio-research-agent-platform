@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+import tempfile
 from unittest.mock import patch
 
 from src.settings import PlatformSettings, SettingsError
@@ -30,6 +32,16 @@ class PlatformSettingsTests(unittest.TestCase):
         with self.assertRaisesRegex(SettingsError, 'WORKER_MAX_CONCURRENCY'):
             PlatformSettings.from_env({'WORKER_MAX_CONCURRENCY': 'many'})
 
+    def test_metrics_scrape_token_loads_only_from_secret_file(self):
+        with tempfile.TemporaryDirectory(prefix='metrics_secret_') as raw:
+            secret_path = Path(raw) / 'metrics-token'
+            secret_path.write_text('m' * 40, encoding='utf-8')
+            settings = PlatformSettings.from_env({
+                'METRICS_SCRAPE_TOKEN_FILE': str(secret_path),
+            })
+        self.assertEqual(settings.metrics_scrape_token, 'm' * 40)
+        self.assertNotIn('m' * 40, str(settings.sanitized_configuration()))
+
     def test_production_rejects_local_storage_and_legacy_token(self):
         settings = PlatformSettings.from_env({
             'APP_ENV': 'production',
@@ -42,13 +54,93 @@ class PlatformSettingsTests(unittest.TestCase):
     def test_production_accepts_s3_without_exposing_credentials(self):
         settings = PlatformSettings.from_env({
             'APP_ENV': 'production',
+            'PUBLIC_BASE_URL': 'https://platform.example',
+            'CORS_ORIGINS': 'https://platform.example',
+            'TRUSTED_PROXY_CIDRS': '172.16.0.0/12',
+            'JOB_BACKEND': 'redis',
             'STORAGE_BACKEND': 's3',
             'S3_BUCKET': 'research-data',
-            'AWS_ACCESS_KEY_ID': 'key',
-            'AWS_SECRET_ACCESS_KEY': 'hidden',
+            'DATABASE_ROLE': 'api',
         }).validate('api')
         self.assertEqual(settings.public_snapshot()['environment'], 'production')
-        self.assertNotIn('hidden', str(settings.public_snapshot()))
+        self.assertFalse(settings.allow_legacy_artifact_paths)
+        self.assertFalse(settings.sanitized_configuration()['secrets_configured']['aws'])
+
+    def test_production_rejects_legacy_artifact_paths(self):
+        settings = PlatformSettings.from_env({
+            'APP_ENV': 'production',
+            'ALLOW_LEGACY_ARTIFACT_PATHS': 'true',
+        })
+        with self.assertRaisesRegex(
+            SettingsError,
+            'ALLOW_LEGACY_ARTIFACT_PATHS',
+        ):
+            settings.validate('api')
+
+    def test_production_requires_component_database_role(self):
+        base = {
+            'APP_ENV': 'production',
+            'PUBLIC_BASE_URL': 'https://platform.example',
+            'CORS_ORIGINS': 'https://platform.example',
+            'JOB_BACKEND': 'redis',
+            'STORAGE_BACKEND': 's3',
+            'S3_BUCKET': 'research-data',
+        }
+        with self.assertRaisesRegex(SettingsError, 'DATABASE_ROLE=api'):
+            PlatformSettings.from_env(base).validate('api')
+        with self.assertRaisesRegex(SettingsError, 'DATABASE_ROLE=worker'):
+            PlatformSettings.from_env({**base, 'DATABASE_ROLE': 'api'}).validate('worker')
+        with self.assertRaisesRegex(SettingsError, 'DATABASE_ROLE=dispatcher'):
+            PlatformSettings.from_env({**base, 'DATABASE_ROLE': 'api'}).validate(
+                'dispatcher'
+            )
+        with self.assertRaisesRegex(SettingsError, 'DATABASE_ROLE=maintenance'):
+            PlatformSettings.from_env({**base, 'DATABASE_ROLE': 'worker'}).validate(
+                'maintenance'
+            )
+        maintenance = PlatformSettings.from_env({
+            **base,
+            'DATABASE_ROLE': 'maintenance',
+            'JOB_BACKEND': 'local',
+        }).validate('maintenance')
+        self.assertEqual(maintenance.database_role, 'maintenance')
+
+    def test_production_rejects_local_job_backend(self):
+        settings = PlatformSettings.from_env({
+            'APP_ENV': 'production',
+            'JOB_BACKEND': 'local',
+            'STORAGE_BACKEND': 's3',
+            'S3_BUCKET': 'research-data',
+        })
+        with self.assertRaisesRegex(SettingsError, 'JOB_BACKEND=redis'):
+            settings.validate('api')
+
+    def test_production_requires_https_public_origin(self):
+        base = {
+            'APP_ENV': 'production',
+            'PUBLIC_BASE_URL': 'http://platform.example',
+            'CORS_ORIGINS': 'https://platform.example',
+        }
+        with self.assertRaisesRegex(SettingsError, 'PUBLIC_BASE_URL'):
+            PlatformSettings.from_env(base).validate('api')
+
+    def test_production_rejects_insecure_cors_origin(self):
+        base = {
+            'APP_ENV': 'production',
+            'PUBLIC_BASE_URL': 'https://platform.example',
+            'CORS_ORIGINS': 'http://platform.example',
+        }
+        with self.assertRaisesRegex(SettingsError, 'CORS_ORIGINS'):
+            PlatformSettings.from_env(base).validate('api')
+
+    def test_trusted_hosts_derive_from_public_origin(self):
+        settings = PlatformSettings.from_env({
+            'PUBLIC_BASE_URL': 'https://platform.example:8443',
+        })
+        self.assertEqual(
+            settings.trusted_hosts,
+            ('127.0.0.1', 'api', 'localhost', 'platform.example'),
+        )
 
 
 if __name__ == '__main__':

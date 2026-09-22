@@ -35,10 +35,12 @@ services:
         condition: service_healthy
     environment:
       APP_ENV: ${APP_ENV:-development}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       APP_RELEASE_TAG: ${RELEASE_TAG:-development}
       APP_GIT_SHA: ${GIT_SHA:-unknown}
       APP_IMAGE_REFERENCE: ${BACKEND_IMAGE:-unknown}
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}
+      DATABASE_URL: ${API_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}}
+      DATABASE_ROLE: ${API_DATABASE_ROLE:-internal}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
@@ -50,8 +52,13 @@ services:
       NCBI_API_KEY: ${NCBI_API_KEY:-}
       CADD_JWT_SECRET: ${CADD_JWT_SECRET:-}
       CADD_JWT_SECRET_FILE: ${CADD_JWT_SECRET_FILE:-}
+      RLS_CONTEXT_SIGNING_KEY: ${RLS_CONTEXT_SIGNING_KEY:-}
+      RLS_CONTEXT_SIGNING_KEY_FILE: ${RLS_CONTEXT_SIGNING_KEY_FILE:-}
+      RLS_CONTEXT_KEY_ID: ${RLS_CONTEXT_KEY_ID:-primary}
       CADD_AUTH_USERS_JSON: ${CADD_AUTH_USERS_JSON:-}
       CADD_AUTH_USERS_FILE: ${CADD_AUTH_USERS_FILE:-}
+      METRICS_SCRAPE_TOKEN: ${METRICS_SCRAPE_TOKEN:-}
+      METRICS_SCRAPE_TOKEN_FILE: ${METRICS_SCRAPE_TOKEN_FILE:-}
       AUTH_TOKEN_TTL_SECONDS: ${AUTH_TOKEN_TTL_SECONDS:-3600}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
       UPLOAD_ROOT: ${UPLOAD_ROOT:-/app/output/uploads}
@@ -59,6 +66,11 @@ services:
       UPLOAD_TOTAL_QUOTA_BYTES: ${UPLOAD_TOTAL_QUOTA_BYTES:-10737418240}
       UPLOAD_MAX_DECOMPRESSED_BYTES: ${UPLOAD_MAX_DECOMPRESSED_BYTES:-209715200}
       UPLOAD_MAX_COMPRESSION_RATIO: ${UPLOAD_MAX_COMPRESSION_RATIO:-100}
+      API_REQUEST_BODY_MAX_BYTES: ${API_REQUEST_BODY_MAX_BYTES:-2097152}
+      API_UPLOAD_BODY_MAX_BYTES: ${API_UPLOAD_BODY_MAX_BYTES:-57671680}
+      AUTH_REQUEST_BODY_MAX_BYTES: ${AUTH_REQUEST_BODY_MAX_BYTES:-16384}
+      ALLOW_LEGACY_ARTIFACT_PATHS: ${ALLOW_LEGACY_ARTIFACT_PATHS:-true}
+      AUTH_RATE_LIMIT_REDIS_TIMEOUT_SECONDS: ${AUTH_RATE_LIMIT_REDIS_TIMEOUT_SECONDS:-0.5}
       STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
       S3_BUCKET: ${S3_BUCKET:-}
       S3_PREFIX: ${S3_PREFIX:-bio-agent}
@@ -87,7 +99,7 @@ services:
       PLUGIN_ALLOWED_ENV_VARS: ${PLUGIN_ALLOWED_ENV_VARS:-}
       PLUGIN_ALLOW_UNTRUSTED_INLINE: "false"
       WORKFLOW_CHECKPOINT_LOCK_TIMEOUT: ${WORKFLOW_CHECKPOINT_LOCK_TIMEOUT:-5}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_URL: ${API_REDIS_URL:-redis://redis:6379/0}
       REDIS_NAMESPACE: ${REDIS_NAMESPACE:-bioagent}
       REDIS_SOCKET_TIMEOUT: ${REDIS_SOCKET_TIMEOUT:-15}
       JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-300}
@@ -142,6 +154,14 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}
+      DATABASE_ROLE: migration
+      RLS_CONTEXT_SIGNING_KEY: ${RLS_CONTEXT_SIGNING_KEY:-}
+      RLS_CONTEXT_SIGNING_KEY_FILE: ${RLS_CONTEXT_SIGNING_KEY_FILE:-}
+      RLS_CONTEXT_KEY_ID: ${RLS_CONTEXT_KEY_ID:-primary}
+      API_DATABASE_URL: ${API_DATABASE_URL:-}
+      DISPATCHER_DATABASE_URL: ${DISPATCHER_DATABASE_URL:-}
+      WORKER_DATABASE_URL: ${WORKER_DATABASE_URL:-}
+      MAINTENANCE_DATABASE_URL: ${MAINTENANCE_DATABASE_URL:-}
       AUTO_CREATE_SCHEMA: "false"
       RUN_MIGRATIONS: "false"
     cap_drop:
@@ -265,6 +285,93 @@ services:
       - --output
       - /run/output/latest-production.json
 
+  dispatcher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      APP_RELEASE_TAG: ${RELEASE_TAG:-development}
+      APP_GIT_SHA: ${GIT_SHA:-unknown}
+      APP_IMAGE_REFERENCE: ${BACKEND_IMAGE:-unknown}
+      JOB_BACKEND: redis
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      S3_BUCKET: ${S3_BUCKET:-}
+      DATABASE_URL: ${DISPATCHER_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}}
+      DATABASE_ROLE: ${DISPATCHER_DATABASE_ROLE:-internal}
+      REDIS_URL: ${DISPATCHER_REDIS_URL:-redis://redis:6379/0}
+      REDIS_NAMESPACE: ${REDIS_NAMESPACE:-bioagent}
+      REDIS_SOCKET_TIMEOUT: ${REDIS_SOCKET_TIMEOUT:-15}
+      WORKER_CAPABILITY_ROUTING: ${WORKER_CAPABILITY_ROUTING:-true}
+      RUN_MIGRATIONS: "false"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    command: ["python", "-m", "src.dispatcher"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.dispatcher", "--check"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  artifact-maintenance:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      DATABASE_URL: ${MAINTENANCE_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}}
+      DATABASE_ROLE: ${MAINTENANCE_DATABASE_ROLE:-internal}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_PREFIX: ${S3_PREFIX:-bio-agent}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      S3_REGION: ${S3_REGION:-}
+      S3_EXPECTED_BUCKET_OWNER: ${S3_EXPECTED_BUCKET_OWNER:-}
+      PLUGIN_ARTIFACT_ROOT: /app/output
+      ARTIFACT_RECOVERY_GRACE_SECONDS: ${ARTIFACT_RECOVERY_GRACE_SECONDS:-3600}
+      ARTIFACT_RECOVERY_LEASE_SECONDS: ${ARTIFACT_RECOVERY_LEASE_SECONDS:-300}
+      ARTIFACT_RECOVERY_BATCH_SIZE: ${ARTIFACT_RECOVERY_BATCH_SIZE:-100}
+      ARTIFACT_RECOVERY_INTERVAL_SECONDS: ${ARTIFACT_RECOVERY_INTERVAL_SECONDS:-300}
+      ARTIFACT_RECOVERY_HEARTBEAT_PATH: /tmp/artifact-recovery-heartbeat
+      ARTIFACT_RECOVERY_HEALTH_MAX_AGE_SECONDS: ${ARTIFACT_RECOVERY_HEALTH_MAX_AGE_SECONDS:-660}
+      RUN_MIGRATIONS: "false"
+      AUTO_CREATE_SCHEMA: "false"
+    volumes:
+      - ./output:/app/output
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    command: ["python", "-m", "src.artifact_recovery", "--loop-seconds", "${ARTIFACT_RECOVERY_INTERVAL_SECONDS:-300}"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.artifact_recovery", "--check"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
   worker:
     build:
       context: .
@@ -284,7 +391,8 @@ services:
       APP_RELEASE_TAG: ${RELEASE_TAG:-development}
       APP_GIT_SHA: ${GIT_SHA:-unknown}
       APP_IMAGE_REFERENCE: ${BACKEND_IMAGE:-unknown}
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}
+      DATABASE_URL: ${WORKER_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-bioagent}:${POSTGRES_PASSWORD:-bioagent-dev-password}@db:5432/${POSTGRES_DB:-bioagent}}
+      DATABASE_ROLE: ${WORKER_DATABASE_ROLE:-internal}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
@@ -293,7 +401,7 @@ services:
       RESEARCH_PLANNER_MODEL: ${RESEARCH_PLANNER_MODEL:-}
       NCBI_EMAIL: ${NCBI_EMAIL:-}
       NCBI_API_KEY: ${NCBI_API_KEY:-}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_URL: ${WORKER_REDIS_URL:-redis://redis:6379/0}
       REDIS_NAMESPACE: ${REDIS_NAMESPACE:-bioagent}
       REDIS_SOCKET_TIMEOUT: ${REDIS_SOCKET_TIMEOUT:-15}
       JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-300}
@@ -389,5 +497,78 @@ services:
     ports:
       - "${WEB_PUBLISHED_PORT:-5173}:80"
 
+  prometheus:
+    profiles: ["monitoring"]
+    image: prom/prometheus@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+      alertmanager:
+        condition: service_healthy
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-15d}
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PUBLISHED_PORT:-9090}:9090"
+    expose:
+      - "9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/storage-deletion-alerts.yml:/etc/prometheus/rules/storage-deletion-alerts.yml:ro
+      - prometheus_data:/prometheus
+    secrets:
+      - metrics_scrape_token
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/bin/promtool", "check", "config", "/etc/prometheus/prometheus.yml"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  alertmanager:
+    profiles: ["monitoring"]
+    image: prom/alertmanager@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    ports:
+      - "127.0.0.1:${ALERTMANAGER_PUBLISHED_PORT:-9093}:9093"
+    expose:
+      - "9093"
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    secrets:
+      - alertmanager_webhook_url
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/bin/amtool", "check-config", "/etc/alertmanager/alertmanager.yml"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
 volumes:
   bioagent_pgdata:
+  prometheus_data:
+  alertmanager_data:
+
+secrets:
+  metrics_scrape_token:
+    file: ${METRICS_SCRAPE_TOKEN_FILE:-./output/secrets/metrics-scrape-token}
+  alertmanager_webhook_url:
+    file: ${ALERTMANAGER_WEBHOOK_URL_FILE:-./output/secrets/alertmanager-webhook-url}

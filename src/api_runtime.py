@@ -64,8 +64,11 @@ class ApiRuntime:
         finally:
             if self.owns_jobs:
                 self.jobs.shutdown()
-            if self.owns_database:
-                await self.database.close()
+            try:
+                await self.login_rate_limiter.close()
+            finally:
+                if self.owns_database:
+                    await self.database.close()
 
 
 def _build_jobs(output_root, job_manager, settings=None):
@@ -148,10 +151,17 @@ def build_api_runtime(
     plugins = plugin_manager or PluginManager(
         state_path=output_root / 'plugin_state.json'
     )
-    runtime_database = database or Database()
-    audit = audit_log or AuditLogger(output_root / 'audit.jsonl')
+    runtime_database = database or Database(settings.database_url)
+    audit = audit_log or AuditLogger(
+        output_root / 'audit.jsonl',
+        database=runtime_database,
+    )
     auth = AuthService.from_env()
-    login_rate_limiter = LoginRateLimiter.from_env()
+    login_rate_limiter = LoginRateLimiter.from_env(
+        redis_url=settings.redis_url if settings.job_backend == 'redis' else None,
+        namespace=settings.redis_namespace,
+        production=settings.app_env in {'production', 'prod'},
+    )
     jobs = _build_jobs(output_root, job_manager, settings)
     return ApiRuntime(
         jobs=jobs,

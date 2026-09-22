@@ -1,10 +1,13 @@
 import hashlib
+import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import yaml
 
@@ -142,6 +145,64 @@ class PluginContainerTests(unittest.TestCase):
         finally:
             executor.shutdown()
 
+    def test_container_executor_transfers_only_contract_paths_and_publishes_output(self):
+        with tempfile.TemporaryDirectory(prefix='container_transfer_') as raw:
+            root = Path(raw)
+            inputs = root / 'inputs'
+            artifacts = root / 'artifacts'
+            exchange = root / 'exchange'
+            inputs.mkdir()
+            artifacts.mkdir()
+            source = inputs / 'sample.csv'
+            source.write_text('gene,value\nTP53,12\n', encoding='utf-8')
+            target = artifacts / 'result.csv'
+
+            def transport(_path, payload, _timeout):
+                staged_input = Path(payload['arguments']['input_path'])
+                staged_output = Path(payload['arguments']['output_path'])
+                self.assertTrue(staged_input.is_relative_to(exchange))
+                self.assertTrue(staged_output.is_relative_to(exchange))
+                self.assertNotIn(str(artifacts), str(payload['arguments']))
+                staged_output.write_text(
+                    staged_input.read_text(encoding='utf-8'),
+                    encoding='utf-8',
+                )
+                return {
+                    'ok': True,
+                    'result': {'output_path': str(staged_output)},
+                }
+
+            executor = ContainerToolExecutor(
+                'http://plugin-sandbox:8081',
+                TOKEN,
+                limits=self.limits(),
+                transport=transport,
+                input_workspace_root=exchange,
+                input_roots=(inputs,),
+                artifact_root=artifacts,
+            )
+            try:
+                with patch(
+                    'src.plugin_container._tool_filesystem_contract',
+                    return_value=(
+                        {'input_path'},
+                        {'output_path': 'file'},
+                        {'output_path'},
+                    ),
+                ):
+                    result = executor.execute('demo_run', {
+                        'input_path': str(source),
+                        'output_path': str(target),
+                    })
+            finally:
+                executor.shutdown()
+            self.assertEqual(result['output_path'], str(target.resolve()))
+            self.assertEqual(
+                target.read_text(encoding='utf-8'),
+                source.read_text(encoding='utf-8'),
+            )
+            self.assertEqual(list(exchange.iterdir()), [])
+
     def test_environment_reads_sandbox_token_from_secret_file(self):
         with tempfile.TemporaryDirectory() as raw:
             secret = Path(raw) / 'sandbox-token'
@@ -180,6 +241,46 @@ class PluginContainerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'at least 32'):
             create_server('127.0.0.1', 0, 'short')
 
+    def test_sandbox_server_hides_internal_execution_errors(self):
+        executor = Mock()
+        executor.execute.side_effect = RuntimeError(
+            'token=secret-value /srv/private/input.fastq'
+        )
+        runtime = SandboxRuntime(executor_factory=lambda: executor)
+        server = create_server('127.0.0.1', 0, TOKEN, runtime=runtime)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        payload = json.dumps({
+            'request_id': 'a' * 32,
+            'tool': 'research_catalog',
+            'arguments': {},
+        }).encode('utf-8')
+        request = Request(
+            f'http://127.0.0.1:{server.server_port}/v1/execute',
+            data=payload,
+            headers={
+                'Authorization': f'Bearer {TOKEN}',
+                'Content-Type': 'application/json',
+            },
+            method='POST',
+        )
+        try:
+            with self.assertRaises(HTTPError) as raised:
+                urlopen(request, timeout=5)
+            response = json.loads(raised.exception.read().decode('utf-8'))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        self.assertEqual(raised.exception.code, 500)
+        self.assertEqual(response, {
+            'ok': False,
+            'error_code': 'sandbox_execution_failed',
+            'error': 'plugin execution failed',
+        })
+        self.assertNotIn('secret-value', str(response))
+        self.assertNotIn('/srv/private', str(response))
+
     def test_secure_compose_has_container_and_scanner_boundaries(self):
         root = Path(__file__).resolve().parent.parent
         compose = yaml.safe_load(
@@ -198,7 +299,12 @@ class PluginContainerTests(unittest.TestCase):
         )
         self.assertEqual(
             services['worker']['environment']['JOB_INPUT_WORKSPACE_ROOT'],
-            '/app/output/.job-inputs',
+            '/run/bioagent/plugin-exchange',
+        )
+        self.assertNotIn('./output:/app/output:rw', sandbox['volumes'])
+        self.assertIn(
+            'plugin_exchange:/run/bioagent/plugin-exchange:rw',
+            sandbox['volumes'],
         )
         self.assertNotIn('ports', services['clamav'])
         self.assertTrue(compose['networks']['malware_scan']['internal'])

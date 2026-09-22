@@ -42,6 +42,7 @@ def register_a2a_routes(
     database,
     jobs,
     current_principal,
+    job_access,
     read_job,
     submit_job,
 ):
@@ -139,6 +140,10 @@ def register_a2a_routes(
             arguments = message_metadata.get('arguments')
             if arguments is None:
                 arguments = request_metadata.get('arguments')
+            project_id = (
+                message_metadata.get('project_id')
+                or request_metadata.get('project_id')
+            )
             text = a2a_message_text(message)
             if tool is None:
                 tool = 'research_plan'
@@ -157,9 +162,19 @@ def register_a2a_routes(
                     -32602,
                     'metadata.arguments must be an object',
                 )
+            if project_id is not None and not isinstance(project_id, str):
+                return a2a_error(
+                    request_id,
+                    -32602,
+                    'metadata.project_id must be a string',
+                )
             try:
                 accepted = await submit_job(
-                    JobCreate(tool=tool, arguments=arguments),
+                    JobCreate(
+                        tool=tool,
+                        arguments=arguments,
+                        project_id=project_id,
+                    ),
                     idempotency_key=normalized_message['messageId'],
                     principal=principal,
                 )
@@ -292,6 +307,14 @@ def register_a2a_routes(
                     'task not found',
                     {'taskId': task_id},
                 )
+            try:
+                await job_access(
+                    task_id,
+                    principal,
+                    {'owner', 'editor', 'viewer'},
+                )
+            except HTTPException:
+                return a2a_error(request_id, -32003, 'task access denied')
             return a2a_response(
                 request_id,
                 result={'task': a2a_task(record, f'bio-{task_id}')},
@@ -304,12 +327,16 @@ def register_a2a_routes(
             if not isinstance(task_id, str) or not task_id:
                 return a2a_error(request_id, -32602, 'id is required')
             try:
+                await job_access(task_id, principal, {'owner', 'editor'})
+            except HTTPException:
+                return a2a_error(request_id, -32003, 'task access denied')
+            try:
                 record = jobs.cancel(task_id)
             except ValueError as exc:
                 return a2a_error(request_id, -32001, str(exc))
             await database.upsert_job(record)
             JOB_STATUS.labels(record['tool'], record['status']).set(1)
-            audit.record(
+            await audit.record(
                 principal,
                 'job.cancel',
                 'job',

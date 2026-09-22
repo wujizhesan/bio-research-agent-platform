@@ -49,6 +49,10 @@ class ProjectMemberCreate(BaseModel):
     role: Literal['owner', 'editor', 'viewer'] = 'viewer'
 
 
+class AuthSubjectRevoke(BaseModel):
+    disabled: bool = False
+
+
 class FrontendErrorReport(BaseModel):
     boundary_name: str = Field(min_length=1, max_length=128)
     error_name: str = Field(min_length=1, max_length=128)

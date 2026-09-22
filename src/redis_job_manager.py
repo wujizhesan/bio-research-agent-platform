@@ -85,6 +85,7 @@ class RedisJobManager:
         max_concurrency=None,
         capability_routing=None,
         require_execution_fingerprint=None,
+        artifact_store=None,
         settings=None,
     ):
         self.settings = settings or PlatformSettings.from_env()
@@ -117,6 +118,7 @@ class RedisJobManager:
             self.result_ttl_seconds = 86400
         self.worker_id = worker_id or f'worker-{uuid4().hex}'
         self.state_store = state_store
+        self.artifact_store = artifact_store
         self._tool_executor = tool_executor or InlineToolExecutor(
             lambda tool, arguments: run_tool(tool, arguments)
         )
@@ -175,6 +177,11 @@ class RedisJobManager:
             self.resource_capacity,
             self.resource_pool,
             self.enforce_capacity,
+            claim_provider=(
+                getattr(self.state_store, 'claim_job', None)
+                if getattr(self.state_store, 'require_job_scope', False)
+                else None
+            ),
         )
         self._worker_runtime = RedisJobWorkerRuntime(self)
         self.redis.ping()
@@ -345,7 +352,8 @@ class RedisJobManager:
 
     def _create_job(self, tool, arguments, resources, priority, retry_of=None,
                     idempotency_key=None, spec=None, parent_context=None,
-                    dispatch=True, execution_identity=None):
+                    dispatch=True, execution_identity=None, project_id=None,
+                    persist=True, public=True):
         job_id = uuid4().hex
         execution_key = uuid4().hex
         identity = dict(
@@ -398,6 +406,7 @@ class RedisJobManager:
             'execution_identity': identity,
             'routing': routing,
             '_capability_routing': self.capability_routing,
+            'project_id': project_id,
         }
         if self.capability_routing and not self._worker_registry.compatible_workers(
             record,
@@ -414,14 +423,19 @@ class RedisJobManager:
             record['retry_of'] = retry_of
         if idempotency_key:
             record['idempotency_key'] = idempotency_key
+        if persist and idempotency_key:
             self._store.set_idempotent_job(idempotency_key, job_id)
-        self._store.save(record, persist_state=dispatch)
+        if persist:
+            self._store.save(record, persist_state=dispatch)
         if dispatch:
+            if not persist:
+                raise RuntimeError('dispatch requires a persisted Redis job record')
             self.dispatch(job_id)
-        return self._public_record(record)
+        return self._public_record(record) if public else dict(record)
 
     def _submit(self, tool, arguments, idempotency_key=None, resources=None,
-                priority=0, dispatch=True):
+                priority=0, dispatch=True, project_id=None, persist=True,
+                public=True):
         if not isinstance(tool, str) or not tool:
             raise ValueError('tool is required')
         if not isinstance(arguments, dict):
@@ -436,7 +450,7 @@ class RedisJobManager:
         validate_required_artifacts(arguments, spec)
         request = merge_requests(spec.get('resources'), resources)
         priority = normalize_priority(priority)
-        distributed_lock = getattr(self.redis, 'lock', None)
+        distributed_lock = getattr(self.redis, 'lock', None) if persist else None
         guard = (
             distributed_lock(
                 f'{self.namespace}:jobs:submit-lock',
@@ -447,7 +461,7 @@ class RedisJobManager:
             else nullcontext()
         )
         with self._lock, guard:
-            if idempotency_key:
+            if persist and idempotency_key:
                 existing_id = self._store.get_idempotent_job(idempotency_key)
                 if existing_id:
                     existing = self._load(existing_id)
@@ -457,6 +471,7 @@ class RedisJobManager:
                             or existing.get('_arguments') != arguments
                             or existing.get('resources') != request.as_dict()
                             or existing.get('priority', 0) != priority
+                            or existing.get('project_id') != project_id
                         ):
                             raise ValueError(
                                 'idempotency key already used with different job payload'
@@ -472,10 +487,13 @@ class RedisJobManager:
                 idempotency_key=idempotency_key,
                 spec=spec,
                 dispatch=dispatch,
+                project_id=project_id,
+                persist=persist,
+                public=public,
             )
 
     def submit(self, tool, arguments, idempotency_key=None, resources=None,
-               priority=0):
+               priority=0, project_id=None):
         return self._submit(
             tool,
             arguments,
@@ -483,10 +501,11 @@ class RedisJobManager:
             resources=resources,
             priority=priority,
             dispatch=True,
+            project_id=project_id,
         )
 
     def prepare(self, tool, arguments, idempotency_key=None, resources=None,
-                priority=0):
+                priority=0, project_id=None):
         return self._submit(
             tool,
             arguments,
@@ -494,6 +513,21 @@ class RedisJobManager:
             resources=resources,
             priority=priority,
             dispatch=False,
+            project_id=project_id,
+        )
+
+    def prepare_durable(self, tool, arguments, idempotency_key=None,
+                        resources=None, priority=0, project_id=None):
+        return self._submit(
+            tool,
+            arguments,
+            idempotency_key=idempotency_key,
+            resources=resources,
+            priority=priority,
+            dispatch=False,
+            project_id=project_id,
+            persist=False,
+            public=False,
         )
 
     def dispatch(self, job_id):
@@ -537,8 +571,20 @@ class RedisJobManager:
         record = self._load(str(job_id))
         return dict(record) if record is not None else None
 
-    def rebuild_durable_queue(self, limit=1000):
-        loader = getattr(self.state_store, 'load_dispatchable', None)
+    def discard_prepared(
+        self,
+        job_id,
+        idempotency_key=None,
+        replacement_job_id=None,
+    ):
+        self._store.discard_prepared(
+            job_id,
+            idempotency_key=idempotency_key,
+            replacement_job_id=replacement_job_id,
+        )
+
+    def rebuild_durable_queue(self, limit=1000, loader=None):
+        loader = loader or getattr(self.state_store, 'load_dispatchable', None)
         if loader is None:
             return []
         rebuilt = []
@@ -558,6 +604,23 @@ class RedisJobManager:
             with self._lock, guard:
                 existing = self._load(job_id)
                 if existing is not None:
+                    claim_ticket = durable.get('_claim_ticket')
+                    if claim_ticket and existing.get('status') == 'queued':
+                        def refresh_claim_ticket(current, _server_now):
+                            if current.get('status') != 'queued':
+                                return None
+                            current['_claim_ticket'] = str(claim_ticket)
+                            current['_dispatch_generation'] = int(
+                                durable.get('_dispatch_generation') or 0
+                            )
+                            return current
+
+                        refreshed, changed = self._store.atomic_update(
+                            job_id,
+                            refresh_claim_ticket,
+                        )
+                        if changed:
+                            existing = refreshed
                     saver = getattr(self.state_store, 'save', None)
                     if saver is not None:
                         saver(existing)
@@ -636,7 +699,8 @@ class RedisJobManager:
         record, _ = self._store.atomic_update(job_id, request_cancel)
         return self._public_record(record)
 
-    def _retry(self, job_id, migrate_implementation=False, dispatch=True):
+    def _retry(self, job_id, migrate_implementation=False, dispatch=True,
+               persist=True, public=True):
         record = self._load(str(job_id))
         if record is None:
             raise ValueError(f'job not found: {job_id}')
@@ -670,6 +734,9 @@ class RedisJobManager:
                 else record.get('execution_identity')
             ),
             dispatch=dispatch,
+            project_id=record.get('project_id'),
+            persist=persist,
+            public=public,
         )
 
     def retry(self, job_id, migrate_implementation=False):
@@ -684,6 +751,15 @@ class RedisJobManager:
             job_id,
             migrate_implementation=migrate_implementation,
             dispatch=False,
+        )
+
+    def prepare_durable_retry(self, job_id, migrate_implementation=False):
+        return self._retry(
+            job_id,
+            migrate_implementation=migrate_implementation,
+            dispatch=False,
+            persist=False,
+            public=False,
         )
 
     def resolve_indeterminate(self, job_id, decision, reason, reviewer, evidence=None):
@@ -715,11 +791,19 @@ class RedisJobManager:
     def _dead_letter(self, record, reason):
         return self._recovery.dead_letter(record, reason)
 
-    def _load_execution_result(self, execution_key, job_id=None, fencing_token=None):
+    def _load_execution_result(
+        self,
+        execution_key,
+        job_id=None,
+        fencing_token=None,
+        attempt=None,
+    ):
         return self._store.load_execution_result(
             execution_key,
             job_id=job_id,
             fencing_token=fencing_token,
+            worker_id=self.worker_id,
+            attempt=attempt,
         )
 
     def _begin_execution_attempt(
@@ -733,27 +817,110 @@ class RedisJobManager:
         begin = getattr(self.state_store, 'begin_execution_attempt', None)
         if begin is None:
             return None
-        return begin(
+        return self._store._call_with_supported_keywords(
+            begin,
             execution_key,
             job_id,
             fencing_token,
             attempt,
             semantics,
+            worker_id=self.worker_id,
         )
 
-    def _store_execution_result(self, execution_key, result, job_id=None, fencing_token=None):
+    def _store_execution_result(
+        self,
+        execution_key,
+        result,
+        job_id=None,
+        fencing_token=None,
+        attempt=None,
+        publication_ids=None,
+    ):
         return self._store.store_execution_result(
             execution_key,
             result,
             job_id=job_id,
             fencing_token=fencing_token,
+            worker_id=self.worker_id,
+            attempt=attempt,
+            publication_ids=publication_ids,
         )
 
-    def _finish(self, job_id, result, failed=False, fencing_token=None):
+    def _artifact_state_call(
+        self,
+        method,
+        record,
+        fencing_token,
+        values,
+        *,
+        error=None,
+    ):
+        callback = getattr(self.state_store, method, None)
+        if callback is None or not values:
+            return None
+        arguments = (
+            record['job_id'],
+            record['_execution_key'],
+            fencing_token,
+            int(record.get('_attempts', 0)),
+            self.worker_id,
+            values,
+        )
+        if method == 'reserve_artifacts':
+            arguments = (
+                record['job_id'],
+                record.get('project_id') or 'system-legacy',
+                record['_execution_key'],
+                fencing_token,
+                int(record.get('_attempts', 0)),
+                self.worker_id,
+                values,
+            )
+        if method == 'orphan_artifacts':
+            return callback(*arguments, error=error)
+        return callback(*arguments)
+
+    def _reserve_artifacts(self, record, fencing_token, artifacts):
+        return self._artifact_state_call(
+            'reserve_artifacts', record, fencing_token, artifacts
+        )
+
+    def _mark_artifacts_uploaded(self, record, fencing_token, artifacts):
+        return self._artifact_state_call(
+            'mark_artifacts_uploaded', record, fencing_token, artifacts
+        )
+
+    def _commit_artifacts(self, record, fencing_token, artifacts):
+        publication_ids = [
+            item['publication_id'] for item in artifacts
+            if isinstance(item, dict) and item.get('publication_id')
+        ]
+        return self._artifact_state_call(
+            'commit_artifacts', record, fencing_token, publication_ids
+        )
+
+    def _orphan_artifacts(self, record, fencing_token, artifacts, error=None):
+        publication_ids = [
+            item['publication_id'] if isinstance(item, dict) else str(item)
+            for item in artifacts
+            if (isinstance(item, dict) and item.get('publication_id'))
+            or (not isinstance(item, dict) and str(item))
+        ]
+        return self._artifact_state_call(
+            'orphan_artifacts',
+            record,
+            fencing_token,
+            publication_ids,
+            error=error,
+        )
+
+    def _finish(self, job_id, result, failed=False, artifacts=None,
+                fencing_token=None):
         return self._coordinator.finish(
             job_id,
             result,
             failed=failed,
+            artifacts=artifacts,
             fencing_token=fencing_token,
         )
 

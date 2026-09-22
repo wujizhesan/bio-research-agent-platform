@@ -1,5 +1,6 @@
 """Execution-state coordination and resource admission for Redis jobs."""
 
+from contextlib import nullcontext
 from datetime import datetime, timezone
 
 try:
@@ -18,7 +19,8 @@ def _now():
 
 class RedisExecutionCoordinator:
     def __init__(self, store, metrics, recovery, worker_id, lease_seconds,
-                 resource_capacity, resource_pool, enforce_capacity=False):
+                 resource_capacity, resource_pool, enforce_capacity=False,
+                 claim_provider=None):
         self.store = store
         self.metrics = metrics
         self.recovery = recovery
@@ -27,48 +29,94 @@ class RedisExecutionCoordinator:
         self.resource_capacity = resource_capacity
         self.resource_pool = resource_pool
         self.enforce_capacity = bool(enforce_capacity)
+        self.claim_provider = claim_provider
 
     def claim(self, record):
-        fencing_token = self.store.next_fencing_token()
-
-        def update(current, server_now):
-            if current.get('status') in TERMINAL_STATUSES:
-                return None
+        job_id = str(record['job_id'])
+        distributed_lock = getattr(self.store.redis, 'lock', None)
+        guard = (
+            distributed_lock(
+                f'{self.store.namespace}:jobs:claim:{job_id}',
+                timeout=10,
+                blocking_timeout=5,
+            )
+            if distributed_lock else nullcontext()
+        )
+        with guard:
+            current = self.store.load(job_id)
+            if current is None or current.get('status') in TERMINAL_STATUSES:
+                return current
             if current.get('_cancel_requested'):
-                return None
+                return current
             lease_until = current.get('_lease_until')
+            server_now = self.store.server_time()
             if (
                 current.get('status') == 'running'
                 and lease_until is not None
                 and float(lease_until) > server_now
             ):
-                return None
-            current.pop('scheduling', None)
-            current.update({
-                'status': 'running',
-                'started_at': _now(),
-                '_worker_id': self.worker_id,
-                '_lease_until': server_now + self.lease_seconds,
-                '_fencing_token': fencing_token,
-                '_attempts': int(current.get('_attempts', 0)) + 1,
-                '_started_epoch': server_now,
-            })
-            return current
+                return current
+            expected_revision = int(current.get('_revision', 0))
+            if self.claim_provider is not None:
+                claim = self.claim_provider(
+                    job_id,
+                    current.get('_execution_key'),
+                    self.worker_id,
+                    current.get('_claim_ticket'),
+                    self.lease_seconds,
+                )
+                if not claim:
+                    return current
+                fencing_token = str(claim['fencing_token'])
+                claim_attempt = int(claim['attempt'])
+            else:
+                fencing_token = self.store.next_fencing_token()
+                claim_attempt = int(current.get('_attempts', 0)) + 1
 
-        claimed, changed = self.store.atomic_update(record['job_id'], update)
+            def update(latest, update_time):
+                if int(latest.get('_revision', 0)) != expected_revision:
+                    return None
+                if latest.get('status') in TERMINAL_STATUSES:
+                    return None
+                if latest.get('_cancel_requested'):
+                    return None
+                active_until = latest.get('_lease_until')
+                if (
+                    latest.get('status') == 'running'
+                    and active_until is not None
+                    and float(active_until) > update_time
+                ):
+                    return None
+                latest.pop('scheduling', None)
+                latest.update({
+                    'status': 'running',
+                    'started_at': _now(),
+                    '_worker_id': self.worker_id,
+                    '_lease_until': update_time + self.lease_seconds,
+                    '_fencing_token': fencing_token,
+                    '_attempts': claim_attempt,
+                    '_started_epoch': update_time,
+                })
+                return latest
+
+            claimed, changed = self.store.atomic_update(job_id, update)
         if changed:
             self.metrics.claimed(claimed, self.worker_id)
         return claimed
 
-    def finish(self, job_id, result, failed=False, fencing_token=None):
+    def finish(self, job_id, result, failed=False, artifacts=None,
+               fencing_token=None):
         update = {
             'status': 'failed' if failed else 'completed',
             'finished_at': _now(),
             'result': result,
         }
+        if artifacts:
+            update['artifacts'] = [dict(item) for item in artifacts]
         if failed:
             update.update({
                 'error': result.get('error', 'tool returned an error'),
+                'error_code': result.get('error_code', 'tool_execution_failed'),
                 'dead_lettered_at': _now(),
                 'dead_letter_reason': 'execution_failed',
             })
@@ -149,6 +197,7 @@ class RedisExecutionCoordinator:
             current.update({
                 'status': 'indeterminate',
                 'finished_at': _now(),
+                'error_code': 'execution_indeterminate',
                 'error': str(reason),
                 'indeterminate': {
                     'requires_manual_review': True,

@@ -70,6 +70,75 @@ class MigrationCompatibilityTests(unittest.TestCase):
             self.assertEqual(len(violations), 1)
             self.assertIn("require server_default", violations[0])
 
+    def test_allows_static_data_backfill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_migration(
+                directory,
+                """
+                def upgrade():
+                    op.execute(sa.text("UPDATE jobs SET owner = 'system' WHERE owner IS NULL"))
+                """,
+            )
+            self.assertEqual(MODULE.check_migration(path), [])
+
+    def test_rejects_schema_changes_hidden_in_execute(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_migration(
+                directory,
+                """
+                def upgrade():
+                    op.execute(sa.text("ALTER TABLE jobs DROP COLUMN owner"))
+                """,
+            )
+            violations = MODULE.check_migration(path)
+            self.assertEqual(len(violations), 1)
+            self.assertIn("backfill or additive", violations[0])
+
+    def test_allows_static_rls_security_expansion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_migration(
+                directory,
+                """
+                POLICY = "subject = current_setting('bioagent.subject', true)"
+
+                def upgrade():
+                    op.execute(sa.text("ALTER TABLE jobs ENABLE ROW LEVEL SECURITY"))
+                    op.execute(sa.text("ALTER TABLE jobs FORCE ROW LEVEL SECURITY"))
+                    op.execute(sa.text(
+                        "CREATE POLICY jobs_tenant ON jobs USING (" + POLICY + ")"
+                    ))
+                """,
+            )
+            self.assertEqual(MODULE.check_migration(path), [])
+
+    def test_allows_static_rls_helper_function_and_privilege_restriction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_migration(
+                directory,
+                """
+                HELPER = "CREATE FUNCTION tenant_role(varchar) RETURNS text LANGUAGE sql AS 'SELECT NULL'"
+
+                def upgrade():
+                    op.execute(sa.text(HELPER))
+                    op.execute(sa.text("REVOKE ALL ON FUNCTION tenant_role(varchar) FROM PUBLIC"))
+                    op.execute(sa.text("GRANT EXECUTE ON FUNCTION tenant_role(varchar) TO app"))
+                """,
+            )
+            self.assertEqual(MODULE.check_migration(path), [])
+
+    def test_allows_static_policy_restriction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_migration(
+                directory,
+                """
+                def upgrade():
+                    op.execute(sa.text(
+                        "ALTER POLICY jobs_tenant ON jobs USING (owner = current_user)"
+                    ))
+                """,
+            )
+            self.assertEqual(MODULE.check_migration(path), [])
+
 
 if __name__ == "__main__":
     unittest.main()

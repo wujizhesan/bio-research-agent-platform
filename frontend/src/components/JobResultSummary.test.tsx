@@ -142,7 +142,10 @@ describe('ReportPreviewModal', () => {
 
     const dialog = screen.getByRole('dialog', { name: 'HTML 报告预览' })
     expect(within(dialog).getByText('result.html')).toBeInTheDocument()
-    expect(within(dialog).getByTitle('HTML report preview result.html')).toHaveAttribute('src', 'blob:report')
+    const frame = within(dialog).getByTitle('HTML report preview result.html')
+    expect(frame).toHaveAttribute('src', 'blob:report')
+    expect(frame).toHaveAttribute('sandbox', '')
+    expect(frame).toHaveAttribute('referrerpolicy', 'no-referrer')
 
     fireEvent.click(within(dialog).getByRole('button', { name: '关闭预览' }))
     expect(onClose).toHaveBeenCalledOnce()

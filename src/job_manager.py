@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import heapq
 from itertools import count
 import json
+import logging
 from pathlib import Path
 import sqlite3
 from threading import Condition, Lock, Thread
@@ -14,7 +15,11 @@ from uuid import uuid4
 try:
     from .execution_semantics import ArtifactTransaction, execution_semantics, validate_required_artifacts
     from .domain_registry import run_tool, active_tool_specs, tool_specs
-    from .job_execution import InlineToolExecutor
+    from .job_execution import (
+        InlineToolExecutor,
+        public_execution_failure,
+        public_tool_failure,
+    )
     from .resource_scheduling import (
         ResourceCapacity,
         ResourcePool,
@@ -31,7 +36,11 @@ try:
 except ImportError:
     from execution_semantics import ArtifactTransaction, execution_semantics, validate_required_artifacts
     from domain_registry import run_tool, active_tool_specs, tool_specs
-    from job_execution import InlineToolExecutor
+    from job_execution import (
+        InlineToolExecutor,
+        public_execution_failure,
+        public_tool_failure,
+    )
     from resource_scheduling import (
         ResourceCapacity,
         ResourcePool,
@@ -107,7 +116,8 @@ class JobManager:
                 'arguments_json TEXT, result_json TEXT, error TEXT, retry_of TEXT, '
                 'idempotency_key TEXT, cancel_requested INTEGER DEFAULT 0, '
                 'resources_json TEXT, priority INTEGER DEFAULT 0, '
-                'trace_id TEXT, request_id TEXT, run_context_json TEXT)'
+                'trace_id TEXT, request_id TEXT, run_context_json TEXT, '
+                'project_id TEXT)'
             )
             columns = {row[1] for row in connection.execute('PRAGMA table_info(jobs)').fetchall()}
             if 'arguments_json' not in columns:
@@ -130,6 +140,8 @@ class JobManager:
                 connection.execute('ALTER TABLE jobs ADD COLUMN run_context_json TEXT')
             if 'resolution_json' not in columns:
                 connection.execute('ALTER TABLE jobs ADD COLUMN resolution_json TEXT')
+            if 'project_id' not in columns:
+                connection.execute('ALTER TABLE jobs ADD COLUMN project_id TEXT')
 
     def _persist(self, record):
         if not self._store_path:
@@ -140,8 +152,8 @@ class JobManager:
                 '(job_id, tool, status, created_at, started_at, finished_at, '
                 'arguments_json, result_json, error, retry_of, idempotency_key, '
                 'cancel_requested, resources_json, priority, trace_id, request_id, '
-                'run_context_json, resolution_json) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ',
+                'run_context_json, resolution_json, project_id) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ',
                 (
                     record['job_id'],
                     record['tool'],
@@ -164,6 +176,7 @@ class JobManager:
                     if record.get('run_context') else None,
                     json.dumps(record.get('resolution'), ensure_ascii=False, default=str)
                     if record.get('resolution') else None,
+                    record.get('project_id'),
                 ),
             )
 
@@ -173,12 +186,12 @@ class JobManager:
                 'SELECT job_id, tool, status, created_at, started_at, finished_at, '
                 'arguments_json, result_json, error, retry_of, idempotency_key, '
                 'cancel_requested, resources_json, priority, trace_id, request_id, '
-                'run_context_json, resolution_json FROM jobs'
+                'run_context_json, resolution_json, project_id FROM jobs'
             ).fetchall()
         interrupted_at = _now()
         resumable = []
         for row in rows:
-            job_id, tool, status, created_at, started_at, finished_at, arguments_json, result_json, error, retry_of, idempotency_key, cancel_requested, resources_json, priority, trace_value, request_value, run_context_json, resolution_json = row
+            job_id, tool, status, created_at, started_at, finished_at, arguments_json, result_json, error, retry_of, idempotency_key, cancel_requested, resources_json, priority, trace_value, request_value, run_context_json, resolution_json, project_id = row
             record = {
                 'job_id': job_id,
                 'tool': tool,
@@ -187,6 +200,7 @@ class JobManager:
                 'resources': json.loads(resources_json) if resources_json else ResourceRequest().as_dict(),
                 'priority': int(priority or 0),
                 'trace_id': trace_value or make_trace_id(),
+                'project_id': project_id,
             }
             if request_value:
                 record['request_id'] = request_value
@@ -232,6 +246,7 @@ class JobManager:
                     record.update({
                         'status': 'indeterminate',
                         'finished_at': interrupted_at,
+                        'error_code': 'execution_indeterminate',
                         'error': (
                             'side-effecting job was interrupted; external state '
                             'must be reviewed before manual retry'
@@ -312,7 +327,7 @@ class JobManager:
 
     def _create_job_locked(self, tool, arguments, resources, priority,
                            retry_of=None, idempotency_key=None, spec=None,
-                           parent_context=None):
+                           parent_context=None, project_id=None):
         job_id = uuid4().hex
         execution_key = uuid4().hex
         run_context = build_run_context(
@@ -346,6 +361,7 @@ class JobManager:
             'priority': priority,
             'trace_id': run_context['trace_id'],
             'run_context': run_context,
+            'project_id': project_id,
         }
         if run_context.get('request_id'):
             record['request_id'] = run_context['request_id']
@@ -376,7 +392,7 @@ class JobManager:
         return active[tool]
 
     def submit(self, tool, arguments, idempotency_key=None, resources=None,
-               priority=0):
+               priority=0, project_id=None):
         if not isinstance(tool, str) or not tool:
             raise ValueError('tool is required')
         if not isinstance(arguments, dict):
@@ -406,6 +422,7 @@ class JobManager:
                         or existing.get('_arguments') != arguments
                         or existing.get('resources') != request.as_dict()
                         or existing.get('priority', 0) != priority
+                        or existing.get('project_id') != project_id
                     ):
                         raise ValueError('idempotency key already used with different job payload')
                     output = self._public_record(existing)
@@ -418,6 +435,7 @@ class JobManager:
                 priority,
                 idempotency_key=idempotency_key,
                 spec=spec,
+                project_id=project_id,
             )
 
     def retry(self, job_id):
@@ -455,6 +473,7 @@ class JobManager:
                 retry_of=original['job_id'],
                 spec=spec,
                 parent_context=original.get('run_context'),
+                project_id=original.get('project_id'),
             )
 
     def resolve_indeterminate(self, job_id, decision, reason, reviewer, evidence=None):
@@ -596,7 +615,13 @@ class JobManager:
                 )
                 failed = isinstance(result, dict) and result.get('status') == 'error'
                 if failed:
+                    log_event(
+                        'job.tool_reported_failure',
+                        level=logging.WARNING,
+                        error_detail=str(result.get('error') or ''),
+                    )
                     transaction.rollback()
+                    result = public_tool_failure(result)
                 else:
                     result = transaction.commit(result)
                 update = {
@@ -609,6 +634,7 @@ class JobManager:
                     'result': result,
                 }
                 if failed:
+                    update['error_code'] = result['error_code']
                     update['error'] = (
                         'side-effecting tool reported an error; external state '
                         'must be reviewed before manual retry'
@@ -618,16 +644,25 @@ class JobManager:
             except Exception as exc:
                 transaction.rollback()
                 error_type = type(exc).__name__
+                log_event(
+                    'job.execution.failed',
+                    level=logging.ERROR,
+                    error_type=error_type,
+                    error_detail=str(exc),
+                )
+                failure = public_execution_failure(exc)
                 update = {
                     'status': (
                         'indeterminate'
                         if semantics == 'side_effecting' else 'failed'
                     ),
                     'finished_at': _now(),
+                    'result': failure,
+                    'error_code': failure['error_code'],
                     'error': (
                         'side-effecting execution stopped without a durable result; '
                         'external state must be reviewed before manual retry'
-                        if semantics == 'side_effecting' else str(exc)
+                        if semantics == 'side_effecting' else failure['error']
                     ),
                 }
             with self._condition:
@@ -640,6 +675,7 @@ class JobManager:
                             update = {
                                 'status': 'indeterminate',
                                 'finished_at': _now(),
+                                'error_code': 'execution_indeterminate',
                                 'error': (
                                     'side-effecting job was cancelled during execution; '
                                     'external state must be reviewed before manual retry'

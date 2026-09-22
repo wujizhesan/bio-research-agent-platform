@@ -14,11 +14,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import Response
 
 try:
     from .api_contracts import (
         A2A_PROTOCOL_VERSION,
+        AuthSubjectRevoke,
         FrontendErrorReport,
         PluginStateUpdate,
         ProjectCreate,
@@ -29,14 +31,22 @@ try:
     from .api_dependencies import ApiDependencies
     from .api_file_routes import register_file_routes
     from .api_runtime import build_api_runtime
+    from .database import set_database_principal
     from .settings import PlatformSettings
-    from .auth import AuthService, AuthenticationError, Principal
+    from .request_limits import RequestBodyLimitMiddleware
+    from .auth import (
+        AuthService, AuthenticationError, Principal, RateLimiterUnavailable,
+        resolve_client_address, roles_sha256,
+    )
     from .domain_registry import active_tool_specs
     from .observability import (
         HTTP_ACTIVE,
         FRONTEND_ERRORS,
         HTTP_LATENCY,
         HTTP_REQUESTS,
+        STORAGE_DELETION_BACKLOG,
+        STORAGE_DELETION_EVENTS,
+        STORAGE_DELETION_OLDEST_AGE,
         bind_context,
         configure_logging,
         current_context,
@@ -47,6 +57,7 @@ try:
 except ImportError:
     from api_contracts import (
         A2A_PROTOCOL_VERSION,
+        AuthSubjectRevoke,
         FrontendErrorReport,
         PluginStateUpdate,
         ProjectCreate,
@@ -57,14 +68,22 @@ except ImportError:
     from api_dependencies import ApiDependencies
     from api_file_routes import register_file_routes
     from api_runtime import build_api_runtime
+    from database import set_database_principal
     from settings import PlatformSettings
-    from auth import AuthService, AuthenticationError, Principal
+    from request_limits import RequestBodyLimitMiddleware
+    from auth import (
+        AuthService, AuthenticationError, Principal, RateLimiterUnavailable,
+        resolve_client_address, roles_sha256,
+    )
     from domain_registry import active_tool_specs
     from observability import (
         HTTP_ACTIVE,
         FRONTEND_ERRORS,
         HTTP_LATENCY,
         HTTP_REQUESTS,
+        STORAGE_DELETION_BACKLOG,
+        STORAGE_DELETION_EVENTS,
+        STORAGE_DELETION_OLDEST_AGE,
         bind_context,
         configure_logging,
         current_context,
@@ -134,13 +153,49 @@ def _register_core_routes(
     app,
     *,
     db,
+    settings,
     auth,
     login_rate_limiter,
     audit,
     plugins,
     require_permission,
+    metrics_principal,
     project_access,
 ):
+    def set_browser_session_cookies(response, access_token, principal, max_age):
+        csrf_token = auth.csrf_token(principal.session_id)
+        cookie_options = {
+            'max_age': max(int(max_age), 0),
+            'secure': auth.production,
+            'samesite': 'strict',
+            'path': '/',
+        }
+        response.set_cookie(
+            auth.session_cookie_name,
+            access_token,
+            httponly=True,
+            **cookie_options,
+        )
+        response.set_cookie(
+            auth.csrf_cookie_name,
+            csrf_token,
+            httponly=False,
+            **cookie_options,
+        )
+
+    def clear_browser_session_cookies(response):
+        for name, httponly in (
+            (auth.session_cookie_name, True),
+            (auth.csrf_cookie_name, False),
+        ):
+            response.delete_cookie(
+                name,
+                path='/',
+                secure=auth.production,
+                httponly=httponly,
+                samesite='strict',
+            )
+
     @app.get('/live', tags=['system'])
     async def live():
         return {
@@ -223,27 +278,58 @@ def _register_core_routes(
     @app.post('/api/v1/auth/token', tags=['auth'])
     async def issue_token(
         request: Request,
+        response: Response,
         form_data: OAuth2PasswordRequestForm = Depends(),
     ):
-        client_host = request.client.host if request.client else 'unknown'
-        rate_key = f'{client_host}:{form_data.username.strip().lower()}'
-        if not login_rate_limiter.allow(rate_key):
+        client_host = resolve_client_address(
+            request.client.host if request.client else '',
+            request.headers.get('X-Forwarded-For', ''),
+            settings.trusted_proxy_cidrs,
+        )
+        account_key = form_data.username.strip().lower()
+        try:
+            allowed = await login_rate_limiter.allow(client_host, account_key)
+        except RateLimiterUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail='authentication service temporarily unavailable',
+                headers={'Retry-After': '5'},
+            ) from exc
+        if not allowed:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail='login rate limit exceeded',
                 headers={'Retry-After': str(login_rate_limiter.window_seconds)},
             )
         try:
-            payload = auth.issue_token(form_data.username, form_data.password)
-        except AuthenticationError as exc:
+            principal = auth.authenticate_credentials(
+                form_data.username,
+                form_data.password,
+            )
+            session = await db.create_auth_session(
+                principal.subject,
+                roles_sha256(principal.roles),
+                auth.ttl_seconds,
+            )
+            payload = auth.issue_token_for_principal(principal, session)
+        except (AuthenticationError, PermissionError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=str(exc),
                 headers={'WWW-Authenticate': 'Bearer'},
             ) from exc
-        login_rate_limiter.reset(rate_key)
+        try:
+            await login_rate_limiter.reset(client_host, account_key)
+        except RateLimiterUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail='authentication service temporarily unavailable',
+                headers={'Retry-After': '5'},
+            ) from exc
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers['Pragma'] = 'no-cache'
         principal_data = payload['principal']
-        audit.record(
+        await audit.record(
             Principal(
                 principal_data['sub'],
                 tuple(principal_data['roles']),
@@ -255,12 +341,116 @@ def _register_core_routes(
         )
         return payload
 
+    @app.post('/api/v1/auth/session', tags=['auth'])
+    async def establish_browser_session(
+        request: Request,
+        response: Response,
+        principal: Principal = Depends(require_permission('projects:read')),
+    ):
+        scheme, _, access_token = request.headers.get(
+            'Authorization', ''
+        ).partition(' ')
+        if (
+            scheme.lower() != 'bearer'
+            or not access_token.strip()
+            or principal.auth_type != 'jwt'
+            or not principal.session_id
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail='a revocable bearer token is required',
+            )
+        set_browser_session_cookies(
+            response,
+            access_token.strip(),
+            principal,
+            auth.ttl_seconds,
+        )
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers['Pragma'] = 'no-cache'
+        await audit.record(
+            principal,
+            'auth.browser_session_create',
+            'auth_session',
+            resource_id=principal.session_id,
+        )
+        return {
+            'status': 'ok',
+            'principal': principal.as_dict(),
+            'expires_in': auth.ttl_seconds,
+        }
+
+    @app.get('/api/v1/auth/session', tags=['auth'])
+    async def read_browser_session(
+        principal: Principal = Depends(require_permission('projects:read')),
+    ):
+        return {
+            'status': 'ok',
+            'principal': principal.as_dict(),
+            'cookie_authenticated': principal.auth_type == 'jwt_cookie',
+        }
+
+    @app.post('/api/v1/auth/logout', status_code=204, tags=['auth'])
+    async def logout(
+        response: Response,
+        principal: Principal = Depends(require_permission('projects:read')),
+    ):
+        if not principal.session_id or not await db.revoke_auth_session(
+            principal.session_id
+        ):
+            raise HTTPException(status_code=401, detail='authentication session is invalid')
+        await audit.record(
+            principal,
+            'auth.logout',
+            'auth_session',
+            resource_id=principal.session_id,
+        )
+        clear_browser_session_cookies(response)
+        response.status_code = 204
+        return response
+
+    @app.post('/api/v1/auth/subjects/{subject}/revoke', tags=['auth'])
+    async def revoke_subject_sessions(
+        subject: str,
+        payload: AuthSubjectRevoke,
+        principal: Principal = Depends(require_permission('auth:revoke')),
+    ):
+        if not await db.revoke_subject_sessions(subject, payload.disabled):
+            raise HTTPException(status_code=404, detail='authentication subject not found')
+        await audit.record(
+            principal,
+            'auth.subject_revoke',
+            'auth_subject',
+            resource_id=subject,
+            metadata={'disabled': payload.disabled},
+        )
+        return {'subject': subject, 'disabled': payload.disabled, 'revoked': True}
+
     @app.get(
         '/metrics',
-        dependencies=[Depends(require_permission('metrics:read'))],
         tags=['system'],
     )
-    async def metrics():
+    async def metrics(
+        _principal: Principal = Depends(metrics_principal),
+    ):
+        deletion_metrics = await db.storage_deletion_metrics()
+        for item in deletion_metrics['backlog']:
+            labels = (item['resource_type'], item['status'])
+            STORAGE_DELETION_BACKLOG.labels(*labels).set(item['count'])
+            STORAGE_DELETION_OLDEST_AGE.labels(*labels).set(
+                item['oldest_age_seconds']
+            )
+        for resource_type in ('file', 'job_artifact'):
+            for event_status in ('retry_requested', 'delete_dead_letter'):
+                STORAGE_DELETION_EVENTS.labels(
+                    resource_type,
+                    event_status,
+                ).set(0)
+        for item in deletion_metrics['events']:
+            STORAGE_DELETION_EVENTS.labels(
+                item['resource_type'],
+                item['status'],
+            ).set(item['count'])
         return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     @app.post('/api/v1/telemetry/frontend-errors', status_code=202, tags=['system'])
@@ -311,7 +501,7 @@ def _register_core_routes(
     ):
         report = plugins.validate_candidate(payload)
         permissions = report.get('permissions') or {}
-        audit.record(
+        await audit.record(
             principal,
             'plugin.validate',
             'plugin',
@@ -329,7 +519,7 @@ def _register_core_routes(
         principal: Principal = Depends(require_permission('plugins:write')),
     ):
         checked = plugins.check_health()
-        audit.record(
+        await audit.record(
             principal,
             'plugin.health_check',
             'plugin',
@@ -346,7 +536,7 @@ def _register_core_routes(
             checked = plugins.check_health(domain)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        audit.record(
+        await audit.record(
             principal,
             'plugin.health_check',
             'plugin',
@@ -426,7 +616,7 @@ def _register_core_routes(
             principal.subject,
             created_at,
         )
-        audit.record(
+        await audit.record(
             principal,
             'project.create',
             'project',
@@ -475,7 +665,13 @@ def _register_core_routes(
         principal: Principal = Depends(require_permission('members:write')),
     ):
         project = await project_access(project_id, principal, {'owner'})
-        if payload.role == 'owner' and payload.subject != project['owner_subject']:
+        owner_subject = project['owner_subject']
+        if payload.subject == owner_subject and payload.role != 'owner':
+            raise HTTPException(
+                status_code=400,
+                detail='project owner role cannot be changed',
+            )
+        if payload.role == 'owner' and payload.subject != owner_subject:
             raise HTTPException(
                 status_code=400,
                 detail='project owner cannot be reassigned',
@@ -486,7 +682,7 @@ def _register_core_routes(
             payload.role,
             datetime.now(timezone.utc).isoformat(),
         )
-        audit.record(
+        await audit.record(
             principal,
             'project.member_upsert',
             'project',
@@ -494,6 +690,34 @@ def _register_core_routes(
             {'subject': payload.subject, 'role': payload.role},
         )
         return {'status': 'ok', 'member': member}
+
+    @app.delete(
+        '/api/v1/projects/{project_id}/members/{subject}',
+        status_code=204,
+        tags=['projects'],
+    )
+    async def delete_project_member(
+        project_id: str,
+        subject: str,
+        principal: Principal = Depends(require_permission('members:write')),
+    ):
+        project = await project_access(project_id, principal, {'owner'})
+        if subject == project['owner_subject']:
+            raise HTTPException(
+                status_code=400,
+                detail='project owner membership cannot be removed',
+            )
+        removed = await db.delete_project_member(project_id, subject)
+        if not removed:
+            raise HTTPException(status_code=404, detail='project member not found')
+        await audit.record(
+            principal,
+            'project.member_delete',
+            'project',
+            project_id,
+            {'subject': subject},
+        )
+        return Response(status_code=204)
 
     @app.post('/api/v1/plugins/{domain}/state', tags=['catalog'])
     async def update_plugin_state(
@@ -505,7 +729,7 @@ def _register_core_routes(
             plugin = plugins.set_enabled(domain, payload.enabled)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        audit.record(
+        await audit.record(
             principal,
             'plugin.state_change',
             'plugin',
@@ -515,7 +739,14 @@ def _register_core_routes(
         return {'status': 'ok', 'plugin': plugin}
 
 
-def create_app(job_manager=None, plugin_manager=None, database=None, file_storage=None, audit_log=None):
+def create_app(
+    job_manager=None,
+    plugin_manager=None,
+    database=None,
+    file_storage=None,
+    audit_log=None,
+    settings=None,
+):
     configure_logging(API_NAME)
     runtime = build_api_runtime(
         PROJECT_ROOT,
@@ -525,6 +756,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         database=database,
         file_storage=file_storage,
         audit_log=audit_log,
+        settings=settings,
     )
     jobs = runtime.jobs
     plugins = runtime.plugins
@@ -533,26 +765,42 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
     audit = runtime.audit
     auth = runtime.auth
     login_rate_limiter = runtime.login_rate_limiter
+    production = runtime.settings.app_env in {'production', 'prod'}
+    require_project_ownership = production
 
     app = FastAPI(
         title='Bio Research Agent API',
         version=API_VERSION,
         description='Async API for pluggable CADD, omics, sequence and research workflows.',
         lifespan=runtime.lifespan,
+        docs_url=None if production else '/docs',
+        redoc_url=None if production else '/redoc',
+        openapi_url=None if production else '/openapi.json',
     )
     runtime.bind(app)
-    origins = [item.strip() for item in os.environ.get(
-        'CORS_ORIGINS',
-        'http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174',
-    ).split(',') if item.strip()]
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        default_limit=runtime.settings.api_request_body_max_bytes,
+        route_limits={
+            ('POST', '/api/v1/auth/token'):
+                runtime.settings.auth_request_body_max_bytes,
+            ('POST', '/api/v1/files'):
+                runtime.settings.api_upload_body_max_bytes,
+        },
+    )
+    if production:
+        app.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=list(runtime.settings.trusted_hosts),
+        )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=False,
-        allow_methods=['GET', 'POST'],
+        allow_origins=list(runtime.settings.cors_origins),
+        allow_credentials=True,
+        allow_methods=['GET', 'POST', 'DELETE'],
         allow_headers=[
             'Authorization', 'Content-Type', 'Idempotency-Key',
-            'X-Request-ID', 'X-Trace-ID', 'traceparent',
+            'X-CSRF-Token', 'X-Request-ID', 'X-Trace-ID', 'traceparent',
         ],
         expose_headers=['X-Request-ID', 'X-Trace-ID'],
     )
@@ -570,6 +818,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         request.state.request_id = current_request_id
         request.state.trace_id = current_trace_id
         HTTP_ACTIVE.labels(request.method).inc()
+        set_database_principal()
         with bind_context(
             request_id=current_request_id,
             trace_id=current_trace_id,
@@ -578,6 +827,12 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
                 response = await call_next(request)
                 response.headers['X-Request-ID'] = current_request_id
                 response.headers['X-Trace-ID'] = current_trace_id
+                response.headers['X-Content-Type-Options'] = 'nosniff'
+                response.headers['Referrer-Policy'] = 'no-referrer'
+                response.headers['X-Frame-Options'] = 'DENY'
+                response.headers['Permissions-Policy'] = (
+                    'camera=(), microphone=(), geolocation=(), payment=(), usb=()'
+                )
                 return response
             except Exception as exc:
                 log_event(
@@ -604,12 +859,17 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
                     duration_seconds=elapsed,
                 )
 
-    dependencies = ApiDependencies(auth, db)
+    dependencies = ApiDependencies(
+        auth,
+        db,
+        metrics_scrape_token=runtime.settings.metrics_scrape_token,
+    )
     current_principal = dependencies.current_principal
     project_access = dependencies.project_access
     job_access = dependencies.job_access
     expose_job = dependencies.expose_job
     require_permission = dependencies.require_permission
+    metrics_principal = dependencies.metrics_principal
     issue_stream_ticket = dependencies.issue_stream_ticket
     stream_ticket_ttl = dependencies.stream_ticket_ttl
     stream_principal = dependencies.stream_principal
@@ -617,11 +877,13 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
     _register_core_routes(
         app,
         db=db,
+        settings=runtime.settings,
         auth=auth,
         login_rate_limiter=login_rate_limiter,
         audit=audit,
         plugins=plugins,
         require_permission=require_permission,
+        metrics_principal=metrics_principal,
         project_access=project_access,
     )
 
@@ -634,6 +896,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         output_root=OUTPUT_ROOT,
         require_permission=require_permission,
         project_access=project_access,
+        require_project_ownership=require_project_ownership,
     )
 
     job_handlers = register_job_routes(
@@ -649,6 +912,10 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         issue_stream_ticket=issue_stream_ticket,
         stream_ticket_ttl=stream_ticket_ttl,
         stream_principal=stream_principal,
+        require_project_ownership=require_project_ownership,
+        allow_legacy_artifact_paths=(
+            runtime.settings.allow_legacy_artifact_paths
+        ),
     )
     read_job = job_handlers.read_job
     submit_job = job_handlers.submit_job
@@ -661,6 +928,7 @@ def create_app(job_manager=None, plugin_manager=None, database=None, file_storag
         database=db,
         jobs=jobs,
         current_principal=current_principal,
+        job_access=job_access,
         read_job=read_job,
         submit_job=submit_job,
     )

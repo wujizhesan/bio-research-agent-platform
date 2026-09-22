@@ -13,7 +13,7 @@ from src.settings import PlatformSettings
 
 COMMON = {
     'APP_ENV', 'APP_RELEASE_TAG', 'APP_GIT_SHA', 'APP_IMAGE_REFERENCE',
-    'DATABASE_URL', 'REDIS_URL', 'REDIS_NAMESPACE', 'REDIS_SOCKET_TIMEOUT',
+    'DATABASE_URL', 'DATABASE_ROLE', 'REDIS_URL', 'REDIS_NAMESPACE', 'REDIS_SOCKET_TIMEOUT',
     'STORAGE_BACKEND', 'S3_BUCKET', 'S3_PREFIX', 'S3_ENDPOINT_URL', 'S3_REGION',
     'S3_EXPECTED_BUCKET_OWNER', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
     'AWS_SESSION_TOKEN', 'EVIDENCE_CACHE_MODE', 'EVIDENCE_CACHE_TTL_SECONDS',
@@ -25,6 +25,10 @@ COMMON = {
     'RESEARCH_PLANNER_BASE_URL', 'RESEARCH_PLANNER_MODEL', 'NCBI_EMAIL',
     'NCBI_API_KEY',
 }
+API = COMMON | {
+    'PUBLIC_BASE_URL', 'CORS_ORIGINS', 'ALLOW_LEGACY_ARTIFACT_PATHS',
+    'METRICS_SCRAPE_TOKEN',
+}
 WORKER = COMMON | {
     'JOB_LEASE_SECONDS', 'JOB_RESULT_TTL_SECONDS', 'JOB_MAX_ATTEMPTS',
     'WORKER_MAX_CONCURRENCY', 'WORKER_DRAIN_TIMEOUT_SECONDS',
@@ -35,6 +39,17 @@ WORKER = COMMON | {
     'STATE_WRITER_ENQUEUE_TIMEOUT_SECONDS', 'STATE_WRITER_MAX_RETRIES',
     'STATE_WRITER_RETRY_BASE_SECONDS', 'STATE_WRITER_PAUSE_THRESHOLD',
     'STATE_WRITER_RESUME_THRESHOLD',
+}
+DISPATCHER = {
+    'APP_ENV', 'APP_RELEASE_TAG', 'APP_GIT_SHA', 'APP_IMAGE_REFERENCE',
+    'DATABASE_URL', 'DATABASE_ROLE', 'REDIS_URL', 'REDIS_NAMESPACE',
+    'REDIS_SOCKET_TIMEOUT', 'JOB_BACKEND', 'STORAGE_BACKEND', 'S3_BUCKET',
+    'WORKER_CAPABILITY_ROUTING',
+}
+MAINTENANCE = {
+    'APP_ENV', 'DATABASE_URL', 'DATABASE_ROLE', 'STORAGE_BACKEND',
+    'S3_BUCKET', 'S3_PREFIX', 'S3_ENDPOINT_URL', 'S3_REGION',
+    'S3_EXPECTED_BUCKET_OWNER',
 }
 
 
@@ -69,7 +84,12 @@ def validate():
     services = compose.get('services') or {}
     errors = []
     known = PlatformSettings.environment_variables()
-    for service_name, required in {'api': COMMON, 'worker': WORKER}.items():
+    for service_name, required in {
+        'api': API,
+        'dispatcher': DISPATCHER,
+        'worker': WORKER,
+        'artifact-maintenance': MAINTENANCE,
+    }.items():
         configured = _environment_keys(services.get(service_name) or {})
         missing = sorted(required - configured)
         unknown = sorted((configured & COMMON) - known)
@@ -78,7 +98,7 @@ def validate():
         if unknown:
             errors.append(f'{service_name} has unknown typed settings: {", ".join(unknown)}')
     documented = _env_example_keys()
-    missing_documentation = sorted((COMMON | WORKER) - documented)
+    missing_documentation = sorted((API | WORKER | MAINTENANCE) - documented)
     if missing_documentation:
         errors.append(
             '.env.example missing settings: ' + ', '.join(missing_documentation)

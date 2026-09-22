@@ -23,6 +23,21 @@ export type Capabilities = {
   interfaces: Record<string, CapabilityInterface>
 }
 
+export type JobArtifact = {
+  artifact_id: string
+  filename: string
+  content_type: string
+  size_bytes: number
+  sha256: string
+  storage_backend: 'local' | 's3'
+  parameter?: string
+  kind?: string
+  path?: string
+  storage_key?: string
+  version_id?: string
+  reference?: string
+}
+
 export type Job = {
   job_id: string
   tool: string
@@ -31,6 +46,7 @@ export type Job = {
   started_at?: string
   finished_at?: string
   result?: Record<string, unknown>
+  artifacts?: JobArtifact[]
   error?: string
   cancel_requested?: boolean
   trace_id?: string

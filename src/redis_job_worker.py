@@ -1,16 +1,23 @@
 """Execution runtime for Redis-backed job workers."""
 
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import logging
 import os
 from threading import Event
 from time import monotonic, sleep
 
 try:
+    from .artifact_store import pack_execution_result, unpack_execution_result
     from .execution_semantics import ArtifactTransaction, execution_semantics
+    from .job_execution import public_execution_failure, public_tool_failure
     from .job_manager import TERMINAL_STATUSES
+    from .observability import log_event
 except ImportError:
+    from artifact_store import pack_execution_result, unpack_execution_result
     from execution_semantics import ArtifactTransaction, execution_semantics
+    from job_execution import public_execution_failure, public_tool_failure
     from job_manager import TERMINAL_STATUSES
+    from observability import log_event
 
 
 class RedisJobWorkerRuntime:
@@ -56,9 +63,14 @@ class RedisJobWorkerRuntime:
         )
         if durable_attempt is not None and durable_attempt.get('status') == 'completed':
             manager._metrics.result_cache(record['tool'], 'hit')
+            result, artifacts = unpack_execution_result(
+                durable_attempt['result']
+            )
+            manager._commit_artifacts(record, fencing_token, artifacts)
             return manager._finish(
                 job_id,
-                durable_attempt['result'],
+                result,
+                artifacts=artifacts,
                 fencing_token=fencing_token,
             )
         if durable_attempt is not None and durable_attempt.get('status') == 'indeterminate':
@@ -72,12 +84,16 @@ class RedisJobWorkerRuntime:
             record['_execution_key'],
             job_id=job_id,
             fencing_token=fencing_token,
+            attempt=int(record.get('_attempts', 0)),
         )
         if cached is not None:
             manager._metrics.result_cache(record['tool'], 'hit')
+            result, artifacts = unpack_execution_result(cached['result'])
+            manager._commit_artifacts(record, fencing_token, artifacts)
             return manager._finish(
                 job_id,
-                cached['result'],
+                result,
+                artifacts=artifacts,
                 fencing_token=fencing_token,
             )
         manager._metrics.result_cache(record['tool'], 'miss')
@@ -133,6 +149,12 @@ class RedisJobWorkerRuntime:
             )
         except Exception as exc:
             transaction.rollback()
+            log_event(
+                'job.execution.failed',
+                level=logging.ERROR,
+                error_type=type(exc).__name__,
+                error_detail=str(exc),
+            )
             if semantics == 'side_effecting':
                 return manager._mark_indeterminate(
                     job_id,
@@ -140,14 +162,20 @@ class RedisJobWorkerRuntime:
                     'external state must be reviewed before manual retry',
                     fencing_token=fencing_token,
                 )
+            failure = public_execution_failure(exc)
             return manager._finish(
                 job_id,
-                {'status': 'error', 'error': str(exc)},
+                failure,
                 failed=True,
                 fencing_token=fencing_token,
             )
         failed = isinstance(result, dict) and result.get('status') == 'error'
         if failed:
+            log_event(
+                'job.tool_reported_failure',
+                level=logging.WARNING,
+                error_detail=str(result.get('error') or ''),
+            )
             transaction.rollback()
             if semantics == 'side_effecting':
                 return manager._mark_indeterminate(
@@ -156,17 +184,118 @@ class RedisJobWorkerRuntime:
                     'external state must be reviewed before manual retry',
                     fencing_token=fencing_token,
                 )
+            result = public_tool_failure(result)
         if not failed:
+            publication = None
+            durable_committed = False
+            artifact_plans = []
             try:
-                result = transaction.commit(result)
-                result = manager._store_execution_result(
+                if manager.artifact_store is None:
+                    committed_result = transaction.commit(result)
+                    artifacts = []
+                else:
+                    artifact_context = {
+                        'job_id': job_id,
+                        'project_id': record.get('project_id'),
+                        'execution_key': record['_execution_key'],
+                        'tool': record['tool'],
+                        'fencing_token': fencing_token,
+                        'attempt': int(record.get('_attempts', 0)),
+                    }
+                    artifact_plans = list(transaction.plan(
+                        manager.artifact_store,
+                        artifact_context,
+                    ))
+                    manager._reserve_artifacts(
+                        record,
+                        fencing_token,
+                        artifact_plans,
+                    )
+                    publication = transaction.publish(
+                        result,
+                        manager.artifact_store,
+                        artifact_context,
+                    )
+                    committed_result = publication.result
+                    artifacts = list(publication.artifacts)
+                    manager._mark_artifacts_uploaded(
+                        record,
+                        fencing_token,
+                        artifacts,
+                    )
+                durable_result = (
+                    pack_execution_result(committed_result, artifacts)
+                    if artifacts else committed_result
+                )
+                stored_result = manager._store_execution_result(
                     record['_execution_key'],
-                    result,
+                    durable_result,
                     job_id=job_id,
                     fencing_token=fencing_token,
+                    attempt=int(record.get('_attempts', 0)),
+                    publication_ids=[
+                        item['publication_id']
+                        for item in artifacts
+                        if item.get('publication_id')
+                    ],
                 )
-            except Exception:
-                transaction.rollback()
+                durable_committed = True
+                if publication is not None and stored_result != durable_result:
+                    try:
+                        publication.rollback()
+                    except Exception as exc:
+                        log_event(
+                            'job.artifact_superseded_cleanup_failed',
+                            level=logging.WARNING,
+                            job_id=job_id,
+                            error_type=type(exc).__name__,
+                        )
+                    manager._orphan_artifacts(
+                        record,
+                        fencing_token,
+                        artifact_plans,
+                        error='publication was superseded by a durable result',
+                    )
+                    publication = None
+                result, artifacts = unpack_execution_result(stored_result)
+                manager._commit_artifacts(record, fencing_token, artifacts)
+                if publication is not None:
+                    try:
+                        publication.finalize()
+                    except Exception as exc:
+                        log_event(
+                            'job.artifact_staging_cleanup_failed',
+                            level=logging.WARNING,
+                            job_id=job_id,
+                            error_type=type(exc).__name__,
+                        )
+            except Exception as exc:
+                log_event(
+                    'job.artifact_commit_failed',
+                    level=logging.ERROR,
+                    job_id=job_id,
+                    error_type=type(exc).__name__,
+                    error_detail=str(exc),
+                )
+                if publication is not None and not durable_committed:
+                    publication.rollback()
+                elif publication is None:
+                    transaction.rollback()
+                if artifact_plans and not durable_committed:
+                    try:
+                        manager._orphan_artifacts(
+                            record,
+                            fencing_token,
+                            artifact_plans,
+                            error=str(exc),
+                        )
+                    except Exception as lifecycle_exc:
+                        log_event(
+                            'job.artifact_orphan_record_failed',
+                            level=logging.ERROR,
+                            job_id=job_id,
+                            error_type=type(lifecycle_exc).__name__,
+                        )
                 if semantics == 'side_effecting':
                     return manager._mark_indeterminate(
                         job_id,
@@ -179,6 +308,7 @@ class RedisJobWorkerRuntime:
             job_id,
             result,
             failed=failed,
+            artifacts=artifacts if not failed else None,
             fencing_token=fencing_token,
         )
 
@@ -215,7 +345,7 @@ class RedisJobWorkerRuntime:
         manager = self.manager
         stop_event = stop_event or Event()
         drain_timeout_seconds = max(float(drain_timeout_seconds), 0.0)
-        reconcile = getattr(manager, 'rebuild_durable_queue', None)
+        reconcile = None
         try:
             reconcile_seconds = max(float(
                 os.environ.get('JOB_OUTBOX_RECONCILE_SECONDS', '30')

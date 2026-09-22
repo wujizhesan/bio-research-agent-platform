@@ -5,6 +5,7 @@ import signal
 from threading import Event
 
 try:
+    from .artifact_store import artifact_store_from_settings
     from .job_execution import build_tool_executor_from_env
     from .job_state_store import DatabaseStateWriter
     from .redis_job_manager import RedisJobManager
@@ -13,6 +14,7 @@ try:
     from .worker_health import WorkerHealthState, WorkerHttpServer
     from .settings import PlatformSettings
 except ImportError:
+    from artifact_store import artifact_store_from_settings
     from job_execution import build_tool_executor_from_env
     from job_state_store import DatabaseStateWriter
     from redis_job_manager import RedisJobManager
@@ -39,7 +41,7 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     configure_logging('bio-research-agent-worker')
-    state_writer = DatabaseStateWriter(settings=settings)
+    state_writer = DatabaseStateWriter(settings=settings, require_job_scope=True)
     manager = None
     health_server = None
     try:
@@ -48,6 +50,7 @@ def main(argv=None):
             namespace=args.namespace,
             state_store=state_writer,
             tool_executor=build_tool_executor_from_env(),
+            artifact_store=artifact_store_from_settings(settings),
             resource_capacity=ResourceCapacity.from_env(),
             enforce_capacity=True,
             settings=settings,
