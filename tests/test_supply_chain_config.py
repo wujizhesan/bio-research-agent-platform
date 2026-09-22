@@ -492,8 +492,8 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         )
         self.assertIn('sudo rm -f', rendered)
         self.assertIn('\\"$PLUGIN_SANDBOX_TOKEN_FILE\\"', rendered)
-        self.assertIn('\\"$METRICS_SCRAPE_TOKEN_FILE\\"', rendered)
-        self.assertIn('\\"$ALERTMANAGER_WEBHOOK_URL_FILE\\"', rendered)
+        self.assertIn('\\"$METRICS_SCRAPE_TOKEN_SECRET_FILE\\"', rendered)
+        self.assertIn('\\"$ALERTMANAGER_WEBHOOK_URL_SECRET_FILE\\"', rendered)
         self.assertIn('for attempt in 1 2 3', rendered)
         self.assertIn('sleep $((attempt * 10))', rendered)
         self.assertIn('JOB_EXECUTION_MODE', (
