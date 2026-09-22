@@ -340,6 +340,8 @@ jobs:
         run: |
           umask 077
           printf '%s' 'ci-plugin-sandbox-token-0000000000000000' > "$PLUGIN_SANDBOX_TOKEN_FILE"
+          sudo chown 1000:1000 "$PLUGIN_SANDBOX_TOKEN_FILE"
+          sudo chmod 0400 "$PLUGIN_SANDBOX_TOKEN_FILE"
           mkdir -p output
           chmod 0777 output
       - name: Build secure full stack
@@ -435,7 +437,7 @@ jobs:
           if [ -f "$PLUGIN_SANDBOX_TOKEN_FILE" ]; then
             docker compose -f docker-compose.yml -f docker-compose.secure.yml down -v --remove-orphans
           fi
-          rm -f "$PLUGIN_SANDBOX_TOKEN_FILE"
+          sudo rm -f "$PLUGIN_SANDBOX_TOKEN_FILE"
 
   package:
     name: Build and install Python package

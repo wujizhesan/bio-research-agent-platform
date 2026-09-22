@@ -461,6 +461,13 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn('configure_tenant_context.py --enable', rendered)
         self.assertIn('verify_database_roles.py', rendered)
         self.assertIn('bioagent_api_secure', rendered)
+        self.assertIn(
+            'sudo chown 1000:1000 \\"$PLUGIN_SANDBOX_TOKEN_FILE\\"', rendered
+        )
+        self.assertIn(
+            'sudo chmod 0400 \\"$PLUGIN_SANDBOX_TOKEN_FILE\\"', rendered
+        )
+        self.assertIn('sudo rm -f \\"$PLUGIN_SANDBOX_TOKEN_FILE\\"', rendered)
         self.assertIn('JOB_EXECUTION_MODE', (
             ROOT / 'docker-compose.secure.yml'
         ).read_text(encoding='utf-8'))
