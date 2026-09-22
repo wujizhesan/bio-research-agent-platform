@@ -313,7 +313,7 @@ jobs:
     timeout-minutes: 35
     env:
       COMPOSE_PROJECT_NAME: bioagent-security-${{ github.run_id }}
-      PLUGIN_SANDBOX_TOKEN_FILE: ${{ runner.temp }}/bioagent-plugin-sandbox-token
+      PLUGIN_SANDBOX_TOKEN_FILE: /tmp/bioagent-plugin-sandbox-token-${{ github.run_id }}
       APP_ENV: ci
       API_PUBLISHED_PORT: '18080'
       WORKER_METRICS_PUBLISHED_PORT: '19000'
