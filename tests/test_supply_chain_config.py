@@ -307,12 +307,30 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         )
         prometheus = compose['services']['prometheus']
         alertmanager = compose['services']['alertmanager']
+        monitoring_test = yaml.safe_load(
+            (ROOT / 'docker-compose.monitoring-test.yml').read_text(
+                encoding='utf-8'
+            )
+        )
         self.assertEqual(prometheus['profiles'], ['monitoring'])
         self.assertEqual(alertmanager['profiles'], ['monitoring'])
         self.assertRegex(prometheus['image'], SHA256_REFERENCE)
         self.assertRegex(alertmanager['image'], SHA256_REFERENCE)
         self.assertIn('metrics_scrape_token', prometheus['secrets'])
         self.assertIn('alertmanager_webhook_url', alertmanager['secrets'])
+        self.assertEqual(
+            prometheus['group_add'],
+            ['${MONITORING_SECRET_GID:-1000}'],
+        )
+        self.assertEqual(
+            alertmanager['group_add'],
+            ['${MONITORING_SECRET_GID:-1000}'],
+        )
+        self.assertIn(
+            '${MONITORING_SECRET_GID:?required}',
+            monitoring_test['services']['api']['group_add'],
+        )
+        self.assertIn('alert-webhook-sink', monitoring_test['services'])
         self.assertEqual(deploy['services']['prometheus']['ports'], [])
         self.assertEqual(deploy['services']['alertmanager']['ports'], [])
         self.assertIn('monitoring/prometheus.yml', workflow)
@@ -320,6 +338,11 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn('monitoring/storage-deletion-alerts.yml', workflow)
         self.assertIn('test rules /etc/prometheus/storage-deletion-alerts.test.yml', ci)
         self.assertIn('check-config /etc/alertmanager/alertmanager.yml', ci)
+        self.assertIn('verify_monitoring_stack.py', ci)
+        self.assertIn('docker-compose.monitoring-test.yml', ci)
+        self.assertIn('alert-webhook-sink prometheus alertmanager', ci)
+        self.assertIn('MONITORING_SECRET_GID', script)
+        self.assertIn("stat -c '%g'", script)
         self.assertIn('--profile monitoring', script)
         self.assertIn('prometheus alertmanager', script)
 
@@ -467,7 +490,10 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn(
             'sudo chmod 0400 \\"$PLUGIN_SANDBOX_TOKEN_FILE\\"', rendered
         )
-        self.assertIn('sudo rm -f \\"$PLUGIN_SANDBOX_TOKEN_FILE\\"', rendered)
+        self.assertIn('sudo rm -f', rendered)
+        self.assertIn('\\"$PLUGIN_SANDBOX_TOKEN_FILE\\"', rendered)
+        self.assertIn('\\"$METRICS_SCRAPE_TOKEN_FILE\\"', rendered)
+        self.assertIn('\\"$ALERTMANAGER_WEBHOOK_URL_FILE\\"', rendered)
         self.assertIn('for attempt in 1 2 3', rendered)
         self.assertIn('sleep $((attempt * 10))', rendered)
         self.assertIn('JOB_EXECUTION_MODE', (

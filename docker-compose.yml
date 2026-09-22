@@ -521,6 +521,8 @@ services:
       - prometheus_data:/prometheus
     secrets:
       - metrics_scrape_token
+    group_add:
+      - "${MONITORING_SECRET_GID:-1000}"
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=32m
@@ -549,6 +551,8 @@ services:
       - alertmanager_data:/alertmanager
     secrets:
       - alertmanager_webhook_url
+    group_add:
+      - "${MONITORING_SECRET_GID:-1000}"
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=32m

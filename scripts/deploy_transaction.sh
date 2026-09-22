@@ -32,7 +32,7 @@ secret_file_value() {
   test "$(wc -c < "$secret_path")" -le 65536
   local mode
   mode=$(stat -c '%a' "$secret_path")
-  (( (8#$mode & 077) == 0 ))
+  (( (8#$mode & 037) == 0 ))
   tr -d '\r\n' < "$secret_path"
 }
 
@@ -81,6 +81,7 @@ test "$(grep -c '^DEPLOY_SMOKE_PASSWORD_FILE=' .env.production)" -eq 1
 test "$(grep -c '^DEPLOY_SMOKE_JOB_TOOL=' .env.production)" -eq 1
 test "$(grep -c '^DEPLOY_SMOKE_JOB_TIMEOUT_SECONDS=' .env.production)" -eq 1
 test "$(grep -c '^TRUSTED_PROXY_CIDRS=' .env.production)" -eq 1
+test "$(grep -c '^MONITORING_SECRET_GID=' .env.production)" -eq 1
 grep -Eq '^PUBLIC_BASE_URL=https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$' .env.production
 grep -Eq '^WEB_PUBLISHED_PORT=[0-9]{1,5}$' .env.production
 grep -Eq '^DEPLOY_SMOKE_USERNAME=[A-Za-z0-9._@+-]+$' .env.production
@@ -88,6 +89,7 @@ grep -Eq '^DEPLOY_SMOKE_PASSWORD_FILE=/[A-Za-z0-9._/-]+$' .env.production
 grep -Eq '^DEPLOY_SMOKE_JOB_TOOL=[A-Za-z0-9_.:-]+$' .env.production
 grep -Eq '^DEPLOY_SMOKE_JOB_TIMEOUT_SECONDS=[1-9][0-9]*$' .env.production
 grep -Eq '^TRUSTED_PROXY_CIDRS=[0-9A-Fa-f:.,/]+$' .env.production
+grep -Eq '^MONITORING_SECRET_GID=[1-9][0-9]*$' .env.production
 postgres_password=$(secret_file_value .env.production POSTGRES_PASSWORD)
 if test "$postgres_password" = "bioagent-dev-password"; then
   echo "production PostgreSQL password must not use the development default" >&2
@@ -103,6 +105,14 @@ done
 for strong_secret in CADD_JWT_SECRET RLS_CONTEXT_SIGNING_KEY PLUGIN_SANDBOX_TOKEN METRICS_SCRAPE_TOKEN; do
   strong_secret_value=$(secret_file_value .env.production "$strong_secret")
   test "${#strong_secret_value}" -ge 32
+done
+monitoring_secret_gid=$(environment_value .env.production MONITORING_SECRET_GID)
+((monitoring_secret_gid >= 1 && monitoring_secret_gid <= 2147483647))
+for monitoring_secret in METRICS_SCRAPE_TOKEN ALERTMANAGER_WEBHOOK_URL; do
+  monitoring_secret_path=$(environment_value .env.production "${monitoring_secret}_FILE")
+  test "$(stat -c '%g' "$monitoring_secret_path")" -eq "$monitoring_secret_gid"
+  monitoring_secret_mode=$(stat -c '%a' "$monitoring_secret_path")
+  (( (8#$monitoring_secret_mode & 040) != 0 ))
 done
 alertmanager_webhook_url=$(secret_file_value .env.production ALERTMANAGER_WEBHOOK_URL)
 [[ "$alertmanager_webhook_url" =~ ^https://[^[:space:]]+$ ]]
@@ -246,12 +256,12 @@ if "${next_compose[@]}" up -d --no-build --remove-orphans \
 fi
 
 "${next_compose[@]}" ps || true
-"${next_compose[@]}" run --rm migration \
-  python scripts/configure_tenant_context.py --disable || true
 if "$had_current"; then
   echo "candidate deployment unhealthy; rolling back to previous image digests" >&2
   rollback_healthy=false
   if "${current_compose[@]}" up -d --no-build --remove-orphans \
+    && "${current_compose[@]}" run --rm migration \
+      python scripts/configure_tenant_context.py --enable \
     && wait_for_health release-images.env \
     && verify_public_deployment; then
     rollback_healthy=true

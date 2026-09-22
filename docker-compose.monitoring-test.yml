@@ -1,0 +1,42 @@
+services:
+  api:
+    environment:
+      METRICS_SCRAPE_TOKEN: ""
+      METRICS_SCRAPE_TOKEN_FILE: /run/secrets/metrics_scrape_token
+    secrets:
+      - metrics_scrape_token
+    group_add:
+      - "${MONITORING_SECRET_GID:?required}"
+
+  prometheus:
+    group_add:
+      - "${MONITORING_SECRET_GID:?required}"
+
+  alertmanager:
+    group_add:
+      - "${MONITORING_SECRET_GID:?required}"
+
+  alert-webhook-sink:
+    profiles: ["monitoring"]
+    image: ${COMPOSE_PROJECT_NAME:?required}-api
+    entrypoint:
+      - python
+      - scripts/alert_webhook_sink.py
+      - --output
+      - /app/output/monitoring-smoke/alerts.jsonl
+    expose:
+      - "8082"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    volumes:
+      - ./output:/app/output
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

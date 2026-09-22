@@ -314,6 +314,9 @@ jobs:
     env:
       COMPOSE_PROJECT_NAME: bioagent-security-${{ github.run_id }}
       PLUGIN_SANDBOX_TOKEN_FILE: /tmp/bioagent-plugin-sandbox-token-${{ github.run_id }}
+      METRICS_SCRAPE_TOKEN_FILE: /tmp/bioagent-metrics-scrape-token-${{ github.run_id }}
+      ALERTMANAGER_WEBHOOK_URL_FILE: /tmp/bioagent-alertmanager-webhook-url-${{ github.run_id }}
+      MONITORING_SECRET_GID: '4242'
       APP_ENV: ci
       API_PUBLISHED_PORT: '18080'
       WORKER_METRICS_PUBLISHED_PORT: '19000'
@@ -342,6 +345,12 @@ jobs:
           printf '%s' 'ci-plugin-sandbox-token-0000000000000000' > "$PLUGIN_SANDBOX_TOKEN_FILE"
           sudo chown 1000:1000 "$PLUGIN_SANDBOX_TOKEN_FILE"
           sudo chmod 0400 "$PLUGIN_SANDBOX_TOKEN_FILE"
+          printf '%s' 'ci-metrics-scrape-token-0000000000000000' > "$METRICS_SCRAPE_TOKEN_FILE"
+          printf '%s' 'http://alert-webhook-sink:8082/alerts' > "$ALERTMANAGER_WEBHOOK_URL_FILE"
+          sudo chown "$(id -u):$MONITORING_SECRET_GID" \
+            "$METRICS_SCRAPE_TOKEN_FILE" "$ALERTMANAGER_WEBHOOK_URL_FILE"
+          sudo chmod 0440 \
+            "$METRICS_SCRAPE_TOKEN_FILE" "$ALERTMANAGER_WEBHOOK_URL_FILE"
           mkdir -p output
           chmod 0777 output
       - name: Build secure full stack
@@ -422,11 +431,33 @@ jobs:
           fi
           leftovers=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox find /run/bioagent/plugin-exchange -mindepth 1 -maxdepth 1 -print -quit)
           test -z "$leftovers"
+      - name: Start and verify production monitoring path
+        run: |
+          mkdir -p output/monitoring-smoke
+          rm -f output/monitoring-smoke/alerts.jsonl output/monitoring-smoke/prometheus-targets.json
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.secure.yml \
+            -f docker-compose.monitoring-test.yml \
+            --profile monitoring \
+            up -d --wait api worker alert-webhook-sink prometheus alertmanager
+          python scripts/verify_monitoring_stack.py \
+            --delivery-file output/monitoring-smoke/alerts.jsonl \
+            --evidence-directory output/monitoring-smoke \
+            --timeout-seconds 75
       - name: Capture secure full-stack diagnostics
         if: always()
         run: |
           mkdir -p output
-          docker compose -f docker-compose.yml -f docker-compose.secure.yml logs --no-color --timestamps api dispatcher worker plugin-sandbox clamav db redis > output/ci-secure-fullstack.log 2>&1 || true
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.secure.yml \
+            -f docker-compose.monitoring-test.yml \
+            --profile monitoring \
+            logs --no-color --timestamps \
+            api dispatcher worker plugin-sandbox clamav db redis \
+            prometheus alertmanager alert-webhook-sink \
+            > output/ci-secure-fullstack.log 2>&1 || true
       - name: Upload secure full-stack diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -438,14 +469,23 @@ jobs:
             output/ci-secure-fullstack-health.json
             output/ci-plugin-sandbox-inspect.json
             output/secure-fullstack-e2e
+            output/monitoring-smoke
           if-no-files-found: ignore
       - name: Clean up secure plugin stack
         if: always()
         run: |
           if [ -f "$PLUGIN_SANDBOX_TOKEN_FILE" ]; then
-            docker compose -f docker-compose.yml -f docker-compose.secure.yml down -v --remove-orphans
+            docker compose \
+              -f docker-compose.yml \
+              -f docker-compose.secure.yml \
+              -f docker-compose.monitoring-test.yml \
+              --profile monitoring \
+              down -v --remove-orphans
           fi
-          sudo rm -f "$PLUGIN_SANDBOX_TOKEN_FILE"
+          sudo rm -f \
+            "$PLUGIN_SANDBOX_TOKEN_FILE" \
+            "$METRICS_SCRAPE_TOKEN_FILE" \
+            "$ALERTMANAGER_WEBHOOK_URL_FILE"
 
   package:
     name: Build and install Python package

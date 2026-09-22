@@ -33,6 +33,8 @@ services:
       - rls_context_signing_key
       - cadd_auth_users
       - metrics_scrape_token
+    group_add:
+      - "${MONITORING_SECRET_GID:?required}"
 
   worker:
     image: ${BACKEND_IMAGE:?required}
@@ -141,11 +143,15 @@ services:
     ports: !reset []
     secrets:
       - metrics_scrape_token
+    group_add:
+      - "${MONITORING_SECRET_GID:?required}"
 
   alertmanager:
     ports: !reset []
     secrets:
       - alertmanager_webhook_url
+    group_add:
+      - "${MONITORING_SECRET_GID:?required}"
 
 secrets:
   postgres_password:

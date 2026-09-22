@@ -38,11 +38,15 @@ class DeployTransactionTests(unittest.TestCase):
             "DISPATCHER_REDIS_URL": "rediss://dispatcher:secret@redis.example:6379/0",
             "WORKER_REDIS_URL": "rediss://worker:secret@redis.example:6379/0",
         }
+        monitoring_secret_gid = os.getgid() or 1
         secret_lines = []
         for name, value in secret_values.items():
             path = root / name.lower()
             path.write_text(value + "\n", encoding="utf-8")
             path.chmod(0o600)
+            if name in {"METRICS_SCRAPE_TOKEN", "ALERTMANAGER_WEBHOOK_URL"}:
+                os.chown(path, -1, monitoring_secret_gid)
+                path.chmod(0o640)
             secret_lines.append(f"{name}_FILE={path}")
         (deploy / ".env.production").write_text(
             "\n".join(
@@ -56,6 +60,7 @@ class DeployTransactionTests(unittest.TestCase):
                     "DEPLOY_SMOKE_JOB_TOOL=research_catalog",
                     "DEPLOY_SMOKE_JOB_TIMEOUT_SECONDS=60",
                     "TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32",
+                    f"MONITORING_SECRET_GID={monitoring_secret_gid}",
                     *secret_lines,
                     "STORAGE_BACKEND=s3",
                     "S3_BUCKET=bioagent-production",
@@ -200,8 +205,13 @@ exit "${VERIFY_EXIT:-0}"
             self.assertEqual(current, previous)
             self.assertTrue((deploy / "release-images.next.env").exists())
             self.assertIn("release-images.next.env up -d", commands)
-            self.assertIn("configure_tenant_context.py --disable", commands)
+            self.assertNotIn("configure_tenant_context.py --disable", commands)
             self.assertIn("release-images.env up -d", commands)
+            rollback_start = commands.index("release-images.env up -d")
+            rollback_enforcement = commands.index(
+                "release-images.env run --rm migration python scripts/configure_tenant_context.py --enable"
+            )
+            self.assertLess(rollback_start, rollback_enforcement)
             self.assertIn("rollback completed", result.stderr)
 
     def test_first_failed_deployment_reports_missing_rollback_target(self):
@@ -247,6 +257,29 @@ exit "${VERIFY_EXIT:-0}"
                     "STORAGE_BACKEND=s3",
                     "STORAGE_BACKEND=local",
                 ),
+                encoding="utf-8",
+            )
+            result = self.run_deploy(deploy, environment)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(log.exists())
+
+    def test_rejects_monitoring_secret_group_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory)
+            environment_path = deploy / ".env.production"
+            lines = environment_path.read_text(encoding="utf-8").splitlines()
+            selected = next(
+                int(line.split("=", 1)[1])
+                for line in lines
+                if line.startswith("MONITORING_SECRET_GID=")
+            )
+            environment_path.write_text(
+                "\n".join(
+                    f"MONITORING_SECRET_GID={selected + 1}"
+                    if line.startswith("MONITORING_SECRET_GID=")
+                    else line
+                    for line in lines
+                ) + "\n",
                 encoding="utf-8",
             )
             result = self.run_deploy(deploy, environment)
