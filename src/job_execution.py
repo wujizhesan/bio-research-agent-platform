@@ -1,6 +1,7 @@
 """Isolated execution for research tools."""
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -19,6 +20,7 @@ try:
     from .observability import (
         TOOL_DURATION,
         TOOL_EXECUTIONS,
+        TOOL_PHASE_DURATION,
         current_context,
         log_event,
     )
@@ -32,6 +34,7 @@ except ImportError:
     from observability import (
         TOOL_DURATION,
         TOOL_EXECUTIONS,
+        TOOL_PHASE_DURATION,
         current_context,
         log_event,
     )
@@ -104,6 +107,25 @@ def public_tool_failure(_result):
     }
 
 
+def _nonnegative_duration(value):
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return None
+    return duration if math.isfinite(duration) and duration >= 0 else None
+
+
+def _execution_spec(tool):
+    try:
+        from .domain_registry import active_tool_specs
+    except ImportError:
+        from domain_registry import active_tool_specs
+    return next(
+        (spec for spec in active_tool_specs() if spec['name'] == tool),
+        None,
+    )
+
+
 def _env_int(name, default, minimum=0):
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -130,17 +152,12 @@ def _env_float(name, default, minimum=0.01):
     return value
 
 
-def _sandbox_environment(tool, temporary_root):
+def _sandbox_environment(tool, temporary_root, spec=None):
     try:
-        from .domain_registry import active_tool_specs
         from .plugin_security import sandbox_environment
     except ImportError:
-        from domain_registry import active_tool_specs
         from plugin_security import sandbox_environment
-    spec = next(
-        (item for item in active_tool_specs() if item['name'] == tool),
-        None,
-    )
+    spec = spec if spec is not None else _execution_spec(tool)
     if spec is None:
         return None
     environment = sandbox_environment(
@@ -341,7 +358,9 @@ class ProcessToolExecutor:
             request_path = root / 'request.json'
             response_path = root / 'response.json'
             error_path = root / 'stderr.log'
-            child_environment = _sandbox_environment(tool, root)
+            execution_spec = _execution_spec(tool)
+            child_environment = _sandbox_environment(tool, root, execution_spec)
+            execution_domain = execution_spec['domain'] if execution_spec else None
             resolved_arguments = materialize_storage_references(
                 arguments,
                 root / 'inputs',
@@ -351,6 +370,7 @@ class ProcessToolExecutor:
                 json.dumps(
                     {
                         'tool': tool,
+                        'domain': execution_domain,
                         'arguments': resolved_arguments,
                         'limits': self.limits.as_dict(),
                         'observability': current_context(),
@@ -406,6 +426,7 @@ class ProcessToolExecutor:
                         self._active_processes.discard(process)
                     if windows_job is not None:
                         windows_job.close()
+            process_elapsed_seconds = monotonic() - started
             if not response_path.exists():
                 detail = error_path.read_text(encoding='utf-8', errors='replace')[-2000:].strip()
                 suffix = f': {detail}' if detail else ''
@@ -424,18 +445,36 @@ class ProcessToolExecutor:
                 metric_tool = str(telemetry.get('tool') or tool)[:200]
                 outcome = str(telemetry.get('status') or 'unknown')[:32]
                 TOOL_EXECUTIONS.labels(domain, metric_tool, outcome).inc()
-                try:
-                    duration = max(float(telemetry.get('duration_seconds')), 0)
-                except (TypeError, ValueError):
-                    duration = None
+                duration = _nonnegative_duration(telemetry.get('duration_seconds'))
                 if duration is not None:
                     TOOL_DURATION.labels(domain, metric_tool).observe(duration)
+                phases = {
+                    'registry_import': _nonnegative_duration(
+                        telemetry.get('registry_import_seconds')
+                    ),
+                    'tool_run': _nonnegative_duration(
+                        telemetry.get('tool_run_seconds')
+                    ),
+                }
+                if duration is not None:
+                    measured = sum(value for value in phases.values() if value is not None)
+                    phases['child_other'] = max(duration - measured, 0)
+                    phases['process_boundary'] = max(
+                        process_elapsed_seconds - duration, 0
+                    )
+                phases = {
+                    phase: seconds for phase, seconds in phases.items()
+                    if seconds is not None
+                }
+                for phase, seconds in phases.items():
+                    TOOL_PHASE_DURATION.labels(domain, metric_tool, phase).observe(seconds)
                 log_event(
                     'tool.execution.completed',
                     domain=domain,
                     tool=metric_tool,
                     status=outcome,
                     duration_seconds=duration,
+                    phase_seconds=phases,
                     execution_mode='process',
                 )
             if not payload.get('ok'):

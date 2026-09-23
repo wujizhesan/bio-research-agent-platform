@@ -40,20 +40,31 @@ def main(argv=None):
     request_path, response_path = map(Path, args)
     request = {}
     started = perf_counter()
+    registry_import_seconds = None
+    tool_run_seconds = None
     try:
         request = json.loads(request_path.read_text(encoding='utf-8'))
         _apply_posix_limits(request.get('limits', {}))
+        execution_domain = str(request.get('domain') or '')
+        if execution_domain:
+            os.environ['BIO_AGENT_EXECUTION_DOMAIN'] = execution_domain
+        registry_started = perf_counter()
         try:
             from .domain_registry import run_tool
         except ImportError:
             from domain_registry import run_tool
+        registry_import_seconds = perf_counter() - registry_started
         context = (
             bind_run_context(request['run_context'])
             if request.get('run_context')
             else bind_context(**request.get('observability', {}))
         )
         with context:
-            result = run_tool(request['tool'], request.get('arguments', {}))
+            tool_started = perf_counter()
+            try:
+                result = run_tool(request['tool'], request.get('arguments', {}))
+            finally:
+                tool_run_seconds = perf_counter() - tool_started
         payload = {'ok': True, 'result': result}
         exit_code = 0
     except BaseException as exc:
@@ -81,6 +92,8 @@ def main(argv=None):
             else 'success'
         ),
         'duration_seconds': perf_counter() - started,
+        'registry_import_seconds': registry_import_seconds,
+        'tool_run_seconds': tool_run_seconds,
     }
     encoded = json.dumps(payload, ensure_ascii=False, default=str)
     max_result_bytes = int(request.get('limits', {}).get('max_result_bytes') or 0)

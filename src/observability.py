@@ -261,6 +261,11 @@ TOOL_DURATION = Histogram(
     'Scientific tool execution duration.',
     ['domain', 'tool'],
 )
+TOOL_PHASE_DURATION = Histogram(
+    'bio_agent_tool_phase_duration_seconds',
+    'Isolated tool execution phase duration.',
+    ['domain', 'tool', 'phase'],
+)
 TOOL_ACTIVE = Gauge(
     'bio_agent_tool_active',
     'Scientific tool calls currently executing.',
