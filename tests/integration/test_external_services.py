@@ -24,6 +24,7 @@ from src.database import (
     database_worker_scope,
     set_database_principal,
 )
+from src.dispatcher import _OUTBOX_CHANNEL
 from scripts.configure_tenant_context import (
     TenantContextConfigurationError,
     configure as configure_tenant_context,
@@ -62,6 +63,59 @@ class ExternalServiceTests(unittest.TestCase):
 
     def test_postgres_migration_and_job_round_trip(self):
         asyncio.run(self._postgres_round_trip())
+
+    def test_committed_outbox_job_notifies_dispatcher(self):
+        asyncio.run(self._committed_outbox_job_notifies_dispatcher())
+
+    async def _committed_outbox_job_notifies_dispatcher(self):
+        import asyncpg
+
+        owner = Database(os.environ['DATABASE_URL'])
+        api = Database(os.environ['API_DATABASE_URL'])
+        connection = await asyncpg.connect(
+            os.environ['DISPATCHER_DATABASE_URL'].replace(
+                'postgresql+asyncpg://', 'postgresql://', 1
+            )
+        )
+        project_id = f'dispatch-notify-{uuid4().hex}'
+        job_id = uuid4().hex
+        created_at = '2026-09-23T00:00:00+00:00'
+        notified = asyncio.Event()
+
+        def on_notification(_connection, _pid, channel, payload):
+            if channel == _OUTBOX_CHANNEL and payload == '':
+                notified.set()
+
+        try:
+            await owner.create_project(
+                project_id, 'Dispatch notification integration', None,
+                'alice', created_at,
+            )
+            await connection.add_listener(_OUTBOX_CHANNEL, on_notification)
+            set_database_principal(Principal('alice', ('researcher',), 'jwt'))
+            await api.stage_job({
+                'job_id': job_id,
+                'tool': 'research_catalog',
+                'status': 'queued',
+                'created_at': created_at,
+                '_arguments': {},
+                '_execution_key': uuid4().hex,
+            }, project_id=project_id)
+            await asyncio.wait_for(notified.wait(), timeout=2)
+        finally:
+            set_database_principal()
+            await connection.close()
+            await api.close()
+            async with owner.engine.begin() as cleanup:
+                await cleanup.execute(
+                    text('DELETE FROM job_records WHERE job_id = :job_id'),
+                    {'job_id': job_id},
+                )
+                await cleanup.execute(
+                    text('DELETE FROM projects WHERE project_id = :project_id'),
+                    {'project_id': project_id},
+                )
+            await owner.close()
 
     def test_postgres_rls_separates_api_tenants_and_worker(self):
         asyncio.run(self._postgres_rls_tenant_isolation())

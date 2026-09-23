@@ -2,9 +2,10 @@
 
 import argparse
 import asyncio
+import logging
 import signal
-from threading import Event
-from time import monotonic, sleep
+from threading import Event, Thread
+from time import monotonic
 
 try:
     from .observability import configure_logging, log_event
@@ -12,6 +13,81 @@ try:
 except ImportError:
     from observability import configure_logging, log_event
     from settings import PlatformSettings
+
+
+_OUTBOX_CHANNEL = 'bioagent_dispatch_outbox'
+
+
+class _DispatchWakeListener:
+    def __init__(self, database_url, connect_timeout=5, asyncpg_module=None):
+        self.database_url = database_url.replace(
+            'postgresql+asyncpg://', 'postgresql://', 1
+        )
+        self.connect_timeout = max(float(connect_timeout), 1)
+        self.asyncpg_module = asyncpg_module
+        self.enabled = self.database_url.startswith('postgresql://')
+        self.wake = Event()
+        self.ready = Event()
+        self.stop = Event()
+        self.thread = Thread(target=self._run, name='dispatch-wakeup', daemon=True)
+
+    def start(self):
+        if self.enabled:
+            self.thread.start()
+
+    def close(self):
+        self.stop.set()
+        self.wake.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=self.connect_timeout + 1)
+
+    def _run(self):
+        asyncio.run(self._listen())
+
+    async def _listen(self):
+        asyncpg_module = self.asyncpg_module
+        if asyncpg_module is None:
+            import asyncpg as asyncpg_module
+        while not self.stop.is_set():
+            connection = None
+            terminated = asyncio.Event()
+            try:
+                connection = await asyncpg_module.connect(
+                    self.database_url,
+                    timeout=self.connect_timeout,
+                )
+                connection.add_termination_listener(
+                    lambda _connection: terminated.set()
+                )
+                await connection.add_listener(
+                    _OUTBOX_CHANNEL,
+                    lambda *_notification: self.wake.set(),
+                )
+                self.ready.set()
+                self.wake.set()
+                log_event('dispatcher.listener_ready')
+                while (
+                    not self.stop.is_set()
+                    and not terminated.is_set()
+                    and not connection.is_closed()
+                ):
+                    await asyncio.sleep(0.25)
+            except Exception as exc:
+                if not self.stop.is_set():
+                    log_event(
+                        'dispatcher.listener_failed',
+                        level=logging.WARNING,
+                        error_type=type(exc).__name__,
+                    )
+            finally:
+                self.ready.clear()
+                if connection is not None and not connection.is_closed():
+                    try:
+                        await connection.close(timeout=1)
+                    except Exception:
+                        pass
+            if not self.stop.is_set():
+                await asyncio.sleep(1)
 
 
 def _health_check(settings, asyncpg_module=None, redis_module=None):
@@ -88,12 +164,18 @@ def main(argv=None):
         int(args.claim_ticket_ttl_seconds),
         lease_seconds,
     )
+    listener = _DispatchWakeListener(
+        settings.database_url,
+        connect_timeout=settings.readiness_timeout_seconds,
+    )
     try:
+        listener.start()
         log_event('dispatcher.started', namespace=args.namespace)
         next_dispatch = 0.0
         while not stop_event.is_set():
             now = monotonic()
-            if now >= next_dispatch:
+            if now >= next_dispatch or listener.wake.is_set():
+                listener.wake.clear()
                 claimed = source.claim_dispatchable(
                     limit=batch_size,
                     lease_seconds=lease_seconds,
@@ -138,11 +220,14 @@ def main(argv=None):
                     )
                 if rebuilt_count:
                     log_event('dispatcher.jobs_rebuilt', count=rebuilt_count)
-                next_dispatch = now + interval
-            sleep(min(interval, 0.5))
+                next_dispatch = monotonic() + interval
+            listener.wake.wait(
+                timeout=min(max(next_dispatch - monotonic(), 0), 0.5)
+            )
     except KeyboardInterrupt:
         return 0
     finally:
+        listener.close()
         manager.shutdown()
         log_event('dispatcher.stopped', namespace=args.namespace)
     return 0

@@ -1285,6 +1285,16 @@ class Database:
                     **payload,
                     '_outbox_staged_at': datetime.now(timezone.utc).isoformat(),
                 }
+                if (
+                    self.url.startswith('postgresql')
+                    and (
+                        outbox.next_attempt_at is None
+                        or outbox.next_attempt_at <= time()
+                    )
+                ):
+                    await session.execute(text(
+                        "SELECT pg_notify('bioagent_dispatch_outbox', '')"
+                    ))
             try:
                 await session.commit()
             except IntegrityError:
