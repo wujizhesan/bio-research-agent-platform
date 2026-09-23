@@ -127,6 +127,48 @@ class InMemoryRedis:
 
 
 class RedisJobManagerTests(unittest.TestCase):
+    def test_worker_claim_after_successful_dispatch_reconciliation_delay(self):
+        with tempfile.TemporaryDirectory(prefix='worker_claim_dispatch_') as raw:
+            url = f"sqlite+aiosqlite:///{(Path(raw) / 'jobs.sqlite3').as_posix()}"
+            database = Database(url)
+            manager = RedisJobManager(
+                redis_client=InMemoryRedis(), namespace='worker-claim-dispatch'
+            )
+            try:
+                asyncio.run(database.init_schema())
+                prepared = manager.prepare_durable('research_catalog', {})
+                job_id = prepared['job_id']
+                asyncio.run(database.stage_job(prepared))
+                dispatched = asyncio.run(database.claim_dispatch_batch(
+                    'dispatch-worker-test', limit=1
+                ))[0]
+                completed = asyncio.run(database.complete_dispatch_claims(
+                    'dispatch-worker-test', [{
+                        'job_id': job_id,
+                        'generation': dispatched['_dispatch_generation'],
+                        'succeeded': True,
+                    }],
+                ))
+                self.assertEqual(completed, [job_id])
+
+                async def retry_time():
+                    async with database.sessions() as session:
+                        outbox = await session.get(JobOutboxRow, job_id)
+                        return outbox.next_attempt_at
+
+                self.assertGreater(asyncio.run(retry_time()), time())
+                claim = asyncio.run(database.claim_worker_job(
+                    job_id,
+                    prepared['_execution_key'],
+                    'worker-after-dispatch',
+                    dispatched['_claim_ticket'],
+                    30,
+                ))
+                self.assertEqual(claim['job_id'], job_id)
+            finally:
+                manager.shutdown()
+                asyncio.run(database.close())
+
     def test_durable_retry_reconciles_after_redis_transition_failure(self):
         with tempfile.TemporaryDirectory(prefix='durable_retry_torn_write_') as raw:
             url = f"sqlite+aiosqlite:///{(Path(raw) / 'jobs.sqlite3').as_posix()}"

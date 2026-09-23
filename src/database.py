@@ -1597,10 +1597,9 @@ class Database:
                     capability_row is not None
                     and job is not None
                     and outbox is not None
-                    and (
-                        outbox.next_attempt_at is None
-                        or float(outbox.next_attempt_at) <= current_time
-                    )
+                    and float(
+                        (outbox.payload or {}).get('_retry_not_before') or 0
+                    ) <= current_time
                     and not job.cancel_requested
                     and capability_row.capability == str(capability)
                     and capability_row.claim_ticket_sha256 == ticket_hash

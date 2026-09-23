@@ -107,7 +107,12 @@ def verify(
             }:
                 return job
             sleep_fn(0.5)
-        return job
+        status = job.get('status')
+        if status not in {'queued', 'running'}:
+            status = 'unknown'
+        raise RuntimeError(
+            f'secure full-stack job {job_id} timed out in {status} status'
+        )
 
     health = requester(base_url, '/health')
     if health.get('status') != 'ok' or health.get('job_backend') != 'redis':
@@ -179,7 +184,9 @@ def verify(
     }
     for key, expected in expected_failure.items():
         if failed_job.get(key) != expected:
-            raise RuntimeError('secure full-stack error contract failed')
+            raise RuntimeError(
+                f'secure full-stack error contract failed: {key}'
+            )
     serialized_failure = json.dumps(failed_job, ensure_ascii=True)
     if (
         'Expecting property name' in serialized_failure
