@@ -409,6 +409,13 @@ jobs:
           exit 1
       - name: Run API to sandbox artifact round trip
         run: python scripts/verify_secure_fullstack_e2e.py --base-url http://127.0.0.1:18080
+      - name: Capture secure job latency baseline
+        run: |
+          python -m scripts.benchmark_secure_jobs \
+            --base-url http://127.0.0.1:18080 \
+            --index-path /app/output/secure-fullstack-e2e/artifacts/knowledge-index.json \
+            --samples 10 \
+            --output output/performance-baseline.json
       - name: Verify sandbox mounts and cleanup
         run: |
           mkdir -p output
@@ -469,6 +476,7 @@ jobs:
             output/ci-secure-fullstack.log
             output/ci-secure-fullstack-health.json
             output/ci-plugin-sandbox-inspect.json
+            output/performance-baseline.json
             output/secure-fullstack-e2e
             output/monitoring-smoke
           if-no-files-found: ignore
