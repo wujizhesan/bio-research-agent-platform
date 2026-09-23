@@ -434,6 +434,7 @@ jobs:
       - name: Start and verify production monitoring path
         run: |
           mkdir -p output/monitoring-smoke
+          chmod 0777 output/monitoring-smoke
           rm -f output/monitoring-smoke/alerts.jsonl output/monitoring-smoke/prometheus-targets.json
           docker compose \
             -f docker-compose.yml \

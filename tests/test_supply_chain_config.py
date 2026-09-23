@@ -341,6 +341,7 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn('verify_monitoring_stack.py', ci)
         self.assertIn('docker-compose.monitoring-test.yml', ci)
         self.assertIn('alert-webhook-sink prometheus alertmanager', ci)
+        self.assertIn('chmod 0777 output/monitoring-smoke', ci)
         self.assertIn('MONITORING_SECRET_GID', script)
         self.assertIn("stat -c '%g'", script)
         self.assertIn('--profile monitoring', script)
