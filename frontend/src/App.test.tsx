@@ -32,6 +32,9 @@ describe('App 工作台编排', () => {
       if (url.endsWith('/api/v1/capabilities')) {
         return response({ tool_count: 2, interfaces: { rest: { status: 'available', protocol: 'http' }, sse: { status: 'available', protocol: 'sse' } } })
       }
+      if (url.endsWith('/api/v1/auth/session') && init?.method === 'POST') {
+        return response({ status: 'ok' })
+      }
       if (url.endsWith('/api/v1/projects') && init?.method === 'POST') {
         return response({ project: { project_id: 'project-2', name: 'New Project', owner_subject: 'user', created_at: '2026-09-07T00:00:00Z' } })
       }
@@ -63,7 +66,8 @@ describe('App 工作台编排', () => {
 
     fireEvent.change(screen.getByLabelText('访问令牌'), { target: { value: 'new-token' } })
     fireEvent.click(screen.getByRole('button', { name: '连接' }))
-    await waitFor(() => expect(localStorage.getItem('bio-agent-token')).toBe('new-token'))
+    await waitFor(() => expect(screen.getByLabelText('访问令牌')).toHaveValue(''))
+    expect(localStorage.getItem('bio-agent-token')).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: '新建项目' }))
     await screen.findByText('New Project')

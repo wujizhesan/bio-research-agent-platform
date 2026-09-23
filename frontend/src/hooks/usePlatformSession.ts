@@ -9,7 +9,7 @@ import {
 } from '../app/platformPayloadValidation'
 import type { Capabilities, Job, Plugin, Project } from '../app/types'
 
-const terminalJobStatuses = new Set<Job['status']>(['completed', 'failed', 'cancelled'])
+const terminalJobStatuses = new Set<Job['status']>(['completed', 'failed', 'cancelled', 'indeterminate'])
 
 function mergeJobState(previous: Job | undefined, next: Job) {
   if (previous && terminalJobStatuses.has(previous.status) && !terminalJobStatuses.has(next.status)) return previous
@@ -64,13 +64,25 @@ export function usePlatformSession(apiBase: string, initialToken: string) {
     void refresh()
   }, [refresh])
 
-  function saveToken() {
+  async function saveToken() {
     const normalized = tokenDraft.trim()
-    if (normalized) localStorage.setItem('bio-agent-token', normalized)
-    else localStorage.removeItem('bio-agent-token')
-    setTokenDraft(normalized)
-    setToken(normalized)
-    if (normalized === token) void refresh(normalized)
+    if (!normalized) {
+      setToken('')
+      setTokenDraft('')
+      await refresh('')
+      return
+    }
+    setError('')
+    try {
+      await apiFetch(apiBase, normalized, '/api/v1/auth/session', {
+        method: 'POST',
+      })
+      setToken('')
+      setTokenDraft('')
+      await refresh('')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '无法建立安全浏览器会话')
+    }
   }
 
   async function createProject() {

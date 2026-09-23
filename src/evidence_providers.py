@@ -2,13 +2,131 @@
 import gzip
 import hashlib
 import json
-import os
 import re
+from datetime import datetime, timedelta, timezone
+from functools import wraps
 from pathlib import Path
 from urllib.parse import quote
+from uuid import uuid4
 
 import pandas as pd
 import requests
+
+try:
+    from .external_service_policy import record_stale_cache, resilient_call
+    from .settings import PlatformSettings
+except ImportError:
+    from external_service_policy import record_stale_cache, resilient_call
+    from settings import PlatformSettings
+
+
+EVIDENCE_CACHE_VERSION = 1
+
+
+def _cache_mode():
+    return PlatformSettings.from_env().evidence_cache_mode
+
+
+def _cache_ttl_seconds():
+    return PlatformSettings.from_env().evidence_cache_ttl_seconds
+
+
+def _read_cache(path, allow_stale=False):
+    mode = _cache_mode()
+    if mode == 'refresh' and not allow_stale:
+        return None
+    if not path or not path.exists():
+        if mode == 'frozen':
+            raise RuntimeError(f'frozen evidence cache entry unavailable: {path}')
+        return None
+    document = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(document, dict) or '_cache' not in document or 'payload' not in document:
+        if mode == 'frozen':
+            raise RuntimeError(f'frozen evidence cache entry is unverifiable: {path}')
+        age = datetime.now(timezone.utc).timestamp() - path.stat().st_mtime
+        maximum_age = _cache_ttl_seconds()
+        if allow_stale:
+            maximum_age += PlatformSettings.from_env().evidence_cache_stale_if_error_seconds
+        return document if age <= maximum_age else None
+    metadata = document.get('_cache') or {}
+    if int(metadata.get('schema_version', 0)) != EVIDENCE_CACHE_VERSION:
+        return None
+    expires_at = metadata.get('expires_at')
+    try:
+        expires = datetime.fromisoformat(str(expires_at))
+    except (TypeError, ValueError):
+        return None
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    payload = document['payload']
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    if hashlib.sha256(encoded.encode('utf-8')).hexdigest() != metadata.get('sha256'):
+        if mode == 'frozen':
+            raise RuntimeError(f'frozen evidence cache integrity check failed: {path}')
+        return None
+    now = datetime.now(timezone.utc)
+    if mode != 'frozen' and expires <= now:
+        stale_seconds = PlatformSettings.from_env().evidence_cache_stale_if_error_seconds
+        if not allow_stale or expires + timedelta(seconds=stale_seconds) < now:
+            return None
+    return payload
+
+
+def _stale_if_error(method):
+    @wraps(method)
+    def wrapped(self, key):
+        cache_path = self._cache_path(key)
+        try:
+            return method(self, key)
+        except Exception:
+            stale = _read_cache(cache_path, allow_stale=True)
+            if stale is not None:
+                record_stale_cache(getattr(self, 'service_name', type(self).__name__))
+                return stale
+            raise
+    return wrapped
+
+
+def _resilient_get(service, *args, **kwargs):
+    return resilient_call(service, lambda: requests.get(*args, **kwargs))
+
+
+def _write_cache(path, payload, *, provider, request, response_headers=None):
+    if not path:
+        return
+    retrieved_at = datetime.now(timezone.utc)
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    headers = response_headers or {}
+
+    def header(name):
+        getter = getattr(headers, 'get', None)
+        value = getter(name) if getter else None
+        return value if isinstance(value, str) else None
+    document = {
+        '_cache': {
+            'schema_version': EVIDENCE_CACHE_VERSION,
+            'provider': provider,
+            'request': request,
+            'retrieved_at': retrieved_at.isoformat(),
+            'expires_at': (
+                retrieved_at + timedelta(seconds=_cache_ttl_seconds())
+            ).isoformat(),
+            'sha256': hashlib.sha256(encoded.encode('utf-8')).hexdigest(),
+            'etag': header('ETag'),
+            'last_modified': header('Last-Modified'),
+            'source_release': (
+                header('X-UniProt-Release')
+                or header('X-Data-Release')
+            ),
+        },
+        'payload': payload,
+    }
+    temporary = path.with_suffix(path.suffix + f'.{uuid4().hex}.tmp')
+    temporary.write_text(
+        json.dumps(document, ensure_ascii=False, indent=2) + '\n',
+        encoding='utf-8',
+    )
+    temporary.replace(path)
 
 
 class LocalEvidenceProvider:
@@ -36,6 +154,7 @@ class LocalEvidenceProvider:
 
 
 class UniProtEvidenceProvider:
+    service_name = 'uniprot'
     endpoint = 'https://rest.uniprot.org/uniprotkb/search'
 
     def __init__(self, organism_id=9606, timeout=15, cache_dir=None):
@@ -53,11 +172,13 @@ class UniProtEvidenceProvider:
         ).hexdigest()
         return self.cache_dir / f'{key}.json'
 
+    @_stale_if_error
     def _request(self, gene_id):
         cache_path = self._cache_path(gene_id)
-        if cache_path and cache_path.exists():
-            return json.loads(cache_path.read_text(encoding='utf-8'))
-        response = requests.get(
+        cached = _read_cache(cache_path)
+        if cached is not None:
+            return cached
+        response = _resilient_get('uniprot',
             self.endpoint,
             params={
                 'query': f'gene:{gene_id} AND organism_id:{self.organism_id}',
@@ -70,11 +191,13 @@ class UniProtEvidenceProvider:
         )
         response.raise_for_status()
         payload = response.json()
-        if cache_path:
-            cache_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
-                encoding='utf-8',
-            )
+        _write_cache(
+            cache_path,
+            payload,
+            provider='uniprot',
+            request={'gene_id': str(gene_id), 'organism_id': self.organism_id},
+            response_headers=response.headers,
+        )
         return payload
 
     @staticmethod
@@ -133,14 +256,16 @@ class UniProtEvidenceProvider:
 
 
 class PubMedEvidenceProvider:
+    service_name = 'pubmed'
     base_endpoint = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils'
 
     def __init__(self, timeout=15, cache_dir=None, retmax=5, email=None, api_key=None):
         self.timeout = float(timeout)
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.retmax = int(retmax)
-        self.email = email or os.environ.get('NCBI_EMAIL')
-        self.api_key = api_key or os.environ.get('NCBI_API_KEY')
+        settings = PlatformSettings.from_env()
+        self.email = email or settings.ncbi_email
+        self.api_key = api_key or settings.ncbi_api_key
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -163,11 +288,13 @@ class PubMedEvidenceProvider:
         params['tool'] = 'cadd-agent'
         return params
 
+    @_stale_if_error
     def _request(self, gene_id):
         cache_path = self._cache_path(gene_id)
-        if cache_path and cache_path.exists():
-            return json.loads(cache_path.read_text(encoding='utf-8'))
-        search_response = requests.get(
+        cached = _read_cache(cache_path)
+        if cached is not None:
+            return cached
+        search_response = _resilient_get('pubmed',
             self.endpoint,
             params=self._params(
                 db='pubmed',
@@ -182,8 +309,9 @@ class PubMedEvidenceProvider:
         search_payload = search_response.json()
         ids = search_payload.get('esearchresult', {}).get('idlist', [])
         summary_payload = {'result': {'uids': []}}
+        cache_headers = search_response.headers
         if ids:
-            summary_response = requests.get(
+            summary_response = _resilient_get('pubmed',
                 f'{self.base_endpoint}/esummary.fcgi',
                 params=self._params(db='pubmed', id=','.join(ids), retmode='json'),
                 headers={'Accept': 'application/json', 'User-Agent': 'cadd-agent/omics'},
@@ -191,12 +319,15 @@ class PubMedEvidenceProvider:
             )
             summary_response.raise_for_status()
             summary_payload = summary_response.json()
+            cache_headers = summary_response.headers
         payload = {'ids': ids, 'summary': summary_payload}
-        if cache_path:
-            cache_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
-                encoding='utf-8',
-            )
+        _write_cache(
+            cache_path,
+            payload,
+            provider='pubmed',
+            request={'gene_id': str(gene_id), 'retmax': self.retmax},
+            response_headers=cache_headers,
+        )
         return payload
 
     @staticmethod
@@ -252,14 +383,16 @@ class PubMedEvidenceProvider:
 
 
 class NcbiGeneEvidenceProvider:
+    service_name = 'ncbi_gene'
     base_endpoint = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils'
 
     def __init__(self, timeout=15, cache_dir=None, organism='Homo sapiens', email=None, api_key=None):
         self.timeout = float(timeout)
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.organism = str(organism)
-        self.email = email or os.environ.get('NCBI_EMAIL')
-        self.api_key = api_key or os.environ.get('NCBI_API_KEY')
+        settings = PlatformSettings.from_env()
+        self.email = email or settings.ncbi_email
+        self.api_key = api_key or settings.ncbi_api_key
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -284,11 +417,13 @@ class NcbiGeneEvidenceProvider:
         params['tool'] = 'cadd-agent'
         return params
 
+    @_stale_if_error
     def _request(self, gene_id):
         cache_path = self._cache_path(gene_id)
-        if cache_path and cache_path.exists():
-            return json.loads(cache_path.read_text(encoding='utf-8'))
-        search_response = requests.get(
+        cached = _read_cache(cache_path)
+        if cached is not None:
+            return cached
+        search_response = _resilient_get('ncbi_gene',
             self.endpoint,
             params=self._params(
                 db='gene',
@@ -303,8 +438,9 @@ class NcbiGeneEvidenceProvider:
         search_payload = search_response.json()
         ids = search_payload.get('esearchresult', {}).get('idlist', [])
         summary_payload = {'result': {'uids': []}}
+        cache_headers = search_response.headers
         if ids:
-            summary_response = requests.get(
+            summary_response = _resilient_get('ncbi_gene',
                 f'{self.base_endpoint}/esummary.fcgi',
                 params=self._params(db='gene', id=','.join(ids), retmode='json'),
                 headers={'Accept': 'application/json', 'User-Agent': 'cadd-agent/omics'},
@@ -312,12 +448,15 @@ class NcbiGeneEvidenceProvider:
             )
             summary_response.raise_for_status()
             summary_payload = summary_response.json()
+            cache_headers = summary_response.headers
         payload = {'ids': ids, 'summary': summary_payload}
-        if cache_path:
-            cache_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
-                encoding='utf-8',
-            )
+        _write_cache(
+            cache_path,
+            payload,
+            provider='ncbi_gene',
+            request={'gene_id': str(gene_id), 'organism': self.organism},
+            response_headers=cache_headers,
+        )
         return payload
 
     @staticmethod
@@ -371,6 +510,7 @@ class NcbiGeneEvidenceProvider:
 
 
 class KeggEvidenceProvider:
+    service_name = 'kegg'
     base_endpoint = 'https://rest.kegg.jp'
 
     def __init__(self, timeout=15, cache_dir=None, organism='hsa'):
@@ -416,12 +556,14 @@ class KeggEvidenceProvider:
                     pathways.append(pathway_id)
         return pathways
 
+    @_stale_if_error
     def _request(self, gene_id):
         cache_path = self._cache_path(gene_id)
-        if cache_path and cache_path.exists():
-            return json.loads(cache_path.read_text(encoding='utf-8'))
+        cached = _read_cache(cache_path)
+        if cached is not None:
+            return cached
         encoded_gene_id = quote(str(gene_id), safe=':_-.')
-        find_response = requests.get(
+        find_response = _resilient_get('kegg',
             f'{self.base_endpoint}/find/{self.organism}/{encoded_gene_id}',
             headers={'Accept': 'text/plain', 'User-Agent': 'cadd-agent/omics'},
             timeout=self.timeout,
@@ -429,7 +571,7 @@ class KeggEvidenceProvider:
         find_response.raise_for_status()
         matches = self._parse_find(find_response.text)
         for match in matches:
-            pathway_response = requests.get(
+            pathway_response = _resilient_get('kegg',
                 f'{self.base_endpoint}/link/pathway/{quote(match["kegg_id"], safe=":_-.")}',
                 headers={'Accept': 'text/plain', 'User-Agent': 'cadd-agent/omics'},
                 timeout=self.timeout,
@@ -437,11 +579,13 @@ class KeggEvidenceProvider:
             pathway_response.raise_for_status()
             match['pathways'] = self._parse_pathways(pathway_response.text)
         payload = {'matches': matches}
-        if cache_path:
-            cache_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
-                encoding='utf-8',
-            )
+        _write_cache(
+            cache_path,
+            payload,
+            provider='kegg',
+            request={'gene_id': str(gene_id), 'organism': self.organism},
+            response_headers=find_response.headers,
+        )
         return payload
 
     def _records(self, gene_id, payload):
@@ -481,6 +625,7 @@ class KeggEvidenceProvider:
 
 
 class UcscEvidenceProvider:
+    service_name = 'ucsc'
     endpoint = 'https://api.genome.ucsc.edu/search'
 
     def __init__(self, genome='hg38', cache_dir=None, timeout=15):
@@ -498,11 +643,13 @@ class UcscEvidenceProvider:
         ).hexdigest()
         return self.cache_dir / f'ucsc_{key}.json'
 
+    @_stale_if_error
     def _request(self, gene_id):
         cache_path = self._cache_path(gene_id)
-        if cache_path and cache_path.exists():
-            return json.loads(cache_path.read_text(encoding='utf-8'))
-        response = requests.get(
+        cached = _read_cache(cache_path)
+        if cached is not None:
+            return cached
+        response = _resilient_get('ucsc',
             self.endpoint,
             params={'search': str(gene_id), 'genome': self.genome},
             headers={'Accept': 'application/json', 'User-Agent': 'cadd-agent/omics'},
@@ -510,11 +657,13 @@ class UcscEvidenceProvider:
         )
         response.raise_for_status()
         payload = response.json()
-        if cache_path:
-            cache_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
-                encoding='utf-8',
-            )
+        _write_cache(
+            cache_path,
+            payload,
+            provider='ucsc',
+            request={'gene_id': str(gene_id), 'genome': self.genome},
+            response_headers=response.headers,
+        )
         return payload
 
     def _records(self, gene_id, payload):

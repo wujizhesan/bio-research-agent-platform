@@ -1,9 +1,10 @@
 import type { Dispatch, SetStateAction } from 'react'
 import { useCallback, useState } from 'react'
 import { apiFetch, followJob } from '../app/api'
+import { browserSessionRequest } from '../app/browserSession'
 import { statusLabels } from '../app/constants'
 import { parseJob, parseJobPayload } from '../app/platformPayloadValidation'
-import type { EventItem, Job } from '../app/types'
+import type { EventItem, Job, JobResolutionDecision } from '../app/types'
 import { useManagedJobStream } from './useManagedJobStream'
 
 export function formatTime(value?: string) {
@@ -65,6 +66,10 @@ export function useJobRunner({ apiBase, token, selectedProjectId, refresh, upser
     acceptedDetail: string,
     onCompleted?: (job: Job) => void,
   ) {
+    if (!selectedProjectId) {
+      setError('请先创建或选择项目')
+      return
+    }
     const controller = beginJobStream()
     setLoading(true)
     setError('')
@@ -114,7 +119,7 @@ export function useJobRunner({ apiBase, token, selectedProjectId, refresh, upser
   }
 
   async function retryJob(sourceJob: Job) {
-    if (!['failed', 'cancelled'].includes(sourceJob.status)) return
+    if (!['failed', 'cancelled', 'indeterminate'].includes(sourceJob.status)) return
     const controller = beginJobStream()
     setLoading(true)
     setError('')
@@ -138,17 +143,63 @@ export function useJobRunner({ apiBase, token, selectedProjectId, refresh, upser
     }
   }
 
+  async function resolveIndeterminateJob(
+    sourceJob: Job,
+    decision: JobResolutionDecision,
+    reason: string,
+  ) {
+    if (sourceJob.status !== 'indeterminate' || sourceJob.resolution) return
+    setLoading(true)
+    setError('')
+    try {
+      const response = await apiFetch<unknown>(apiBase, token, `/api/v1/jobs/${sourceJob.job_id}/resolve`, {
+        method: 'POST',
+        body: JSON.stringify({ decision, reason, evidence: {} }),
+      })
+      const jobResult = parseJobPayload(response)
+      if (!jobResult.value) throw new Error(jobResult.issues.join('；'))
+      const resolvedJob = jobResult.value
+      updateJob(resolvedJob)
+      setEvents((current) => [...current, {
+        at: formatTime(new Date().toISOString()),
+        type: 'resolution',
+        status: resolvedJob.status,
+        detail: `人工裁决：${decision}`,
+      }])
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '任务裁决失败')
+    } finally {
+      setLoading(false)
+      void refresh()
+    }
+  }
+
   async function fetchJobArtifact(jobId: string, artifactPath: string) {
-    const response = await fetch(`${apiBase}/api/v1/jobs/${jobId}/artifacts?path=${encodeURIComponent(artifactPath)}`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    })
+    const artifact = selectedJob?.job_id === jobId
+      ? selectedJob.artifacts?.find((item) => item.reference === artifactPath || item.path === artifactPath)
+      : undefined
+    const endpoint = artifact
+      ? `/api/v1/jobs/${jobId}/artifacts/${artifact.artifact_id}`
+      : `/api/v1/jobs/${jobId}/artifacts?path=${encodeURIComponent(artifactPath)}`
+    const response = await fetch(
+      `${apiBase}${endpoint}`,
+      browserSessionRequest(token),
+    )
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}))
       throw new Error(payload.detail || `产物读取失败: ${response.status}`)
     }
     const blob = await response.blob()
     const disposition = response.headers.get('content-disposition') || ''
-    const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] || artifactPath.split(/[\\/]/).pop() || 'artifact'
+    const encodedFilename = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1]
+    let filename = artifact?.filename || disposition.match(/filename="?([^";]+)"?/i)?.[1] || artifactPath.split(/[\\/]/).pop() || 'artifact'
+    if (encodedFilename) {
+      try {
+        filename = decodeURIComponent(encodedFilename)
+      } catch {
+        filename = artifact?.filename || filename
+      }
+    }
     return { blob, filename }
   }
 
@@ -173,6 +224,10 @@ export function useJobRunner({ apiBase, token, selectedProjectId, refresh, upser
     setError('')
     try {
       const { blob, filename } = await fetchJobArtifact(jobId, artifactPath)
+      const mediaType = blob.type.split(';', 1)[0].trim().toLowerCase()
+      if (!/\.html?$/i.test(filename) || !['text/html', 'application/xhtml+xml'].includes(mediaType)) {
+        throw new Error('仅允许预览 HTML 报告；其他产物请下载后使用可信工具打开')
+      }
       showReportPreview(blob, filename)
     } catch (err) {
       setError(err instanceof Error ? err.message : '报告预览失败')
@@ -196,6 +251,7 @@ export function useJobRunner({ apiBase, token, selectedProjectId, refresh, upser
     submitToolJob,
     cancelSelectedJob,
     retryJob,
+    resolveIndeterminateJob,
     downloadJobArtifact,
     previewJobArtifact,
     selectJob,

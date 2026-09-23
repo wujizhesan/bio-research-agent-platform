@@ -1,11 +1,14 @@
 import asyncio
 import gzip
+import hashlib
+from io import BytesIO
 import json
 import os
 import shutil
 import tempfile
 import time
 import unittest
+from uuid import uuid4
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -13,11 +16,14 @@ from fastapi.testclient import TestClient
 
 import src.fastapi_app as fastapi_module
 from src.audit_log import AuditLogger
+from src.auth import AuthService
 from src.database import Database
 from src.fastapi_app import create_app
 from src.file_storage import LocalFileStorage, StoredFile
 from src.job_manager import JobManager
 from src.plugin_manager import PluginManager
+from src.settings import PlatformSettings
+from src.storage_workspace import S3ObjectReference
 
 
 class RedisReadJobManager:
@@ -39,6 +45,13 @@ class RedisReadJobManager:
 
     def shutdown(self):
         return None
+
+    def list_workers(self):
+        return [{
+            'worker_id': 'worker-1',
+            'draining': False,
+            'active_jobs': 0,
+        }]
 
 
 class RedisEventPubSub:
@@ -81,14 +94,110 @@ class RedisEventJobManager(RedisReadJobManager):
         return self.pubsub
 
 
+class RedisReplayJobManager(RedisReadJobManager):
+    def __init__(self):
+        super().__init__()
+        self.cursors = []
+
+    def get(self, job_id):
+        self.read_count += 1
+        return {
+            'job_id': job_id,
+            'tool': 'research_catalog',
+            'status': 'running',
+            'created_at': '2026-08-23T00:00:00+00:00',
+            'attempts': 1,
+        }
+
+    def read_job_events(self, job_id, last_event_id, block_ms, count):
+        self.cursors.append(last_event_id)
+        return [('2-0', {
+            'job_id': job_id,
+            'tool': 'research_catalog',
+            'status': 'completed',
+            'created_at': '2026-08-23T00:00:00+00:00',
+            'result': {'status': 'ok'},
+            'attempts': 1,
+        })]
+
+
+class RedisLostEventJobManager(RedisReadJobManager):
+    def get(self, _job_id):
+        self.read_count += 1
+        return None
+
+    def read_job_events(self, *_args, **_kwargs):
+        return []
+
+
+class RedisRevocationJobManager(RedisReadJobManager):
+    def get(self, job_id):
+        self.read_count += 1
+        return {
+            'job_id': job_id,
+            'project_id': 'revocation-project',
+            'tool': 'research_catalog',
+            'status': 'running',
+            'created_at': '2026-09-20T00:00:00+00:00',
+            'attempts': 1,
+        }
+
+    def read_job_events(self, *_args, **_kwargs):
+        time.sleep(0.05)
+        return []
+
+
+class RedisDurableSubmitJobManager(RedisReadJobManager):
+    def __init__(self):
+        super().__init__()
+        self.order = []
+        self.record = None
+
+    def prepare(self, tool, arguments, **_kwargs):
+        self.order.append('prepare')
+        self.record = {
+            'job_id': 'durable-submit-job',
+            'tool': tool,
+            'status': 'queued',
+            'created_at': '2026-09-15T00:00:00+00:00',
+            '_arguments': dict(arguments),
+            '_attempts': 0,
+            '_cancel_requested': False,
+            'resources': {},
+            'priority': 0,
+        }
+        return {
+            key: value
+            for key, value in self.record.items()
+            if not key.startswith('_')
+        }
+
+    def durable_record(self, job_id):
+        return dict(self.record) if self.record and self.record['job_id'] == job_id else None
+
+    def dispatch(self, job_id):
+        self.order.append('dispatch')
+        return self.get(job_id)
+
+    def get(self, job_id):
+        if self.record is None or self.record['job_id'] != job_id:
+            return None
+        return {
+            key: value
+            for key, value in self.record.items()
+            if not key.startswith('_')
+        }
+
+
 class FastApiAppTests(unittest.TestCase):
-    def _app(self, root, file_storage=None, audit_log=None):
+    def _app(self, root, file_storage=None, audit_log=None, settings=None):
         app = create_app(
             job_manager=JobManager(max_workers=1, store_path=Path(root) / 'jobs.sqlite3'),
             plugin_manager=PluginManager(state_path=Path(root) / 'plugins.json'),
             database=Database(f"sqlite+aiosqlite:///{(Path(root) / 'api.sqlite3').as_posix()}"),
             file_storage=file_storage,
             audit_log=audit_log or AuditLogger(Path(root) / 'audit.jsonl'),
+            settings=settings,
         )
         return app
 
@@ -106,6 +215,35 @@ class FastApiAppTests(unittest.TestCase):
             time.sleep(0.05)
         self.fail(f'job did not reach a terminal state: {job_id}')
 
+    def _persist_artifact(self, app, record, artifact, status='committed'):
+        publication_id = hashlib.sha256(
+            f"{record['job_id']}:{artifact['artifact_id']}".encode('utf-8')
+        ).hexdigest()
+        reservation = {
+            **artifact,
+            'publication_id': publication_id,
+            'job_id': record['job_id'],
+            'project_id': record.get('project_id') or 'system-legacy',
+            'execution_key': record.get('_execution_key') or uuid4().hex,
+            'fencing_token': str(record.get('_fencing_token') or 'local-test'),
+            'attempt': max(int(record.get('_attempts', 1) or 1), 1),
+            'parameter': 'output_path',
+            'kind': 'file',
+            'reserved_bytes': max(int(artifact['size_bytes']), 1),
+        }
+
+        async def persist():
+            await app.state.database.upsert_job(record)
+            await app.state.database.reserve_job_artifacts([reservation])
+            if status == 'reserved':
+                return
+            await app.state.database.mark_job_artifacts_uploaded([reservation])
+            if status == 'uploaded':
+                return
+            await app.state.database.commit_job_artifacts([publication_id])
+
+        asyncio.run(persist())
+
     def test_health_openapi_and_database(self):
         with tempfile.TemporaryDirectory(prefix='fastapi_app_') as raw:
             app = self._app(raw)
@@ -120,6 +258,8 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(health.json()['dependencies']['job_backend'], 'ok')
                     self.assertEqual(health.json()['dependencies']['storage'], 'ok')
                     self.assertEqual(health.json()['storage_backend'], 'local')
+                    self.assertEqual(health.json()['configuration']['schema_version'], 1)
+                    self.assertEqual(len(health.json()['configuration']['fingerprint']), 64)
                     self.assertEqual(health.headers['x-request-id'], 'interview-trace-001')
                     self.assertEqual(
                         health.headers['x-trace-id'],
@@ -135,6 +275,12 @@ class FastApiAppTests(unittest.TestCase):
                     metrics = client.get('/metrics').text
                     self.assertIn('/_unmatched', metrics)
                     self.assertNotIn('/missing/high-cardinality-value', metrics)
+                    self.assertIn('bio_agent_storage_deletion_backlog', metrics)
+                    self.assertIn(
+                        'bio_agent_storage_deletion_oldest_age_seconds',
+                        metrics,
+                    )
+                    self.assertIn('bio_agent_storage_deletion_event_count', metrics)
                     submitted = client.post(
                         '/api/v1/jobs',
                         json={'tool': 'research_catalog', 'arguments': {}},
@@ -149,6 +295,51 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(job['request_id'], 'job-request-001')
                     completed = self._wait_for_job(client, job['job_id'])
                     self.assertEqual(completed['trace_id'], 'job-trace-001')
+            finally:
+                self._close_app(app)
+
+    def test_redis_submission_commits_outbox_without_api_dispatch(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_outbox_') as raw:
+            manager = RedisDurableSubmitJobManager()
+            database = Database(
+                f"sqlite+aiosqlite:///{(Path(raw) / 'api.sqlite3').as_posix()}"
+            )
+            original_stage = database.stage_job
+
+            async def stage(record, **kwargs):
+                manager.order.append('stage')
+                await original_stage(record, **kwargs)
+
+            database.stage_job = stage
+            app = create_app(
+                job_manager=manager,
+                plugin_manager=PluginManager(
+                    state_path=Path(raw) / 'plugins.json'
+                ),
+                database=database,
+                audit_log=AuditLogger(Path(raw) / 'audit.jsonl'),
+            )
+            try:
+                with TestClient(app) as client:
+                    project = client.post('/api/v1/projects', json={
+                        'name': 'Durable project',
+                    }).json()['project']
+                    response = client.post('/api/v1/jobs', json={
+                        'tool': 'research_catalog',
+                        'arguments': {},
+                        'project_id': project['project_id'],
+                    })
+                self.assertEqual(response.status_code, 202)
+                self.assertEqual(manager.order, ['prepare', 'stage'])
+                dispatchable = asyncio.run(database.list_dispatchable_jobs())
+                self.assertEqual(
+                    [item['job_id'] for item in dispatchable],
+                    ['durable-submit-job'],
+                )
+                self.assertEqual(
+                    asyncio.run(database.get_job_project('durable-submit-job')),
+                    project['project_id'],
+                )
             finally:
                 self._close_app(app)
 
@@ -390,6 +581,131 @@ class FastApiAppTests(unittest.TestCase):
             finally:
                 self._close_app(app)
 
+    def test_a2a_task_access_respects_project_membership(self):
+        users = {
+            'alice': {'password': 'alice-secret', 'roles': ['researcher']},
+            'bob': {'password': 'bob-secret', 'roles': ['researcher']},
+        }
+        with tempfile.TemporaryDirectory(prefix='fastapi_a2a_tenant_') as raw:
+            with patch.dict(os.environ, {
+                'CADD_API_TOKEN': '',
+                'CADD_JWT_SECRET': 'test-secret-' * 4,
+                'CADD_AUTH_USERS_JSON': json.dumps(users),
+            }, clear=False):
+                app = self._app(raw)
+                try:
+                    with TestClient(app) as client:
+                        headers = {}
+                        for username in users:
+                            response = client.post('/api/v1/auth/token', data={
+                                'username': username,
+                                'password': f'{username}-secret',
+                            })
+                            headers[username] = {
+                                'Authorization': f"Bearer {response.json()['access_token']}"
+                            }
+                        project = client.post(
+                            '/api/v1/projects',
+                            headers=headers['alice'],
+                            json={'name': 'Alice project'},
+                        ).json()['project']
+                        submitted = client.post(
+                            '/api/v1/jobs',
+                            headers=headers['alice'],
+                            json={
+                                'tool': 'research_catalog',
+                                'arguments': {},
+                                'project_id': project['project_id'],
+                            },
+                        )
+                        job_id = submitted.json()['job']['job_id']
+                        for method in ('tasks/get', 'tasks/cancel'):
+                            denied = client.post(
+                                '/a2a',
+                                headers=headers['bob'],
+                                json={
+                                    'jsonrpc': '2.0',
+                                    'id': method,
+                                    'method': method,
+                                    'params': {'id': job_id},
+                                },
+                            )
+                            self.assertEqual(denied.json()['error']['code'], -32003)
+                finally:
+                    self._close_app(app)
+
+    def test_project_owner_can_revoke_member_but_not_owner(self):
+        users = {
+            'alice': {'password': 'alice-secret', 'roles': ['researcher']},
+            'bob': {'password': 'bob-secret', 'roles': ['researcher']},
+        }
+        with tempfile.TemporaryDirectory(prefix='fastapi_member_revoke_') as raw:
+            with patch.dict(os.environ, {
+                'CADD_API_TOKEN': '',
+                'CADD_JWT_SECRET': 'test-secret-' * 4,
+                'CADD_AUTH_USERS_JSON': json.dumps(users),
+            }, clear=False):
+                app = self._app(raw)
+                try:
+                    with TestClient(app) as client:
+                        headers = {}
+                        for username in users:
+                            response = client.post('/api/v1/auth/token', data={
+                                'username': username,
+                                'password': f'{username}-secret',
+                            })
+                            headers[username] = {
+                                'Authorization': f"Bearer {response.json()['access_token']}"
+                            }
+                        project = client.post(
+                            '/api/v1/projects',
+                            headers=headers['alice'],
+                            json={'name': 'Revocation project'},
+                        ).json()['project']
+                        project_id = project['project_id']
+                        added = client.post(
+                            f'/api/v1/projects/{project_id}/members',
+                            headers=headers['alice'],
+                            json={'subject': 'bob', 'role': 'viewer'},
+                        )
+                        self.assertEqual(added.status_code, 201)
+                        self.assertEqual(
+                            client.get(
+                                f'/api/v1/projects/{project_id}',
+                                headers=headers['bob'],
+                            ).status_code,
+                            200,
+                        )
+                        removed = client.delete(
+                            f'/api/v1/projects/{project_id}/members/bob',
+                            headers=headers['alice'],
+                        )
+                        self.assertEqual(removed.status_code, 204)
+                        self.assertEqual(
+                            client.get(
+                                f'/api/v1/projects/{project_id}',
+                                headers=headers['bob'],
+                            ).status_code,
+                            403,
+                        )
+                        self.assertEqual(
+                            client.delete(
+                                f'/api/v1/projects/{project_id}/members/alice',
+                                headers=headers['alice'],
+                            ).status_code,
+                            400,
+                        )
+                        self.assertEqual(
+                            client.post(
+                                f'/api/v1/projects/{project_id}/members',
+                                headers=headers['alice'],
+                                json={'subject': 'alice', 'role': 'viewer'},
+                            ).status_code,
+                            400,
+                        )
+                finally:
+                    self._close_app(app)
+
     def test_redis_job_reads_use_redis_before_database(self):
         with tempfile.TemporaryDirectory(prefix='fastapi_redis_read_') as raw:
             manager = RedisReadJobManager()
@@ -405,6 +721,12 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(response.status_code, 200)
                     self.assertEqual(response.json()['job']['status'], 'completed')
                     self.assertEqual(manager.read_count, 1)
+                    workers = client.get('/api/v1/workers')
+                    self.assertEqual(workers.status_code, 200)
+                    self.assertEqual(
+                        workers.json()['workers'][0]['worker_id'],
+                        'worker-1',
+                    )
             finally:
                 self._close_app(app)
 
@@ -427,6 +749,146 @@ class FastApiAppTests(unittest.TestCase):
             finally:
                 self._close_app(app)
 
+    def test_redis_sse_replays_from_last_event_id(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_redis_replay_') as raw:
+            manager = RedisReplayJobManager()
+            app = create_app(
+                job_manager=manager,
+                plugin_manager=PluginManager(state_path=Path(raw) / 'plugins.json'),
+                database=Database(f"sqlite+aiosqlite:///{(Path(raw) / 'api.sqlite3').as_posix()}"),
+                audit_log=AuditLogger(Path(raw) / 'audit.jsonl'),
+            )
+            try:
+                with TestClient(app) as client:
+                    with client.stream(
+                        'GET',
+                        '/api/v1/jobs/redis-job/events',
+                        headers={'Last-Event-ID': '1-0'},
+                    ) as events:
+                        body = ''.join(events.iter_text())
+                    self.assertEqual(events.status_code, 200)
+                    self.assertIn('id: 2-0', body)
+                    self.assertIn('"status": "completed"', body)
+                    self.assertEqual(manager.cursors, ['1-0'])
+            finally:
+                self._close_app(app)
+
+    def test_redis_sse_falls_back_to_durable_terminal_event(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_durable_sse_') as raw:
+            manager = RedisLostEventJobManager()
+            database = Database(
+                f"sqlite+aiosqlite:///{(Path(raw) / 'api.sqlite3').as_posix()}"
+            )
+            asyncio.run(database.init_schema())
+            asyncio.run(database.upsert_job({
+                'job_id': 'durable-event-job',
+                'tool': 'research_catalog',
+                'status': 'completed',
+                'created_at': '2026-09-16T00:00:00+00:00',
+                'finished_at': '2026-09-16T00:00:01+00:00',
+                'result': {'status': 'ok'},
+                '_revision': 4,
+                '_event_id': '4000-0',
+            }))
+            app = create_app(
+                job_manager=manager,
+                plugin_manager=PluginManager(state_path=Path(raw) / 'plugins.json'),
+                database=database,
+                audit_log=AuditLogger(Path(raw) / 'audit.jsonl'),
+            )
+            try:
+                with TestClient(app) as client:
+                    with client.stream(
+                        'GET',
+                        '/api/v1/jobs/durable-event-job/events',
+                        headers={'Last-Event-ID': '3999-0'},
+                    ) as events:
+                        body = ''.join(events.iter_text())
+                    self.assertEqual(events.status_code, 200)
+                    self.assertIn('id: 4000-0', body)
+                    self.assertIn('"status": "completed"', body)
+                    self.assertIn('"replay_gap": true', body)
+            finally:
+                self._close_app(app)
+
+    def test_sse_closes_when_project_membership_is_revoked(self):
+        users = {
+            'alice': {'password': 'alice-secret', 'roles': ['researcher']},
+            'bob': {'password': 'bob-secret', 'roles': ['researcher']},
+        }
+        with tempfile.TemporaryDirectory(prefix='fastapi_sse_revoke_') as raw:
+            database = Database(
+                f"sqlite+aiosqlite:///{(Path(raw) / 'api.sqlite3').as_posix()}"
+            )
+            asyncio.run(database.init_schema())
+            asyncio.run(database.create_project(
+                'revocation-project',
+                'Revocation project',
+                None,
+                'alice',
+                '2026-09-20T00:00:00+00:00',
+            ))
+            asyncio.run(database.upsert_project_member(
+                'revocation-project',
+                'bob',
+                'viewer',
+                '2026-09-20T00:00:00+00:00',
+            ))
+            asyncio.run(database.stage_job({
+                'job_id': 'revocation-job',
+                'tool': 'research_catalog',
+                'status': 'running',
+                'created_at': '2026-09-20T00:00:00+00:00',
+                '_arguments': {},
+            }, project_id='revocation-project'))
+            original_get_member = database.get_project_member
+            membership_checks = 0
+
+            async def get_member_then_revoke(project_id, subject):
+                nonlocal membership_checks
+                membership_checks += 1
+                if membership_checks > 1:
+                    return None
+                return await original_get_member(project_id, subject)
+
+            database.get_project_member = get_member_then_revoke
+            with patch.dict(os.environ, {
+                'CADD_API_TOKEN': '',
+                'CADD_JWT_SECRET': 'test-secret-' * 4,
+                'CADD_AUTH_USERS_JSON': json.dumps(users),
+            }, clear=False):
+                app = create_app(
+                    job_manager=RedisRevocationJobManager(),
+                    plugin_manager=PluginManager(
+                        state_path=Path(raw) / 'plugins.json'
+                    ),
+                    database=database,
+                    audit_log=AuditLogger(Path(raw) / 'audit.jsonl'),
+                )
+                try:
+                    with TestClient(app) as client:
+                        token_response = client.post('/api/v1/auth/token', data={
+                            'username': 'bob',
+                            'password': 'bob-secret',
+                        })
+                        headers = {
+                            'Authorization': (
+                                f"Bearer {token_response.json()['access_token']}"
+                            )
+                        }
+                        with client.stream(
+                            'GET',
+                            '/api/v1/jobs/revocation-job/events?timeout_seconds=3',
+                            headers=headers,
+                        ) as events:
+                            body = ''.join(events.iter_text())
+                    self.assertEqual(events.status_code, 200)
+                    self.assertIn('event: access_revoked', body)
+                    self.assertIn('"status": "access_revoked"', body)
+                    self.assertGreaterEqual(membership_checks, 2)
+                finally:
+                    self._close_app(app)
+
     def test_token_protects_api_but_not_health(self):
         with tempfile.TemporaryDirectory(prefix='fastapi_auth_') as raw:
             with patch.dict(os.environ, {'CADD_API_TOKEN': 'test-token'}, clear=False):
@@ -436,6 +898,159 @@ class FastApiAppTests(unittest.TestCase):
                         self.assertEqual(client.get('/health').status_code, 200)
                         self.assertEqual(client.get('/api/v1/plugins').status_code, 401)
                         self.assertEqual(client.get('/api/v1/plugins', headers={'Authorization': 'Bearer test-token'}).status_code, 200)
+                finally:
+                    self._close_app(app)
+
+    def test_metrics_scrape_token_is_limited_to_metrics_endpoint(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_metrics_auth_') as raw:
+            token_path = Path(raw) / 'metrics-token'
+            token_path.write_text('metrics-secret-' * 3, encoding='utf-8')
+            with patch.dict(os.environ, {
+                'APP_ENV': 'development',
+                'CADD_API_TOKEN': '',
+                'CADD_JWT_SECRET': 'test-metrics-jwt-secret-' * 2,
+                'CADD_AUTH_USERS_JSON': '{}',
+                'METRICS_SCRAPE_TOKEN': '',
+                'METRICS_SCRAPE_TOKEN_FILE': str(token_path),
+            }, clear=False):
+                app = self._app(raw)
+                headers = {
+                    'Authorization': f"Bearer {'metrics-secret-' * 3}",
+                }
+                try:
+                    with TestClient(app) as client:
+                        response = client.get('/metrics', headers=headers)
+                        self.assertEqual(response.status_code, 200)
+                        self.assertIn(
+                            'bio_agent_storage_deletion_backlog',
+                            response.text,
+                        )
+                        self.assertEqual(
+                            client.get('/api/v1/plugins', headers=headers).status_code,
+                            401,
+                        )
+                        self.assertEqual(client.get('/metrics').status_code, 401)
+                finally:
+                    self._close_app(app)
+
+    def test_logout_and_admin_subject_revocation_invalidate_tokens(self):
+        users = {
+            'alice': {'password': 'alice-secret', 'roles': ['researcher']},
+            'admin': {'password': 'admin-secret', 'roles': ['admin']},
+        }
+        with tempfile.TemporaryDirectory(prefix='fastapi_session_revoke_') as raw:
+            with patch.dict(os.environ, {
+                'CADD_API_TOKEN': '',
+                'CADD_JWT_SECRET': 'test-session-secret-' * 2,
+                'CADD_AUTH_USERS_JSON': json.dumps(users),
+            }, clear=False):
+                app = self._app(raw)
+                try:
+                    with TestClient(app) as client:
+                        alice = client.post('/api/v1/auth/token', data={
+                            'username': 'alice',
+                            'password': 'alice-secret',
+                        }).json()['access_token']
+                        alice_headers = {'Authorization': f'Bearer {alice}'}
+                        self.assertEqual(
+                            client.get('/api/v1/plugins', headers=alice_headers).status_code,
+                            200,
+                        )
+                        self.assertEqual(
+                            client.post('/api/v1/auth/logout', headers=alice_headers).status_code,
+                            204,
+                        )
+                        self.assertEqual(
+                            client.get('/api/v1/plugins', headers=alice_headers).status_code,
+                            401,
+                        )
+                        alice = client.post('/api/v1/auth/token', data={
+                            'username': 'alice',
+                            'password': 'alice-secret',
+                        }).json()['access_token']
+                        admin = client.post('/api/v1/auth/token', data={
+                            'username': 'admin',
+                            'password': 'admin-secret',
+                        }).json()['access_token']
+                        revoke = client.post(
+                            '/api/v1/auth/subjects/alice/revoke',
+                            json={'disabled': True},
+                            headers={'Authorization': f'Bearer {admin}'},
+                        )
+                        self.assertEqual(revoke.status_code, 200)
+                        self.assertEqual(
+                            client.get(
+                                '/api/v1/plugins',
+                                headers={'Authorization': f'Bearer {alice}'},
+                            ).status_code,
+                            401,
+                        )
+                        self.assertEqual(
+                            client.post('/api/v1/auth/token', data={
+                                'username': 'alice',
+                                'password': 'alice-secret',
+                            }).status_code,
+                            401,
+                        )
+                finally:
+                    self._close_app(app)
+
+    def test_browser_session_uses_httponly_cookie_and_requires_csrf(self):
+        users = {
+            'alice': {'password': 'alice-secret', 'roles': ['researcher']},
+        }
+        with tempfile.TemporaryDirectory(prefix='fastapi_browser_session_') as raw:
+            with patch.dict(os.environ, {
+                'CADD_API_TOKEN': '',
+                'CADD_JWT_SECRET': 'test-browser-session-secret-' * 2,
+                'CADD_AUTH_USERS_JSON': json.dumps(users),
+            }, clear=False):
+                app = self._app(raw)
+                try:
+                    with TestClient(app) as client:
+                        token_response = client.post('/api/v1/auth/token', data={
+                            'username': 'alice',
+                            'password': 'alice-secret',
+                        })
+                        self.assertEqual(token_response.headers['cache-control'], 'no-store')
+                        self.assertEqual(token_response.headers['pragma'], 'no-cache')
+                        token = token_response.json()['access_token']
+                        exchange = client.post(
+                            '/api/v1/auth/session',
+                            headers={'Authorization': f'Bearer {token}'},
+                        )
+                        self.assertEqual(exchange.status_code, 200)
+                        self.assertEqual(exchange.headers['cache-control'], 'no-store')
+                        self.assertEqual(exchange.headers['pragma'], 'no-cache')
+                        self.assertIn('HttpOnly', exchange.headers['set-cookie'])
+                        self.assertIn('SameSite=strict', exchange.headers['set-cookie'])
+                        self.assertEqual(
+                            client.get('/api/v1/plugins').status_code,
+                            200,
+                        )
+                        self.assertEqual(
+                            client.post(
+                                '/api/v1/projects',
+                                json={'name': 'CSRF denied'},
+                            ).status_code,
+                            403,
+                        )
+                        csrf_token = client.cookies.get('bioagent_csrf')
+                        created = client.post(
+                            '/api/v1/projects',
+                            json={'name': 'CSRF accepted'},
+                            headers={'X-CSRF-Token': csrf_token},
+                        )
+                        self.assertEqual(created.status_code, 201)
+                        logout = client.post(
+                            '/api/v1/auth/logout',
+                            headers={'X-CSRF-Token': csrf_token},
+                        )
+                        self.assertEqual(logout.status_code, 204)
+                        self.assertEqual(
+                            client.get('/api/v1/plugins').status_code,
+                            401,
+                        )
                 finally:
                     self._close_app(app)
 
@@ -460,6 +1075,18 @@ class FastApiAppTests(unittest.TestCase):
                         self.assertEqual(
                             response.headers.get('access-control-allow-origin'),
                             'http://127.0.0.1:5173',
+                        )
+                        self.assertEqual(
+                            response.headers.get('access-control-allow-credentials'),
+                            'true',
+                        )
+                        self.assertEqual(
+                            response.headers.get('x-content-type-options'),
+                            'nosniff',
+                        )
+                        self.assertEqual(
+                            response.headers.get('x-frame-options'),
+                            'DENY',
                         )
                 finally:
                     self._close_app(app)
@@ -616,6 +1243,29 @@ class FastApiAppTests(unittest.TestCase):
                         alice_headers = {'Authorization': f'Bearer {alice_token}'}
                         self.assertEqual(client.get('/api/v1/plugins', headers=alice_headers).status_code, 200)
                         self.assertEqual(
+                            client.post(
+                                '/api/v1/jobs',
+                                json={'tool': 'research_catalog', 'arguments': {}},
+                                headers=alice_headers,
+                            ).status_code,
+                            422,
+                        )
+                        self.assertEqual(
+                            client.post(
+                                '/api/v1/files',
+                                files={'upload': ('notes.txt', b'notes', 'text/plain')},
+                                headers=alice_headers,
+                            ).status_code,
+                            422,
+                        )
+                        self.assertEqual(
+                            client.get(
+                                f'/api/v1/files/{"a" * 32}',
+                                headers=alice_headers,
+                            ).status_code,
+                            403,
+                        )
+                        self.assertEqual(
                             client.post('/api/v1/plugins/cadd/state', json={'enabled': False}, headers=alice_headers).status_code,
                             403,
                         )
@@ -661,6 +1311,88 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(second.status_code, 202)
                     self.assertEqual(first.json()['job']['job_id'], second.json()['job']['job_id'])
                     self.assertEqual(second.json()['status'], 'deduplicated')
+            finally:
+                self._close_app(app)
+
+    def test_idempotency_key_is_scoped_to_project(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_idempotency_scope_') as raw:
+            app = self._app(raw)
+            try:
+                with TestClient(app) as client:
+                    project_ids = [
+                        client.post('/api/v1/projects', json={'name': name})
+                        .json()['project']['project_id']
+                        for name in ('Project A', 'Project B')
+                    ]
+                    responses = [
+                        client.post(
+                            '/api/v1/jobs',
+                            json={
+                                'tool': 'research_catalog',
+                                'arguments': {},
+                                'project_id': project_id,
+                            },
+                            headers={'Idempotency-Key': 'shared-key'},
+                        )
+                        for project_id in project_ids
+                    ]
+                self.assertTrue(all(item.status_code == 202 for item in responses))
+                self.assertNotEqual(
+                    responses[0].json()['job']['job_id'],
+                    responses[1].json()['job']['job_id'],
+                )
+            finally:
+                self._close_app(app)
+
+    def test_production_requires_project_for_admin_submissions(self):
+        settings = PlatformSettings.from_env({
+            'APP_ENV': 'production',
+            'PUBLIC_BASE_URL': 'https://testserver',
+            'CORS_ORIGINS': 'https://testserver',
+            'TRUSTED_PROXY_CIDRS': '127.0.0.1/32',
+            'JOB_BACKEND': 'redis',
+            'STORAGE_BACKEND': 's3',
+            'S3_BUCKET': 'test-bucket',
+            'DATABASE_ROLE': 'api',
+        })
+        with tempfile.TemporaryDirectory(prefix='fastapi_project_required_') as raw, patch(
+            'src.api_runtime.AuthService.from_env',
+            return_value=AuthService(),
+        ):
+            app = create_app(
+                job_manager=JobManager(
+                    max_workers=1,
+                    store_path=Path(raw) / 'jobs.sqlite3',
+                ),
+                plugin_manager=PluginManager(
+                    state_path=Path(raw) / 'plugins.json',
+                ),
+                database=Database(
+                    f"sqlite+aiosqlite:///{(Path(raw) / 'api.sqlite3').as_posix()}"
+                ),
+                file_storage=LocalFileStorage(Path(raw) / 'uploads'),
+                audit_log=AuditLogger(Path(raw) / 'audit.jsonl'),
+                settings=settings,
+            )
+            try:
+                with TestClient(app) as client:
+                    self.assertEqual(client.get('/health').status_code, 200)
+                    self.assertEqual(client.get('/docs').status_code, 404)
+                    self.assertEqual(client.get('/openapi.json').status_code, 404)
+                    self.assertEqual(
+                        client.get('/health', headers={'Host': 'evil.example'}).status_code,
+                        400,
+                    )
+                    job = client.post('/api/v1/jobs', json={
+                        'tool': 'research_catalog',
+                        'arguments': {},
+                    })
+                    upload = client.post(
+                        '/api/v1/files',
+                        files={'upload': ('notes.txt', b'notes', 'text/plain')},
+                    )
+                self.assertEqual(job.status_code, 422)
+                self.assertEqual(upload.status_code, 422)
             finally:
                 self._close_app(app)
 
@@ -729,6 +1461,82 @@ class FastApiAppTests(unittest.TestCase):
                     child = retried.json()['job']
                     self.assertEqual(child['retry_of'], job_id)
                     self.assertEqual(child['tool'], 'research_catalog')
+            finally:
+                self._close_app(app)
+
+    def test_required_artifact_argument_is_rejected_before_queueing(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_artifact_contract_') as raw:
+            app = self._app(raw)
+            try:
+                with TestClient(app) as client:
+                    response = client.post(
+                        '/api/v1/jobs',
+                        json={'tool': 'cadd_run_screening', 'arguments': {}},
+                    )
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn('artifact argument is required: out', response.json()['detail'])
+                    self.assertEqual(
+                        client.get('/api/v1/jobs').json()['jobs'],
+                        [],
+                    )
+            finally:
+                self._close_app(app)
+
+    def test_indeterminate_job_requires_resolution_before_retry(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_resolution_') as raw:
+            app = self._app(raw)
+            try:
+                with TestClient(app) as client:
+                    submitted = client.post(
+                        '/api/v1/jobs',
+                        json={'tool': 'research_catalog', 'arguments': {}},
+                    ).json()['job']
+                    self._wait_for_job(client, submitted['job_id'])
+                    manager = app.state.job_manager
+                    with manager._lock:
+                        record = manager._jobs[submitted['job_id']]
+                        record['status'] = 'indeterminate'
+                        record['error'] = 'commit outcome is unknown'
+                        record['indeterminate'] = {'requires_manual_review': True}
+                        record.pop('resolution', None)
+                        manager._persist(record)
+
+                    rejected = client.post(
+                        f"/api/v1/jobs/{submitted['job_id']}/retry"
+                    )
+                    self.assertEqual(rejected.status_code, 400)
+                    self.assertIn('approve_retry', rejected.json()['detail'])
+
+                    resolved = client.post(
+                        f"/api/v1/jobs/{submitted['job_id']}/resolve",
+                        json={
+                            'decision': 'approve_retry',
+                            'reason': 'external system confirms no result was committed',
+                            'evidence': {'ticket': 'INC-42'},
+                        },
+                    )
+                    self.assertEqual(resolved.status_code, 200)
+                    source = resolved.json()['job']
+                    self.assertEqual(source['resolution']['decision'], 'approve_retry')
+                    self.assertEqual(source['resolution']['reviewer'], 'local-dev')
+
+                    duplicate = client.post(
+                        f"/api/v1/jobs/{submitted['job_id']}/resolve",
+                        json={
+                            'decision': 'approve_retry',
+                            'reason': 'attempt to approve twice',
+                        },
+                    )
+                    self.assertEqual(duplicate.status_code, 409)
+
+                    retried = client.post(
+                        f"/api/v1/jobs/{submitted['job_id']}/retry"
+                    )
+                    self.assertEqual(retried.status_code, 202)
+                    self.assertEqual(
+                        retried.json()['job']['retry_of'],
+                        submitted['job_id'],
+                    )
             finally:
                 self._close_app(app)
 
@@ -812,6 +1620,30 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertEqual(downloaded.content, content)
                     self.assertEqual(downloaded.headers['x-file-sha256'], uploaded['sha256'])
                     self.assertIn('expression.csv', downloaded.headers['content-disposition'])
+            finally:
+                self._close_app(app)
+
+    def test_file_upload_is_discarded_when_ownership_commit_fails(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_file_ownership_') as raw:
+            upload_root = Path(raw) / 'uploads'
+            storage = LocalFileStorage(upload_root)
+            app = self._app(raw, storage)
+            try:
+                with TestClient(app) as client:
+                    project_id = client.post(
+                        '/api/v1/projects',
+                        json={'name': 'Ownership failure'},
+                    ).json()['project']['project_id']
+                    app.state.database.activate_file_upload = AsyncMock(
+                        side_effect=RuntimeError('database unavailable')
+                    )
+                    response = client.post(
+                        '/api/v1/files',
+                        data={'project_id': project_id},
+                        files={'upload': ('notes.txt', b'notes', 'text/plain')},
+                    )
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(list(upload_root.iterdir()), [])
             finally:
                 self._close_app(app)
 
@@ -916,6 +1748,16 @@ class FastApiAppTests(unittest.TestCase):
                             break
                         time.sleep(0.05)
                     manager._jobs[job['job_id']]['result'] = {'report_path': str(artifact)}
+                    durable_artifact = {
+                        'artifact_id': 'a' * 32,
+                        'filename': artifact.name,
+                        'content_type': 'text/markdown',
+                        'size_bytes': artifact.stat().st_size,
+                        'sha256': hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                        'storage_backend': 'local',
+                        'path': str(artifact),
+                    }
+                    manager._jobs[job['job_id']]['artifacts'] = [durable_artifact]
                     manager._persist(manager._jobs[job['job_id']])
                     with TestClient(app) as client:
                         downloaded = client.get(
@@ -925,6 +1767,64 @@ class FastApiAppTests(unittest.TestCase):
                         self.assertEqual(downloaded.status_code, 200)
                         self.assertEqual(downloaded.text, '# report\n')
                         self.assertEqual(downloaded.headers['x-job-id'], job['job_id'])
+                        self.assertIn(
+                            'attachment',
+                            downloaded.headers['content-disposition'].lower(),
+                        )
+                        self.assertEqual(
+                            downloaded.headers['content-security-policy'],
+                            "sandbox; default-src 'none'",
+                        )
+                        self.assertEqual(downloaded.headers['deprecation'], 'true')
+                        self._persist_artifact(
+                            app,
+                            manager._jobs[job['job_id']],
+                            durable_artifact,
+                            status='uploaded',
+                        )
+                        uncommitted = client.get(
+                            f"/api/v1/jobs/{job['job_id']}/artifacts/{'a' * 32}",
+                        )
+                        self.assertEqual(uncommitted.status_code, 404)
+                        visible_uncommitted = client.get(
+                            f"/api/v1/jobs/{job['job_id']}"
+                        ).json()['job']['artifacts']
+                        self.assertEqual(visible_uncommitted, [])
+                        self._persist_artifact(
+                            app,
+                            manager._jobs[job['job_id']],
+                            durable_artifact,
+                        )
+                        visible_committed = client.get(
+                            f"/api/v1/jobs/{job['job_id']}"
+                        ).json()['job']['artifacts']
+                        self.assertEqual(
+                            visible_committed[0]['status'],
+                            'committed',
+                        )
+                        published = client.get(
+                            f"/api/v1/jobs/{job['job_id']}/artifacts/{'a' * 32}",
+                        )
+                        self.assertEqual(published.status_code, 200)
+                        self.assertEqual(published.text, '# report\n')
+                        self.assertEqual(
+                            published.headers['x-artifact-sha256'],
+                            hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                        )
+                        artifact.write_text('tampered\n', encoding='utf-8')
+                        tampered = client.get(
+                            f"/api/v1/jobs/{job['job_id']}/artifacts/{'a' * 32}",
+                        )
+                        self.assertEqual(tampered.status_code, 502)
+                        deletion = client.delete(
+                            f"/api/v1/jobs/{job['job_id']}/artifacts/{'a' * 32}",
+                        )
+                        self.assertEqual(deletion.status_code, 202)
+                        hidden_legacy = client.get(
+                            f"/api/v1/jobs/{job['job_id']}/artifacts",
+                            params={'path': str(artifact)},
+                        )
+                        self.assertEqual(hidden_legacy.status_code, 404)
                         forbidden = client.get(
                             f"/api/v1/jobs/{job['job_id']}/artifacts",
                             params={'path': str(outside)},
@@ -932,6 +1832,219 @@ class FastApiAppTests(unittest.TestCase):
                         self.assertEqual(forbidden.status_code, 404)
                 finally:
                     self._close_app(app)
+
+    def test_file_and_artifact_deletion_requests_are_hidden_and_idempotent(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_delete_storage_') as raw:
+            output_root = Path(raw) / 'output'
+            output_root.mkdir()
+            artifact_path = output_root / 'result.json'
+            artifact_path.write_text('{"status":"ok"}\n', encoding='utf-8')
+            audit_path = Path(raw) / 'audit.jsonl'
+            with patch.object(fastapi_module, 'OUTPUT_ROOT', output_root):
+                app = self._app(raw, audit_log=AuditLogger(audit_path))
+                try:
+                    with TestClient(app) as client:
+                        manager = app.state.job_manager
+                        submitted = manager.submit('research_catalog', {})
+                        for _ in range(100):
+                            record = manager.get(submitted['job_id'])
+                            if record['status'] == 'completed':
+                                break
+                            time.sleep(0.05)
+                        artifact = {
+                            'artifact_id': '7' * 32,
+                            'filename': artifact_path.name,
+                            'content_type': 'application/json',
+                            'size_bytes': artifact_path.stat().st_size,
+                            'sha256': hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
+                            'storage_backend': 'local',
+                            'path': str(artifact_path),
+                        }
+                        self._persist_artifact(
+                            app,
+                            manager._jobs[submitted['job_id']],
+                            artifact,
+                        )
+                        upload = client.post(
+                            '/api/v1/files',
+                            files={'upload': ('input.csv', b'value\n1\n', 'text/csv')},
+                        )
+                        self.assertEqual(upload.status_code, 201)
+                        file_id = upload.json()['file']['file_id']
+                        headers = {'Idempotency-Key': 'delete-once'}
+                        deleted_file = client.delete(
+                            f'/api/v1/files/{file_id}',
+                            headers=headers,
+                        )
+                        self.assertEqual(deleted_file.status_code, 202)
+                        repeated_file = client.delete(
+                            f'/api/v1/files/{file_id}',
+                            headers=headers,
+                        )
+                        self.assertEqual(repeated_file.status_code, 202)
+                        self.assertEqual(
+                            deleted_file.json()['file']['delete_request_id'],
+                            repeated_file.json()['file']['delete_request_id'],
+                        )
+                        self.assertEqual(
+                            client.get(f'/api/v1/files/{file_id}').status_code,
+                            404,
+                        )
+                        file_status = client.get(
+                            f'/api/v1/files/{file_id}/deletion'
+                        )
+                        self.assertEqual(file_status.status_code, 200)
+                        self.assertEqual(
+                            [event['status'] for event in file_status.json()['events']],
+                            ['delete_requested'],
+                        )
+                        self.assertEqual(
+                            client.post(
+                                f'/api/v1/files/{file_id}/deletion/retry',
+                                headers=headers,
+                            ).status_code,
+                            409,
+                        )
+                        deleted_artifact = client.delete(
+                            f"/api/v1/jobs/{submitted['job_id']}/artifacts/{'7' * 32}",
+                            headers=headers,
+                        )
+                        self.assertEqual(deleted_artifact.status_code, 202)
+                        self.assertEqual(
+                            deleted_artifact.json()['artifact']['status'],
+                            'delete_requested',
+                        )
+                        self.assertEqual(
+                            client.get(
+                                f"/api/v1/jobs/{submitted['job_id']}/artifacts/{'7' * 32}"
+                            ).status_code,
+                            404,
+                        )
+                        artifact_status = client.get(
+                            f"/api/v1/jobs/{submitted['job_id']}/artifacts/{'7' * 32}/deletion"
+                        )
+                        self.assertEqual(artifact_status.status_code, 200)
+                        self.assertEqual(
+                            artifact_status.json()['events'][0]['status'],
+                            'delete_requested',
+                        )
+                    actions = {
+                        json.loads(line)['action']
+                        for line in audit_path.read_text(encoding='utf-8').splitlines()
+                    }
+                    self.assertIn('file.delete_requested', actions)
+                    self.assertIn('job.artifact_delete_requested', actions)
+                finally:
+                    self._close_app(app)
+
+    def test_legacy_path_artifact_download_can_be_disabled(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_legacy_artifact_') as raw:
+            output_root = Path(raw) / 'output'
+            output_root.mkdir()
+            artifact = output_root / 'legacy.txt'
+            artifact.write_text('legacy\n', encoding='utf-8')
+            settings = PlatformSettings.from_env({
+                'ALLOW_LEGACY_ARTIFACT_PATHS': 'false',
+            })
+            with patch.object(fastapi_module, 'OUTPUT_ROOT', output_root):
+                app = self._app(raw, settings=settings)
+                try:
+                    manager = app.state.job_manager
+                    job = manager.submit('research_catalog', {})
+                    for _ in range(100):
+                        if manager.get(job['job_id'])['status'] == 'completed':
+                            break
+                        time.sleep(0.05)
+                    manager._jobs[job['job_id']]['result'] = {
+                        'report_path': str(artifact),
+                    }
+                    manager._persist(manager._jobs[job['job_id']])
+                    with TestClient(app) as client:
+                        response = client.get(
+                            f"/api/v1/jobs/{job['job_id']}/artifacts",
+                            params={'path': str(artifact)},
+                        )
+                    self.assertEqual(response.status_code, 410)
+                    self.assertIn('artifact_id', response.json()['detail'])
+                finally:
+                    self._close_app(app)
+
+    def test_version_locked_s3_job_artifact_download(self):
+        class S3Client:
+            def __init__(self, body, sha256):
+                self.body = body
+                self.sha256 = sha256
+                self.requests = []
+
+            def get_object(self, **request):
+                self.requests.append(request)
+                return {
+                    'Body': BytesIO(self.body),
+                    'ContentLength': len(self.body),
+                    'Metadata': {'sha256': self.sha256},
+                    'VersionId': 'version-7',
+                }
+
+        class S3Storage:
+            backend = 's3'
+            bucket = 'research-results'
+            prefix = 'bio-agent'
+            expected_bucket_owner = '123456789012'
+
+            def __init__(self, client):
+                self.client = client
+
+        with tempfile.TemporaryDirectory(prefix='fastapi_s3_artifact_') as raw:
+            body = b'{"status":"ok"}\n'
+            sha256 = hashlib.sha256(body).hexdigest()
+            s3_client = S3Client(body, sha256)
+            app = self._app(raw, file_storage=S3Storage(s3_client))
+            try:
+                manager = app.state.job_manager
+                job = manager.submit('research_catalog', {})
+                for _ in range(100):
+                    if manager.get(job['job_id'])['status'] == 'completed':
+                        break
+                    time.sleep(0.05)
+                durable_artifact = {
+                    'artifact_id': 'b' * 32,
+                    'filename': 'result.json',
+                    'content_type': 'application/json',
+                    'size_bytes': len(body),
+                    'sha256': sha256,
+                    'storage_backend': 's3',
+                    'storage_key': 'bio-agent/artifacts/project/job/result.json',
+                    'version_id': 'version-7',
+                    'reference': S3ObjectReference(
+                        'research-results',
+                        'bio-agent/artifacts/project/job/result.json',
+                        'version-7',
+                        sha256,
+                        len(body),
+                    ).serialize(),
+                }
+                manager._jobs[job['job_id']]['artifacts'] = [durable_artifact]
+                manager._persist(manager._jobs[job['job_id']])
+                with TestClient(app) as client:
+                    self._persist_artifact(
+                        app,
+                        manager._jobs[job['job_id']],
+                        durable_artifact,
+                    )
+                    response = client.get(
+                        f"/api/v1/jobs/{job['job_id']}/artifacts/{'b' * 32}",
+                    )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.content, body)
+                self.assertEqual(response.headers['x-artifact-sha256'], sha256)
+                self.assertEqual(s3_client.requests, [{
+                    'Bucket': 'research-results',
+                    'Key': 'bio-agent/artifacts/project/job/result.json',
+                    'VersionId': 'version-7',
+                    'ExpectedBucketOwner': '123456789012',
+                }])
+            finally:
+                self._close_app(app)
 
 
 if __name__ == '__main__':

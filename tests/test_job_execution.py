@@ -17,6 +17,7 @@ from src.job_execution import (
     ProcessToolExecutor,
     build_tool_executor_from_env,
     job_max_workers_from_env,
+    public_execution_failure,
 )
 from src.job_manager import JobManager
 from src.observability import bind_context
@@ -45,6 +46,18 @@ Path(sys.argv[2]).write_text(json.dumps({'ok': True, 'result': result}), encodin
 
 
 class JobExecutionTests(unittest.TestCase):
+    def test_public_execution_failure_hides_internal_details(self):
+        failure = public_execution_failure(
+            RuntimeError('token=secret-value /srv/private/input.fastq')
+        )
+        self.assertEqual(failure, {
+            'status': 'error',
+            'error_code': 'execution_failed',
+            'error': 'job execution failed',
+        })
+        self.assertNotIn('secret-value', str(failure))
+        self.assertNotIn('/srv/private', str(failure))
+
     def _executor(self, root, **overrides):
         runner = Path(root) / 'helper.py'
         runner.write_text(HELPER, encoding='utf-8')

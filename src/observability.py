@@ -360,3 +360,18 @@ FILE_UPLOAD_BYTES = Counter(
     'Total bytes accepted by the file storage layer.',
     ['backend'],
 )
+STORAGE_DELETION_BACKLOG = Gauge(
+    'bio_agent_storage_deletion_backlog',
+    'Current durable deletion backlog by resource type and lifecycle status.',
+    ['resource_type', 'status'],
+)
+STORAGE_DELETION_OLDEST_AGE = Gauge(
+    'bio_agent_storage_deletion_oldest_age_seconds',
+    'Age of the oldest durable deletion request by resource type and status.',
+    ['resource_type', 'status'],
+)
+STORAGE_DELETION_EVENTS = Gauge(
+    'bio_agent_storage_deletion_event_count',
+    'Durable deletion retry and dead-letter events recorded in PostgreSQL.',
+    ['resource_type', 'status'],
+)

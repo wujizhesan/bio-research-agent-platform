@@ -41,6 +41,29 @@ class DrainManager:
 
 
 class WorkerDrainTests(unittest.TestCase):
+    def test_backpressure_pauses_claiming_new_jobs(self):
+        class PausedStateStore:
+            @staticmethod
+            def admission():
+                return {'accepting_work': False}
+
+        manager = DrainManager(block=True)
+        manager.state_store = PausedStateStore()
+        stop_event = threading.Event()
+        runtime = RedisJobWorkerRuntime(manager)
+        runtime.next_job = manager._next_job
+        thread = threading.Thread(target=lambda: runtime.run_forever(
+            poll_timeout=0.01,
+            stop_event=stop_event,
+            drain_timeout_seconds=1,
+        ))
+        thread.start()
+        time.sleep(0.05)
+        stop_event.set()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(manager.next_calls, 0)
+
     def test_pre_stopped_worker_claims_no_jobs(self):
         manager = DrainManager()
         stop_event = threading.Event()

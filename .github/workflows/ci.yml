@@ -44,6 +44,8 @@ jobs:
           uv sync --locked --all-extras
       - name: Enforce expand-contract migrations
         run: uv run python scripts/check_expand_contract_migrations.py
+      - name: Validate typed deployment settings
+        run: uv run python scripts/check_settings_consistency.py
       - name: Run unit tests
         run: |
           uv run coverage run --source=src -m pytest -q --ignore=tests/integration
@@ -58,8 +60,36 @@ jobs:
       - name: Validate Compose configuration
         run: |
           docker compose config --quiet
-          PLUGIN_SANDBOX_TOKEN=ci-plugin-sandbox-token-0000000000000000 \
-            docker compose -f docker-compose.yml -f docker-compose.secure.yml config --quiet
+          secret_file=$(mktemp)
+          metrics_file=$(mktemp)
+          webhook_file=$(mktemp)
+          trap 'rm -f "$secret_file" "$metrics_file" "$webhook_file"' EXIT
+          printf '%s' 'ci-plugin-sandbox-token-0000000000000000' > "$secret_file"
+          printf '%s' 'ci-metrics-scrape-token-0000000000000000' > "$metrics_file"
+          printf '%s' 'https://alerts.example.invalid/bioagent' > "$webhook_file"
+          PLUGIN_SANDBOX_TOKEN_FILE="$secret_file" docker compose -f docker-compose.yml -f docker-compose.secure.yml config --quiet
+          METRICS_SCRAPE_TOKEN_SECRET_FILE="$metrics_file" ALERTMANAGER_WEBHOOK_URL_SECRET_FILE="$webhook_file" docker compose --profile monitoring config --quiet
+      - name: Validate monitoring configuration and alert behavior
+        run: |
+          metrics_file=$(mktemp)
+          webhook_file=$(mktemp)
+          trap 'rm -f "$metrics_file" "$webhook_file"' EXIT
+          printf '%s' 'ci-metrics-scrape-token-0000000000000000' > "$metrics_file"
+          printf '%s' 'https://alerts.example.invalid/bioagent' > "$webhook_file"
+          docker run --rm --entrypoint /bin/promtool \
+            -v "$PWD/monitoring:/etc/prometheus:ro" \
+            -v "$metrics_file:/run/secrets/metrics_scrape_token:ro" \
+            prom/prometheus@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0 \
+            check config /etc/prometheus/prometheus.yml
+          docker run --rm --entrypoint /bin/promtool \
+            -v "$PWD/monitoring:/etc/prometheus:ro" \
+            prom/prometheus@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0 \
+            test rules /etc/prometheus/storage-deletion-alerts.test.yml
+          docker run --rm --entrypoint /bin/amtool \
+            -v "$PWD/monitoring:/etc/alertmanager:ro" \
+            -v "$webhook_file:/run/secrets/alertmanager_webhook_url:ro" \
+            prom/alertmanager@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a \
+            check-config /etc/alertmanager/alertmanager.yml
 
   services:
     name: PostgreSQL, Redis and migrations
@@ -67,7 +97,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+        image: postgres:16.15-alpine3.24@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
         env:
           POSTGRES_DB: bioagent_ci
           POSTGRES_USER: bioagent
@@ -80,7 +110,7 @@ jobs:
           --health-timeout 5s
           --health-retries 20
       redis:
-        image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+        image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
         ports:
           - 6379:6379
         options: >-
@@ -93,9 +123,14 @@ jobs:
       AUTO_CREATE_SCHEMA: 'false'
       RUN_EXTERNAL_SERVICE_TESTS: '1'
       DATABASE_URL: postgresql+asyncpg://bioagent:bioagent-ci-password@127.0.0.1:5432/bioagent_ci
+      API_DATABASE_URL: postgresql+asyncpg://bioagent_api_ci:bioagent-api-ci-password@127.0.0.1:5432/bioagent_ci
+      DISPATCHER_DATABASE_URL: postgresql+asyncpg://bioagent_dispatcher_ci:bioagent-dispatcher-ci-password@127.0.0.1:5432/bioagent_ci
+      WORKER_DATABASE_URL: postgresql+asyncpg://bioagent_worker_ci:bioagent-worker-ci-password@127.0.0.1:5432/bioagent_ci
+      MAINTENANCE_DATABASE_URL: postgresql+asyncpg://bioagent_maintenance_ci:bioagent-maintenance-ci-password@127.0.0.1:5432/bioagent_ci
       REDIS_URL: redis://127.0.0.1:6379/0
       REDIS_NAMESPACE: bioagent-fullstack-${{ github.run_id }}
       CI_LEGACY_JOB_ID: ci-legacy-before-run-context
+      RLS_CONTEXT_SIGNING_KEY: ci-rls-context-signing-key-at-least-32-characters
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -123,6 +158,40 @@ jobs:
                   os.environ['DATABASE_URL'].replace('postgresql+asyncpg://', 'postgresql://')
               )
               try:
+                  await connection.execute('''
+                  DO $roles$
+                  BEGIN
+                      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bioagent_api') THEN
+                          CREATE ROLE bioagent_api NOLOGIN;
+                      END IF;
+                      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bioagent_worker') THEN
+                          CREATE ROLE bioagent_worker NOLOGIN;
+                      END IF;
+                      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bioagent_dispatcher') THEN
+                          CREATE ROLE bioagent_dispatcher NOLOGIN;
+                      END IF;
+                      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bioagent_maintenance') THEN
+                          CREATE ROLE bioagent_maintenance NOLOGIN;
+                      END IF;
+                      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bioagent_api_ci') THEN
+                          CREATE ROLE bioagent_api_ci LOGIN PASSWORD 'bioagent-api-ci-password';
+                      END IF;
+                      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bioagent_worker_ci') THEN
+                          CREATE ROLE bioagent_worker_ci LOGIN PASSWORD 'bioagent-worker-ci-password';
+                      END IF;
+                      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bioagent_dispatcher_ci') THEN
+                          CREATE ROLE bioagent_dispatcher_ci LOGIN PASSWORD 'bioagent-dispatcher-ci-password';
+                      END IF;
+                      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bioagent_maintenance_ci') THEN
+                          CREATE ROLE bioagent_maintenance_ci LOGIN PASSWORD 'bioagent-maintenance-ci-password';
+                      END IF;
+                      GRANT bioagent_api TO bioagent_api_ci;
+                      GRANT bioagent_dispatcher TO bioagent_dispatcher_ci;
+                      GRANT bioagent_worker TO bioagent_worker_ci;
+                      GRANT bioagent_maintenance TO bioagent_maintenance_ci;
+                  END
+                  $roles$;
+                  ''')
                   await connection.execute(
                       '''
                       INSERT INTO job_records (
@@ -149,6 +218,8 @@ jobs:
           uv run --no-sync python -m alembic upgrade head
           uv run --no-sync python -m alembic current --check-heads
           uv run --no-sync python -m alembic check
+          uv run --no-sync python scripts/verify_database_roles.py
+          uv run --no-sync python scripts/configure_tenant_context.py --enable
       - name: Test real PostgreSQL and Redis
         run: uv run --no-sync python -m pytest tests/integration/test_external_services.py -q
       - name: Set up Node
@@ -167,6 +238,7 @@ jobs:
           APP_ENV: ci
           CADD_API_TOKEN: ''
           CADD_JWT_SECRET: ci-fullstack-jwt-secret-at-least-32-characters
+          RLS_CONTEXT_SIGNING_KEY: ci-rls-context-signing-key-at-least-32-characters
           CORS_ORIGINS: http://127.0.0.1:4173
           JOB_BACKEND: redis
           JOB_EXECUTION_MODE: process
@@ -175,23 +247,38 @@ jobs:
         run: |
           mkdir -p output
           uv run --no-sync python - <<'PY' >> "$GITHUB_ENV"
-          import time
-          import jwt
+          import asyncio
+          import os
+          from src.auth import AuthService, Principal, roles_sha256
+          from src.database import Database
 
-          now = int(time.time())
-          token = jwt.encode({
-              'sub': 'ci-fullstack',
-              'roles': ['admin'],
-              'iat': now,
-              'exp': now + 1800,
-              'iss': 'bio-research-agent',
-          }, 'ci-fullstack-jwt-secret-at-least-32-characters', algorithm='HS256')
-          print(f'VITE_API_TOKEN={token}')
-          print(f'FULLSTACK_API_TOKEN={token}')
+          async def issue():
+              principal = Principal('ci-fullstack', ('admin',), 'jwt')
+              database = Database(os.environ['API_DATABASE_URL'])
+              try:
+                  session = await database.create_auth_session(
+                      principal.subject,
+                      roles_sha256(principal.roles),
+                      1800,
+                  )
+              finally:
+                  await database.close()
+              auth = AuthService(
+                  jwt_secret='ci-fullstack-jwt-secret-at-least-32-characters'
+              )
+              token = auth.issue_token_for_principal(
+                  principal,
+                  session,
+              )['access_token']
+              print(f'FULLSTACK_API_TOKEN={token}')
+
+          asyncio.run(issue())
           PY
-          nohup python -m uvicorn src.fastapi_app:app --host 127.0.0.1 --port 8000 > output/ci-fullstack-api.log 2>&1 &
+          nohup env DATABASE_URL="$API_DATABASE_URL" DATABASE_ROLE=api python -m uvicorn src.fastapi_app:app --host 127.0.0.1 --port 8000 > output/ci-fullstack-api.log 2>&1 &
           echo $! > output/ci-fullstack-api.pid
-          nohup python -m src.worker > output/ci-fullstack-worker.log 2>&1 &
+          nohup env DATABASE_URL="$DISPATCHER_DATABASE_URL" DATABASE_ROLE=dispatcher python -m src.dispatcher > output/ci-fullstack-dispatcher.log 2>&1 &
+          echo $! > output/ci-fullstack-dispatcher.pid
+          nohup env DATABASE_URL="$WORKER_DATABASE_URL" DATABASE_ROLE=worker python -m src.worker > output/ci-fullstack-worker.log 2>&1 &
           echo $! > output/ci-fullstack-worker.pid
           for attempt in {1..30}; do
             if curl --fail --silent http://127.0.0.1:8000/health > output/ci-fullstack-health.json; then
@@ -200,6 +287,7 @@ jobs:
             sleep 1
           done
           cat output/ci-fullstack-api.log
+          cat output/ci-fullstack-dispatcher.log
           cat output/ci-fullstack-worker.log
           exit 1
       - name: Run real full-stack smoke test
@@ -217,6 +305,188 @@ jobs:
             frontend/playwright-report
             frontend/test-results
           if-no-files-found: ignore
+
+  secure-plugin-e2e:
+    name: Secure full-stack container execution
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      COMPOSE_PROJECT_NAME: bioagent-security-${{ github.run_id }}
+      PLUGIN_SANDBOX_TOKEN_FILE: /tmp/bioagent-plugin-sandbox-token-${{ github.run_id }}
+      METRICS_SCRAPE_TOKEN_SECRET_FILE: /tmp/bioagent-metrics-scrape-token-${{ github.run_id }}
+      ALERTMANAGER_WEBHOOK_URL_SECRET_FILE: /tmp/bioagent-alertmanager-webhook-url-${{ github.run_id }}
+      MONITORING_SECRET_GID: '4242'
+      APP_ENV: ci
+      API_PUBLISHED_PORT: '18080'
+      WORKER_METRICS_PUBLISHED_PORT: '19000'
+      POSTGRES_PASSWORD: ci-secure-stack-postgres-password
+      API_DATABASE_URL: postgresql+asyncpg://bioagent_api_secure:ci-api-password@db:5432/bioagent
+      API_DATABASE_ROLE: api
+      DISPATCHER_DATABASE_URL: postgresql+asyncpg://bioagent_dispatcher_secure:ci-dispatcher-password@db:5432/bioagent
+      DISPATCHER_DATABASE_ROLE: dispatcher
+      WORKER_DATABASE_URL: postgresql+asyncpg://bioagent_worker_secure:ci-worker-password@db:5432/bioagent
+      WORKER_DATABASE_ROLE: worker
+      MAINTENANCE_DATABASE_URL: postgresql+asyncpg://bioagent_maintenance_secure:ci-maintenance-password@db:5432/bioagent
+      MAINTENANCE_DATABASE_ROLE: maintenance
+      CADD_JWT_SECRET: ci-secure-stack-jwt-secret-at-least-32-characters
+      RLS_CONTEXT_SIGNING_KEY: ci-secure-stack-rls-context-key-at-least-32-characters
+      CADD_AUTH_USERS_JSON: '{"secure-e2e":{"password":"ci-secure-e2e-password","roles":["admin"]}}'
+      SECURE_E2E_USERNAME: secure-e2e
+      SECURE_E2E_PASSWORD: ci-secure-e2e-password
+      REDIS_NAMESPACE: bioagent-secure-${{ github.run_id }}
+      WORKER_MIN_FREE_DISK_BYTES: '1048576'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Prepare sandbox credential
+        run: |
+          umask 077
+          printf '%s' 'ci-plugin-sandbox-token-0000000000000000' > "$PLUGIN_SANDBOX_TOKEN_FILE"
+          sudo chown 1000:1000 "$PLUGIN_SANDBOX_TOKEN_FILE"
+          sudo chmod 0400 "$PLUGIN_SANDBOX_TOKEN_FILE"
+          printf '%s' 'ci-metrics-scrape-token-0000000000000000' > "$METRICS_SCRAPE_TOKEN_SECRET_FILE"
+          printf '%s' 'http://alert-webhook-sink:8082/alerts' > "$ALERTMANAGER_WEBHOOK_URL_SECRET_FILE"
+          sudo chown "$(id -u):$MONITORING_SECRET_GID" \
+            "$METRICS_SCRAPE_TOKEN_SECRET_FILE" "$ALERTMANAGER_WEBHOOK_URL_SECRET_FILE"
+          sudo chmod 0440 \
+            "$METRICS_SCRAPE_TOKEN_SECRET_FILE" "$ALERTMANAGER_WEBHOOK_URL_SECRET_FILE"
+          mkdir -p output
+          chmod 0777 output
+      - name: Build secure full stack
+        run: |
+          for attempt in 1 2 3; do
+            if docker compose -f docker-compose.yml -f docker-compose.secure.yml \
+              build api migration dispatcher worker plugin-sandbox; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+      - name: Migrate database and start secure stack
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml up -d --wait db redis
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T db psql -v ON_ERROR_STOP=1 -U bioagent -d bioagent <<'SQL'
+          DO $roles$
+          BEGIN
+            CREATE ROLE bioagent_api NOLOGIN;
+            CREATE ROLE bioagent_dispatcher NOLOGIN;
+            CREATE ROLE bioagent_worker NOLOGIN;
+            CREATE ROLE bioagent_maintenance NOLOGIN;
+            CREATE ROLE bioagent_api_secure LOGIN PASSWORD 'ci-api-password';
+            CREATE ROLE bioagent_dispatcher_secure LOGIN PASSWORD 'ci-dispatcher-password';
+            CREATE ROLE bioagent_worker_secure LOGIN PASSWORD 'ci-worker-password';
+            CREATE ROLE bioagent_maintenance_secure LOGIN PASSWORD 'ci-maintenance-password';
+            GRANT bioagent_api TO bioagent_api_secure;
+            GRANT bioagent_dispatcher TO bioagent_dispatcher_secure;
+            GRANT bioagent_worker TO bioagent_worker_secure;
+            GRANT bioagent_maintenance TO bioagent_maintenance_secure;
+          END
+          $roles$;
+          SQL
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml --profile operations run --rm migration
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml --profile operations run --rm --no-deps migration python scripts/configure_tenant_context.py --enable
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml --profile operations run --rm --no-deps migration python scripts/verify_database_roles.py
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml up -d api dispatcher worker plugin-sandbox
+          for attempt in {1..180}; do
+            plugin_id=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml ps -q plugin-sandbox)
+            worker_id=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml ps -q worker)
+            dispatcher_id=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml ps -q dispatcher)
+            plugin_status=$(docker inspect --format='{{.State.Health.Status}}' "$plugin_id" 2>/dev/null || true)
+            worker_status=$(docker inspect --format='{{.State.Health.Status}}' "$worker_id" 2>/dev/null || true)
+            dispatcher_status=$(docker inspect --format='{{.State.Health.Status}}' "$dispatcher_id" 2>/dev/null || true)
+            if curl --fail --silent http://127.0.0.1:18080/health > output/ci-secure-fullstack-health.json \
+              && [ "$plugin_status" = healthy ] \
+              && [ "$worker_status" = healthy ] \
+              && [ "$dispatcher_status" = healthy ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml logs api dispatcher worker plugin-sandbox clamav db redis
+          exit 1
+      - name: Run API to sandbox artifact round trip
+        run: python scripts/verify_secure_fullstack_e2e.py --base-url http://127.0.0.1:18080
+      - name: Verify sandbox mounts and cleanup
+        run: |
+          mkdir -p output
+          container_id=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml ps -q plugin-sandbox)
+          docker inspect "$container_id" > output/ci-plugin-sandbox-inspect.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          inspection = json.loads(
+              Path('output/ci-plugin-sandbox-inspect.json').read_text(encoding='utf-8')
+          )[0]
+          destinations = {item['Destination'] for item in inspection['Mounts']}
+          assert '/app/output' not in destinations
+          assert '/run/bioagent/plugin-exchange' in destinations
+          PY
+          if docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox touch /app/output/.boundary-probe 2>/dev/null; then
+            docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox rm -f /app/output/.boundary-probe
+            exit 1
+          fi
+          leftovers=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox find /run/bioagent/plugin-exchange -mindepth 1 -maxdepth 1 -print -quit)
+          test -z "$leftovers"
+      - name: Start and verify production monitoring path
+        run: |
+          mkdir -p output/monitoring-smoke
+          chmod 0777 output/monitoring-smoke
+          rm -f output/monitoring-smoke/alerts.jsonl output/monitoring-smoke/prometheus-targets.json
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.secure.yml \
+            -f docker-compose.monitoring-test.yml \
+            --profile monitoring \
+            up -d --wait api worker alert-webhook-sink prometheus alertmanager
+          python scripts/verify_monitoring_stack.py \
+            --delivery-file output/monitoring-smoke/alerts.jsonl \
+            --evidence-directory output/monitoring-smoke \
+            --timeout-seconds 75
+      - name: Capture secure full-stack diagnostics
+        if: always()
+        run: |
+          mkdir -p output
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.secure.yml \
+            -f docker-compose.monitoring-test.yml \
+            --profile monitoring \
+            logs --no-color --timestamps \
+            api dispatcher worker plugin-sandbox clamav db redis \
+            prometheus alertmanager alert-webhook-sink \
+            > output/ci-secure-fullstack.log 2>&1 || true
+      - name: Upload secure full-stack diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: secure-fullstack-diagnostics
+          retention-days: 14
+          path: |
+            output/ci-secure-fullstack.log
+            output/ci-secure-fullstack-health.json
+            output/ci-plugin-sandbox-inspect.json
+            output/secure-fullstack-e2e
+            output/monitoring-smoke
+          if-no-files-found: ignore
+      - name: Clean up secure plugin stack
+        if: always()
+        run: |
+          if [ -f "$PLUGIN_SANDBOX_TOKEN_FILE" ]; then
+            docker compose \
+              -f docker-compose.yml \
+              -f docker-compose.secure.yml \
+              -f docker-compose.monitoring-test.yml \
+              --profile monitoring \
+              down -v --remove-orphans
+          fi
+          sudo rm -f \
+            "$PLUGIN_SANDBOX_TOKEN_FILE" \
+            "$METRICS_SCRAPE_TOKEN_SECRET_FILE" \
+            "$ALERTMANAGER_WEBHOOK_URL_SECRET_FILE"
 
   package:
     name: Build and install Python package
@@ -250,6 +520,7 @@ jobs:
           from pathlib import Path
           import database
           import domain_registry
+          import execution_semantics
           import fastapi_app
           import omics_protocol
           import redis_job_manager
@@ -265,6 +536,7 @@ jobs:
           assert version('bio-research-agent-platform')
           assert 'site-packages' in Path(run_context.__file__).as_posix()
           assert domain_registry.active_tool_specs()
+          assert execution_semantics.VALID_EXECUTION_SEMANTICS
           assert fastapi_app.app is not None
           assert database.Database is not None
           assert redis_job_manager.RedisJobManager is not None
@@ -357,19 +629,29 @@ jobs:
             dockerfile: frontend/Dockerfile
             exit_code: '1'
           - name: redis
-            image_ref: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
-            pull_image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+            image_ref: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+            pull_image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
             baseline_name: redis
             exit_code: '0'
           - name: postgres
-            image_ref: postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
-            pull_image: postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+            image_ref: postgres:16.15-alpine3.24@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+            pull_image: postgres:16.15-alpine3.24@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
             baseline_name: postgres
             exit_code: '0'
           - name: clamav
             image_ref: clamav/clamav:1.5@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422
             pull_image: clamav/clamav:1.5@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422
             baseline_name: clamav
+            exit_code: '0'
+          - name: prometheus
+            image_ref: prom/prometheus@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
+            pull_image: prom/prometheus@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
+            baseline_name: prometheus
+            exit_code: '0'
+          - name: alertmanager
+            image_ref: prom/alertmanager@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
+            pull_image: prom/alertmanager@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
+            baseline_name: alertmanager
             exit_code: '0'
     steps:
       - name: Check out source

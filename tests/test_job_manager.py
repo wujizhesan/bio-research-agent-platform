@@ -39,9 +39,16 @@ class JobManagerPersistenceTests(unittest.TestCase):
                 })
                 for _ in range(200):
                     current = manager.get(submitted['job_id'])
-                    if current['status'] == 'failed':
+                    if current['status'] in {'failed', 'indeterminate'}:
                         break
                     time.sleep(0.01)
+                if current['status'] == 'indeterminate':
+                    manager.resolve_indeterminate(
+                        submitted['job_id'],
+                        'approve_retry',
+                        'checkpoint confirms the workflow can resume safely',
+                        'test-reviewer',
+                    )
                 retried = manager.retry(submitted['job_id'])
                 for _ in range(200):
                     current = manager.get(retried['job_id'])

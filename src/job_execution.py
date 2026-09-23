@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -30,16 +31,61 @@ except ImportError:
     from storage_workspace import materialize_storage_references
 
 
+_PUBLIC_EXECUTION_MESSAGES = {
+    'execution_failed': 'job execution failed',
+    'execution_indeterminate': 'job outcome requires manual review',
+    'job_execution_cancelled': 'job execution was cancelled',
+    'job_execution_timed_out': 'job execution timed out',
+    'sandbox_authentication_required': 'plugin sandbox authentication failed',
+    'sandbox_execution_failed': 'plugin execution failed',
+    'sandbox_invalid_request': 'plugin sandbox rejected the request',
+    'sandbox_unavailable': 'plugin sandbox is unavailable',
+    'tool_execution_failed': 'tool execution failed',
+}
+_ERROR_CODE_PATTERN = re.compile(r'^[a-z][a-z0-9_]{2,63}$')
+
+
 class JobExecutionError(RuntimeError):
-    pass
+    error_code = 'execution_failed'
+
+    def __init__(self, message=None, *, error_code=None):
+        super().__init__(message or _PUBLIC_EXECUTION_MESSAGES[self.error_code])
+        selected = str(error_code or self.error_code)
+        self.error_code = (
+            selected
+            if _ERROR_CODE_PATTERN.fullmatch(selected)
+            and selected in _PUBLIC_EXECUTION_MESSAGES
+            else 'execution_failed'
+        )
 
 
 class JobExecutionCancelled(JobExecutionError):
-    pass
+    error_code = 'job_execution_cancelled'
 
 
 class JobExecutionTimedOut(JobExecutionError):
-    pass
+    error_code = 'job_execution_timed_out'
+
+
+def public_execution_failure(exc):
+    code = (
+        exc.error_code
+        if isinstance(exc, JobExecutionError)
+        else 'execution_failed'
+    )
+    return {
+        'status': 'error',
+        'error_code': code,
+        'error': _PUBLIC_EXECUTION_MESSAGES[code],
+    }
+
+
+def public_tool_failure(_result):
+    return {
+        'status': 'error',
+        'error_code': 'tool_execution_failed',
+        'error': _PUBLIC_EXECUTION_MESSAGES['tool_execution_failed'],
+    }
 
 
 def _env_int(name, default, minimum=0):
@@ -95,6 +141,18 @@ def _sandbox_environment(tool, temporary_root):
             'TMPDIR': str(plugin_temp),
         })
         environment['PLUGIN_SANDBOX_DOMAIN'] = spec['domain']
+        context = current_run_context(as_dict=True) or {}
+        execution = context.get('execution') or {}
+        environment['BIO_AGENT_JOB_ID'] = str(context.get('job_id') or '')
+        environment['BIO_AGENT_EXECUTION_KEY'] = str(
+            execution.get('execution_key') or ''
+        )
+        environment['BIO_AGENT_IDEMPOTENCY_KEY'] = str(
+            execution.get('idempotency_key') or ''
+        )
+        environment['BIO_AGENT_EXECUTION_SEMANTICS'] = str(
+            execution.get('semantics') or spec.get('execution_semantics') or 'pure'
+        )
     return environment
 
 

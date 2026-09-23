@@ -192,7 +192,12 @@ class LocalFileStorage:
             raise ValueError('content does not match .vcf')
         return CONTENT_TYPES.get(extension, 'text/plain')
 
-    async def save(self, upload: Any) -> StoredFile:
+    def planned_storage_key(self, file_id: str, filename: str) -> str | None:
+        if not FILE_ID_PATTERN.fullmatch(str(file_id)):
+            raise ValueError('invalid stored file id')
+        return None
+
+    async def save(self, upload: Any, file_id: str | None = None) -> StoredFile:
         filename = self._safe_filename(getattr(upload, 'filename', None))
         extension = Path(filename).suffix.lower()
         is_vcf_gzip = filename.lower().endswith('.vcf.gz')
@@ -202,7 +207,9 @@ class LocalFileStorage:
 
         async with self._quota_lock:
             current_usage = self._storage_usage()
-            file_id = uuid4().hex
+            file_id = str(file_id or uuid4().hex)
+            if not FILE_ID_PATTERN.fullmatch(file_id):
+                raise ValueError('invalid stored file id')
             directory = self.root / file_id
             directory.mkdir(parents=False, exist_ok=False)
             target = directory / filename
@@ -322,6 +329,14 @@ class LocalFileStorage:
             raise FileNotFoundError(file_id)
         return stored
 
+    async def discard(self, stored: StoredFile):
+        if not FILE_ID_PATTERN.fullmatch(stored.file_id):
+            raise ValueError('invalid stored file id')
+        directory = (self.root / stored.file_id).resolve()
+        if directory.parent != self.root:
+            raise ValueError('stored file is outside storage root')
+        await asyncio.to_thread(shutil.rmtree, directory, True)
+
     def payload(self, stored: StoredFile, project_root: str | Path, download_url: str) -> dict[str, Any]:
         project_path = Path(project_root).resolve()
         try:
@@ -405,8 +420,13 @@ class S3FileStorage(LocalFileStorage):
         parts = [item for item in (self.prefix, file_id, filename) if item]
         return '/'.join(parts)
 
-    async def save(self, upload: Any) -> StoredFile:
-        stored = await super().save(upload)
+    def planned_storage_key(self, file_id: str, filename: str) -> str:
+        if not FILE_ID_PATTERN.fullmatch(str(file_id)):
+            raise ValueError('invalid stored file id')
+        return self._object_key(str(file_id), self._safe_filename(filename))
+
+    async def save(self, upload: Any, file_id: str | None = None) -> StoredFile:
+        stored = await super().save(upload, file_id=file_id)
         storage_key = self._object_key(stored.file_id, stored.filename)
         try:
             await asyncio.to_thread(
@@ -580,6 +600,16 @@ class S3FileStorage(LocalFileStorage):
             relative = path.relative_to(downloads_root)
             if relative.parts:
                 shutil.rmtree(downloads_root / relative.parts[0], ignore_errors=True)
+
+    async def discard(self, stored):
+        try:
+            if stored.storage_key:
+                request = self._bucket_request(Key=stored.storage_key)
+                if stored.version_id:
+                    request['VersionId'] = stored.version_id
+                await asyncio.to_thread(self.client.delete_object, **request)
+        finally:
+            await super().discard(stored)
 
     async def aget(self, file_id: str, reference=None) -> StoredFile:
         return await asyncio.to_thread(self.get, file_id, reference)

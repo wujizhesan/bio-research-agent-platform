@@ -1,3 +1,5 @@
+import { browserSessionRequest } from './browserSession'
+
 export type FrontendErrorEvent = {
   boundary_name: string
   error_name: string
@@ -58,16 +60,15 @@ export function createFrontendErrorEvent(context: BoundaryErrorContext, error: E
 
 export async function reportFrontendError(apiBase: string, token: string, event: FrontendErrorEvent) {
   try {
-    const response = await fetch(`${apiBase}/api/v1/telemetry/frontend-errors`, {
+    const response = await fetch(`${apiBase}/api/v1/telemetry/frontend-errors`, browserSessionRequest(token, {
       method: 'POST',
       keepalive: true,
       headers: {
         'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(event.trace_id ? { 'X-Trace-ID': event.trace_id } : {}),
       },
       body: JSON.stringify(event),
-    })
+    }))
     recordResponseTrace(response)
     return response.ok
   } catch {

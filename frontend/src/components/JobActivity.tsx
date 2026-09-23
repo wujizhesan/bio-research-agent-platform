@@ -1,22 +1,44 @@
-import { Ban, ChevronRight, Clock3, RefreshCw } from 'lucide-react'
-import type { EventItem, Job } from '../app/types'
+import { useState } from 'react'
+import { Ban, ChevronRight, Clock3, RefreshCw, ShieldCheck } from 'lucide-react'
+import type { EventItem, Job, JobResolutionDecision } from '../app/types'
 import { formatJobId, formatTime } from '../hooks/useJobRunner'
 import { EmptyStream, StatusBadge } from './WorkspaceStatus'
 
-export function JobControl({ job, loading, onCancel, onRetry }: {
+export function JobControl({ job, loading, onCancel, onRetry, onResolve }: {
   job: Job | null
   loading: boolean
   onCancel: () => void
   onRetry: (job: Job) => void
+  onResolve: (job: Job, decision: JobResolutionDecision, reason: string) => void
 }) {
   if (!job) return null
   if (job.status === 'queued' || job.status === 'running') {
     return <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#5c4930] bg-[#211d16] px-5 py-4"><div className="flex items-center gap-3"><Ban size={16} className="text-[#e6c875]" /><div><div className="text-sm font-medium text-[#f1dfaa]">任务控制</div><div className="mt-1 text-xs text-[#aa9767]">排队中的任务会立即取消，运行中的任务采用协作式取消。</div></div></div><button onClick={onCancel} disabled={job.cancel_requested} className="rounded-lg border border-[#80643c] px-3 py-2 text-xs font-medium text-[#f1d889] transition hover:bg-[#392d1c] disabled:cursor-not-allowed disabled:opacity-50">{job.cancel_requested ? '取消请求已发送' : '取消任务'}</button></div>
   }
+  if (job.status === 'indeterminate') {
+    return <IndeterminateControl key={job.job_id} job={job} loading={loading} onRetry={onRetry} onResolve={onResolve} />
+  }
   if (job.status === 'failed' || job.status === 'cancelled') {
     return <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#3f527c] bg-[#111d32] px-5 py-4"><div className="flex items-center gap-3"><RefreshCw size={16} className="text-[#aebfff]" /><div><div className="text-sm font-medium text-[#d7ddff]">任务恢复</div><div className="mt-1 text-xs text-[#99a6cf]">保留原任务记录，复制原始参数重新提交。</div></div></div><button aria-label="Retry selected task" onClick={() => onRetry(job)} disabled={loading} className="rounded-lg bg-[#aebfff] px-3 py-2 text-xs font-semibold text-[#111a34] transition hover:bg-[#c4d0ff] disabled:cursor-not-allowed disabled:opacity-50">重试任务</button></div>
   }
   return null
+}
+
+function IndeterminateControl({ job, loading, onRetry, onResolve }: {
+  job: Job
+  loading: boolean
+  onRetry: (job: Job) => void
+  onResolve: (job: Job, decision: JobResolutionDecision, reason: string) => void
+}) {
+  const [reason, setReason] = useState('')
+  if (job.resolution?.decision === 'approve_retry') {
+    return <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#755d2f] bg-[#241f15] px-5 py-4"><div className="flex items-center gap-3"><ShieldCheck size={16} className="text-[#efcd72]" /><div><div className="text-sm font-medium text-[#f7e1a5]">已批准安全重试</div><div className="mt-1 text-xs text-[#baa66e]">审核人：{job.resolution.reviewer}</div></div></div><button aria-label="Retry approved indeterminate task" onClick={() => onRetry(job)} disabled={loading} className="rounded-lg bg-[#efcd72] px-3 py-2 text-xs font-semibold text-[#211b0e] disabled:opacity-50">执行重试</button></div>
+  }
+  const submit = (decision: JobResolutionDecision) => {
+    const selectedReason = reason.trim()
+    if (selectedReason.length >= 3) onResolve(job, decision, selectedReason)
+  }
+  return <div className="mt-5 rounded-2xl border border-[#75483d] bg-[#2b1a1b] px-5 py-4"><div className="flex items-center gap-3"><ShieldCheck size={16} className="text-[#f0a994]" /><div><div className="text-sm font-medium text-[#f6d7cd]">任务结果不确定，需要管理员裁决</div><div className="mt-1 text-xs text-[#ddb9ae]">核对外部系统和产物后填写理由；未经批准不能重试。</div></div></div><textarea aria-label="Resolution reason" value={reason} onChange={(event) => setReason(event.target.value)} className="mt-4 min-h-20 w-full rounded-lg border border-[#75483d] bg-[#160e10] px-3 py-2 text-sm text-[#f6d7cd]" placeholder="填写核查结果、工单或证据说明（至少 3 个字符）" /><div className="mt-3 flex flex-wrap gap-2"><button onClick={() => submit('confirm_succeeded')} disabled={loading || reason.trim().length < 3} className="rounded-lg border border-[#5b967e] px-3 py-2 text-xs text-[#9ee2c3] disabled:opacity-50">确认已成功</button><button onClick={() => submit('confirm_failed')} disabled={loading || reason.trim().length < 3} className="rounded-lg border border-[#a86858] px-3 py-2 text-xs text-[#f0a994] disabled:opacity-50">确认失败</button><button onClick={() => submit('approve_retry')} disabled={loading || reason.trim().length < 3} className="rounded-lg bg-[#efcd72] px-3 py-2 text-xs font-semibold text-[#211b0e] disabled:opacity-50">批准重试</button></div></div>
 }
 
 export function ExecutionStream({ job, events }: { job: Job | null; events: EventItem[] }) {

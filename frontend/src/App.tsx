@@ -60,13 +60,10 @@ import {
 const runtimeApiBase = new URLSearchParams(window.location.search).get('api') || ''
 const defaultApiBase = runtimeApiBase || import.meta.env.VITE_API_BASE_URL || (
   window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-    ? 'http://127.0.0.1:8000'
+    ? `http://${window.location.hostname}:8000`
     : ''
 )
-const localDevelopmentToken = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'change-me-in-development'
-  : ''
-const initialToken = localStorage.getItem('bio-agent-token') || import.meta.env.VITE_API_TOKEN || localDevelopmentToken
+const initialToken = ''
 
 function App() {
   const [view, setView] = useState<View>('workspace')
@@ -133,6 +130,7 @@ function App() {
     submitToolJob,
     cancelSelectedJob,
     retryJob,
+    resolveIndeterminateJob,
     downloadJobArtifact,
     previewJobArtifact,
     selectJob,
@@ -185,6 +183,10 @@ function App() {
 
   async function handleResearchFileUpload(slot: ResearchFileSlot, file?: File) {
     if (!file) return
+    if (!selectedProjectId) {
+      setError('请先创建或选择项目')
+      return
+    }
     setUploadingFile(slot)
     setError('')
     try {
@@ -200,6 +202,10 @@ function App() {
 
   async function handleRnaFileUpload(slot: RnaFileSlot, files?: FileList | null) {
     if (!files?.length) return
+    if (!selectedProjectId) {
+      setError('请先创建或选择项目')
+      return
+    }
     setUploadingRnaFile(slot)
     setError('')
     try {
@@ -351,9 +357,9 @@ function App() {
               </select>
               <button type="button" onClick={() => void createProject()} className="rounded-lg border border-[#28524b] px-2.5 py-1.5 text-xs text-[#a8f0d2] transition hover:bg-[#102b2a]">新建项目</button>
             </div>
-            <form onSubmit={(event) => { event.preventDefault(); saveToken() }} className="flex items-center gap-3">
+            <form onSubmit={(event) => { event.preventDefault(); void saveToken() }} className="flex items-center gap-3">
               <div className="hidden items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 font-mono text-[10px] text-[#8aa9a2] sm:flex"><LockKeyhole size={12} />访问令牌</div>
-              <input aria-label="访问令牌" autoComplete="off" value={tokenDraft} onChange={(event) => setTokenDraft(event.target.value)} type="password" className="w-32 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 font-mono text-[10px] text-[#c7ded8] outline-none transition focus:border-[#72dcb4] sm:w-48" placeholder="本地可留空，生产请输入 Token" />
+              <input aria-label="访问令牌" autoComplete="off" value={tokenDraft} onChange={(event) => setTokenDraft(event.target.value)} type="password" className="w-32 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 font-mono text-[10px] text-[#c7ded8] outline-none transition focus:border-[#72dcb4] sm:w-48" placeholder="粘贴一次，连接后不保存" />
               <button type="submit" className="rounded-lg bg-[#a8f0d2] px-3 py-1.5 text-xs font-semibold text-[#092521] transition hover:bg-[#c6f8e1]">连接</button>
             </form>
           </header>
@@ -381,7 +387,7 @@ function App() {
                 </summary>
                 <div className="px-5 pb-1"><CapabilityStrip capabilities={capabilities} /></div>
               </details>
-              <JobControl job={selectedJob} loading={loading} onCancel={() => void cancelSelectedJob()} onRetry={(job) => void retryJob(job)} />
+              <JobControl job={selectedJob} loading={loading} onCancel={() => void cancelSelectedJob()} onRetry={(job) => void retryJob(job)} onResolve={(job, decision, reason) => void resolveIndeterminateJob(job, decision, reason)} />
 
               <section className={`grid gap-5 xl:grid-cols-[1.08fr_0.92fr] ${mode === 'sequence' ? 'xl:items-start' : ''}`}>
                 <div className="panel p-5 sm:p-6">

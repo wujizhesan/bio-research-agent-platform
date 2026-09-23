@@ -23,19 +23,49 @@ export type Capabilities = {
   interfaces: Record<string, CapabilityInterface>
 }
 
+export type JobArtifact = {
+  artifact_id: string
+  filename: string
+  content_type: string
+  size_bytes: number
+  sha256: string
+  storage_backend: 'local' | 's3'
+  parameter?: string
+  kind?: string
+  path?: string
+  storage_key?: string
+  version_id?: string
+  reference?: string
+}
+
 export type Job = {
   job_id: string
   tool: string
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'indeterminate'
   created_at: string
   started_at?: string
   finished_at?: string
   result?: Record<string, unknown>
+  artifacts?: JobArtifact[]
   error?: string
   cancel_requested?: boolean
   trace_id?: string
   request_id?: string
+  execution_identity?: Record<string, unknown>
+  routing?: Record<string, unknown>
+  execution?: Record<string, unknown>
+  scheduling?: Record<string, unknown>
+  indeterminate?: Record<string, unknown>
+  resolution?: {
+    decision: 'confirm_succeeded' | 'confirm_failed' | 'approve_retry'
+    reason: string
+    reviewer: string
+    resolved_at: string
+    evidence?: Record<string, unknown>
+  }
 }
+
+export type JobResolutionDecision = 'confirm_succeeded' | 'confirm_failed' | 'approve_retry'
 
 export type EventItem = {
   at: string

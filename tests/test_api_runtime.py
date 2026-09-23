@@ -32,6 +32,14 @@ class FakeStorage:
     backend = 'injected-storage'
 
 
+class FakeRateLimiter:
+    def __init__(self):
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+
+
 class ApiRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def test_injected_resources_are_preserved_and_not_owned(self):
         with tempfile.TemporaryDirectory(prefix='api_runtime_') as raw:
@@ -133,6 +141,7 @@ class ApiRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_owned_runtime_closes_resources_after_lifespan(self):
         jobs = FakeJobs()
         database = FakeDatabase()
+        limiter = FakeRateLimiter()
         runtime = ApiRuntime(
             jobs=jobs,
             plugins=object(),
@@ -140,7 +149,7 @@ class ApiRuntimeTests(unittest.IsolatedAsyncioTestCase):
             storage=FakeStorage(),
             audit=object(),
             auth=object(),
-            login_rate_limiter=object(),
+            login_rate_limiter=limiter,
             job_backend='test',
             storage_backend='test',
             owns_jobs=True,
@@ -153,6 +162,7 @@ class ApiRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(jobs.stopped)
         self.assertTrue(database.closed)
+        self.assertTrue(limiter.closed)
 
 
 if __name__ == '__main__':

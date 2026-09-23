@@ -1,17 +1,17 @@
 import type { Job, UploadedFile } from './types'
 import { recordResponseTrace } from './frontendObservability'
+import { browserSessionRequest } from './browserSession'
 
-const terminalJobStatuses = new Set<Job['status']>(['completed', 'failed', 'cancelled'])
+const terminalJobStatuses = new Set<Job['status']>(['completed', 'failed', 'cancelled', 'indeterminate'])
 
 export async function apiFetch<T>(base: string, token: string, path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(`${base}${path}`, {
+  const response = await fetch(`${base}${path}`, browserSessionRequest(token, {
     ...init,
     headers: {
       ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(init.headers || {}),
     },
-  })
+  }))
   recordResponseTrace(response)
   const payload = await response.json().catch(() => ({}))
   if (!response.ok) {
@@ -23,11 +23,10 @@ export async function uploadFile(base: string, token: string, file: File, projec
   const body = new FormData()
   body.append('upload', file)
   if (projectId) body.append('project_id', projectId)
-  const response = await fetch(`${base}/api/v1/files`, {
+  const response = await fetch(`${base}/api/v1/files`, browserSessionRequest(token, {
     method: 'POST',
     body,
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  })
+  }))
   recordResponseTrace(response)
   const payload = await response.json().catch(() => ({}))
   if (!response.ok) {
@@ -52,7 +51,7 @@ async function readJobStream(
     signal,
   })
   await new Promise<void>((resolve, reject) => {
-    const source = new EventSource(`${base}/api/v1/jobs/${jobId}/events?ticket=${encodeURIComponent(ticketPayload.ticket)}&interval_seconds=0.15&timeout_seconds=300`)
+    const source = new EventSource(`${base}/api/v1/jobs/${jobId}/events?ticket=${encodeURIComponent(ticketPayload.ticket)}&interval_seconds=0.15&timeout_seconds=300`, { withCredentials: true })
     let settled = false
     const cleanup = () => {
       source.close()

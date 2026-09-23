@@ -1,0 +1,24 @@
+groups:
+  - name: storage-deletion-reliability
+    rules:
+      - alert: StorageDeletionDeadLettersPresent
+        expr: sum(bio_agent_storage_deletion_backlog{status="delete_dead_letter"}) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Storage deletion dead letters require manual intervention
+      - alert: StorageDeletionBacklogStuck
+        expr: max(bio_agent_storage_deletion_oldest_age_seconds{status=~"delete_requested|deleting|delete_failed"}) > 900
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: A storage deletion has not completed within 15 minutes
+      - alert: StorageDeletionRetryBurst
+        expr: sum(bio_agent_storage_deletion_event_count{status="retry_requested"}) - sum(bio_agent_storage_deletion_event_count{status="retry_requested"} offset 15m) > 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Storage deletion retries increased rapidly

@@ -17,15 +17,51 @@ class DeployTransactionTests(unittest.TestCase):
         binaries = root / "bin"
         deploy.mkdir()
         binaries.mkdir()
+        password_file = root / "smoke-password"
+        password_file.write_text("deployment-secret\n", encoding="utf-8")
+        password_file.chmod(0o600)
+        secret_values = {
+            "POSTGRES_PASSWORD": "production-password",
+            "CADD_JWT_SECRET": "a" * 32,
+            "RLS_CONTEXT_SIGNING_KEY": "c" * 32,
+            "PLUGIN_SANDBOX_TOKEN": "b" * 32,
+            "CADD_AUTH_USERS": '{"deployment-smoke":{"password_hash":"test","roles":["admin"]}}',
+            "METRICS_SCRAPE_TOKEN": "m" * 40,
+            "ALERTMANAGER_WEBHOOK_URL": "https://alerts.example/bioagent",
+            "API_DATABASE_URL": "postgresql+asyncpg://api:secret@postgres.example:5432/bioagent",
+            "DISPATCHER_DATABASE_URL": "postgresql+asyncpg://dispatcher:secret@postgres.example:5432/bioagent",
+            "WORKER_DATABASE_URL": "postgresql+asyncpg://worker:secret@postgres.example:5432/bioagent",
+            "MAINTENANCE_DATABASE_URL": "postgresql+asyncpg://maintenance:secret@postgres.example:5432/bioagent",
+            "MIGRATION_DATABASE_URL": "postgresql+asyncpg://migration:secret@postgres.example:5432/bioagent",
+            "PITR_DATABASE_URL": "postgresql://backup:secret@postgres.example:5432/bioagent",
+            "API_REDIS_URL": "rediss://api:secret@redis.example:6379/0",
+            "DISPATCHER_REDIS_URL": "rediss://dispatcher:secret@redis.example:6379/0",
+            "WORKER_REDIS_URL": "rediss://worker:secret@redis.example:6379/0",
+        }
+        monitoring_secret_gid = os.getgid() or 1
+        secret_lines = []
+        for name, value in secret_values.items():
+            path = root / name.lower()
+            path.write_text(value + "\n", encoding="utf-8")
+            path.chmod(0o600)
+            if name in {"METRICS_SCRAPE_TOKEN", "ALERTMANAGER_WEBHOOK_URL"}:
+                os.chown(path, -1, monitoring_secret_gid)
+                path.chmod(0o640)
+            secret_lines.append(f"{name}_FILE={path}")
         (deploy / ".env.production").write_text(
             "\n".join(
                 [
-                    "POSTGRES_PASSWORD=production-password",
                     "APP_ENV=production",
-                    f"CADD_JWT_SECRET={'a' * 32}",
-                    f"PLUGIN_SANDBOX_TOKEN={'b' * 32}",
-                    "DATABASE_URL=postgresql+asyncpg://app:secret@postgres.example:5432/bioagent",
-                    "PITR_DATABASE_URL=postgresql://backup:secret@postgres.example:5432/bioagent",
+                    "PUBLIC_BASE_URL=https://platform.example",
+                    "CORS_ORIGINS=https://platform.example",
+                    "WEB_PUBLISHED_PORT=5173",
+                    "DEPLOY_SMOKE_USERNAME=deployment-smoke",
+                    f"DEPLOY_SMOKE_PASSWORD_FILE={password_file}",
+                    "DEPLOY_SMOKE_JOB_TOOL=research_catalog",
+                    "DEPLOY_SMOKE_JOB_TIMEOUT_SECONDS=60",
+                    "TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32",
+                    f"MONITORING_SECRET_GID={monitoring_secret_gid}",
+                    *secret_lines,
                     "STORAGE_BACKEND=s3",
                     "S3_BUCKET=bioagent-production",
                     "S3_REGION=us-east-1",
@@ -51,6 +87,7 @@ class DeployTransactionTests(unittest.TestCase):
             "docker-compose.deploy.yml",
         ):
             (deploy / name).write_text("services: {}\n", encoding="utf-8")
+        (deploy / "verify_public_deployment.py").write_text("", encoding="utf-8")
         (deploy / "release-images.next.env").write_text(
             "BACKEND_IMAGE=next-backend\nFRONTEND_IMAGE=next-frontend\n"
             "RELEASE_TAG=v0.2.0-rc.1\nGIT_SHA=" + "a" * 40 + "\n",
@@ -80,8 +117,17 @@ exit "${CURL_EXIT:-0}"
 """,
             encoding="utf-8",
         )
+        python = binaries / "python3"
+        python.write_text(
+            """#!/usr/bin/env bash
+printf 'python3 %s\\n' "$*" >> "$COMMAND_LOG"
+exit "${VERIFY_EXIT:-0}"
+""",
+            encoding="utf-8",
+        )
         docker.chmod(0o755)
         curl.chmod(0o755)
+        python.chmod(0o755)
         log = root / "commands.log"
         environment = os.environ.copy()
         environment.update(
@@ -126,12 +172,24 @@ exit "${CURL_EXIT:-0}"
             migration = next(i for i, line in enumerate(commands) if "run --rm migration" in line)
             rollout = next(i for i, line in enumerate(commands) if " up -d " in line)
             health = next(i for i, line in enumerate(commands) if line.startswith("curl "))
+            verification = next(
+                i for i, line in enumerate(commands) if line.startswith("python3 ")
+            )
+            enforcement = next(
+                i for i, line in enumerate(commands)
+                if "configure_tenant_context.py --enable" in line
+            )
             self.assertLess(storage, recovery)
             self.assertLess(recovery, pitr)
             self.assertLess(pitr, migration)
             self.assertLess(recovery, migration)
             self.assertLess(migration, rollout)
             self.assertLess(rollout, health)
+            self.assertLess(rollout, enforcement)
+            self.assertLess(enforcement, health)
+            self.assertLess(health, verification)
+            self.assertIn('--base-url https://platform.example', commands[verification])
+            self.assertIn('--username deployment-smoke', commands[verification])
             self.assertIn("X-Expected-Release: v0.2.0-rc.1", commands[health])
             self.assertIn("X-Expected-Commit: " + "a" * 40, commands[health])
 
@@ -147,7 +205,13 @@ exit "${CURL_EXIT:-0}"
             self.assertEqual(current, previous)
             self.assertTrue((deploy / "release-images.next.env").exists())
             self.assertIn("release-images.next.env up -d", commands)
+            self.assertNotIn("configure_tenant_context.py --disable", commands)
             self.assertIn("release-images.env up -d", commands)
+            rollback_start = commands.index("release-images.env up -d")
+            rollback_enforcement = commands.index(
+                "release-images.env run --rm migration python scripts/configure_tenant_context.py --enable"
+            )
+            self.assertLess(rollback_start, rollback_enforcement)
             self.assertIn("rollback completed", result.stderr)
 
     def test_first_failed_deployment_reports_missing_rollback_target(self):
@@ -158,6 +222,31 @@ exit "${CURL_EXIT:-0}"
             self.assertEqual(result.returncode, 1)
             self.assertIn("no previous image set exists", result.stderr)
             self.assertFalse((deploy / "release-images.env").exists())
+
+    def test_public_verification_failure_rolls_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory, current=True)
+            environment["VERIFY_EXIT"] = "1"
+            result = self.run_deploy(deploy, environment)
+            commands = log.read_text(encoding="utf-8")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("release-images.next.env up -d", commands)
+            self.assertIn("release-images.env up -d", commands)
+
+    def test_rejects_non_https_public_origin_before_running_compose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory)
+            environment_path = deploy / ".env.production"
+            environment_path.write_text(
+                environment_path.read_text(encoding="utf-8").replace(
+                    "PUBLIC_BASE_URL=https://platform.example",
+                    "PUBLIC_BASE_URL=http://platform.example",
+                ),
+                encoding="utf-8",
+            )
+            result = self.run_deploy(deploy, environment)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(log.exists())
 
     def test_rejects_local_storage_before_running_compose(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -174,15 +263,40 @@ exit "${CURL_EXIT:-0}"
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(log.exists())
 
+    def test_rejects_monitoring_secret_group_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory)
+            environment_path = deploy / ".env.production"
+            lines = environment_path.read_text(encoding="utf-8").splitlines()
+            selected = next(
+                int(line.split("=", 1)[1])
+                for line in lines
+                if line.startswith("MONITORING_SECRET_GID=")
+            )
+            environment_path.write_text(
+                "\n".join(
+                    f"MONITORING_SECRET_GID={selected + 1}"
+                    if line.startswith("MONITORING_SECRET_GID=")
+                    else line
+                    for line in lines
+                ) + "\n",
+                encoding="utf-8",
+            )
+            result = self.run_deploy(deploy, environment)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(log.exists())
+
     def test_rejects_local_database_before_running_compose(self):
         with tempfile.TemporaryDirectory() as directory:
             deploy, log, environment = self.prepare(directory)
             environment_path = deploy / ".env.production"
-            environment_path.write_text(
-                environment_path.read_text(encoding="utf-8").replace(
-                    "postgres.example:5432",
-                    "db:5432",
-                ),
+            api_secret_line = next(
+                line for line in environment_path.read_text(encoding="utf-8").splitlines()
+                if line.startswith("API_DATABASE_URL_FILE=")
+            )
+            api_secret_path = Path(api_secret_line.split("=", 1)[1])
+            api_secret_path.write_text(
+                "postgresql+asyncpg://api:secret@db:5432/bioagent\n",
                 encoding="utf-8",
             )
             result = self.run_deploy(deploy, environment)
@@ -193,11 +307,12 @@ exit "${CURL_EXIT:-0}"
         with tempfile.TemporaryDirectory() as directory:
             deploy, log, environment = self.prepare(directory)
             environment_path = deploy / ".env.production"
-            environment_path.write_text(
-                environment_path.read_text(encoding="utf-8").replace(
-                    "POSTGRES_PASSWORD=production-password",
-                    "POSTGRES_PASSWORD=bioagent-dev-password",
-                ),
+            password_line = next(
+                line for line in environment_path.read_text(encoding="utf-8").splitlines()
+                if line.startswith("POSTGRES_PASSWORD_FILE=")
+            )
+            Path(password_line.split("=", 1)[1]).write_text(
+                "bioagent-dev-password\n",
                 encoding="utf-8",
             )
             result = self.run_deploy(deploy, environment)
