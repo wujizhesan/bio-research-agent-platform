@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Lock
-from time import monotonic, monotonic_ns
+from time import monotonic, monotonic_ns, sleep
 
 try:
     from .external_service_policy import (
@@ -360,6 +360,11 @@ class ProcessToolExecutor:
             error_path = root / 'stderr.log'
             spec = _tool_spec(tool)
             child_environment = _sandbox_environment(tool, root, spec)
+            sandboxed = child_environment is not None
+            child_environment = dict(
+                child_environment if sandboxed else os.environ
+            )
+            child_environment['BIO_AGENT_ISOLATED_TOOL_CHILD'] = '1'
             resolved_arguments = materialize_storage_references(
                 arguments,
                 root / 'inputs',
@@ -392,7 +397,7 @@ class ProcessToolExecutor:
                     stdout=subprocess.DEVNULL,
                     stderr=error_stream,
                     env=child_environment,
-                    cwd=str(root) if child_environment is not None else None,
+                    cwd=str(root) if sandboxed else None,
                 )
                 with self._process_lock:
                     if self._shutdown.is_set():
@@ -417,16 +422,7 @@ class ProcessToolExecutor:
                             )
                         if heartbeat:
                             heartbeat()
-                        wait_seconds = self.limits.poll_interval_seconds
-                        if self.limits.timeout_seconds:
-                            wait_seconds = min(
-                                wait_seconds,
-                                max(self.limits.timeout_seconds - (now - started), 0.001),
-                            )
-                        try:
-                            process.wait(timeout=wait_seconds)
-                        except subprocess.TimeoutExpired:
-                            pass
+                        sleep(self.limits.poll_interval_seconds)
                     if self._shutdown.is_set():
                         raise JobExecutionCancelled('tool executor is shutting down')
                 except Exception:

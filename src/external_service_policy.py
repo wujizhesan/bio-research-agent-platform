@@ -9,7 +9,10 @@ import random
 from threading import BoundedSemaphore, Lock
 import time
 
-from prometheus_client import Counter, Gauge
+try:
+    from .metrics_backend import Counter, Gauge
+except ImportError:
+    from metrics_backend import Counter, Gauge
 
 try:
     from .settings import PlatformSettings

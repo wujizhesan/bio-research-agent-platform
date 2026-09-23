@@ -10,7 +10,10 @@ import sys
 from time import perf_counter
 from uuid import uuid4
 
-from prometheus_client import Counter, Gauge, Histogram
+try:
+    from .metrics_backend import Counter, Gauge, Histogram
+except ImportError:
+    from metrics_backend import Counter, Gauge, Histogram
 
 
 REQUEST_ID = ContextVar('bio_agent_request_id', default=None)

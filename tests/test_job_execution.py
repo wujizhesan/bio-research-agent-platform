@@ -154,13 +154,15 @@ class JobExecutionTests(unittest.TestCase):
     def test_isolated_knowledge_registry_skips_unrelated_domains(self):
         environment = os.environ.copy()
         environment['BIO_AGENT_EXECUTION_DOMAIN'] = 'knowledge'
+        environment['BIO_AGENT_ISOLATED_TOOL_CHILD'] = '1'
         completed = subprocess.run(
             [
                 sys.executable,
                 '-c',
                 'import json, sys; from src import domain_registry; '
                 'print(json.dumps({"domains": domain_registry.available_domains(), '
-                '"omics_loaded": "src.omics_agent" in sys.modules}))',
+                '"omics_loaded": "src.omics_agent" in sys.modules, '
+                '"prometheus_loaded": "prometheus_client" in sys.modules}))',
             ],
             cwd=str(Path(__file__).resolve().parents[1]),
             env=environment,
@@ -172,6 +174,7 @@ class JobExecutionTests(unittest.TestCase):
         payload = json.loads(completed.stdout)
         self.assertEqual(payload['domains'], ['knowledge'])
         self.assertFalse(payload['omics_loaded'])
+        self.assertFalse(payload['prometheus_loaded'])
 
     def test_isolated_research_plan_keeps_cross_domain_catalog(self):
         executor = ProcessToolExecutor(ExecutionLimits(
