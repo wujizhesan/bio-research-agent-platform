@@ -11,6 +11,7 @@ from uuid import uuid4
 import unittest
 from unittest.mock import patch
 
+from alembic.script import ScriptDirectory
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
@@ -1392,7 +1393,10 @@ class ExternalServiceTests(unittest.TestCase):
                     text('SELECT run_context FROM job_records WHERE job_id = :job_id'),
                     {'job_id': os.environ['CI_LEGACY_JOB_ID']},
                 )
-            self.assertEqual(revision, '0026_durable_audit_events')
+            expected_revision = ScriptDirectory(
+                str(Path(__file__).resolve().parents[2] / 'migrations')
+            ).get_current_head()
+            self.assertEqual(revision, expected_revision)
             self.assertIn('run_context', columns)
             self.assertTrue({
                 'execution_identity',
