@@ -370,6 +370,7 @@ class RedisJobWorkerRuntime:
         manager = self.manager
         stop_event = stop_event or Event()
         drain_timeout_seconds = max(float(drain_timeout_seconds), 0.0)
+        poll_interval = min(max(float(poll_timeout), 0.05), 1.0)
         reconcile = None
         try:
             reconcile_seconds = max(float(
@@ -396,6 +397,11 @@ class RedisJobWorkerRuntime:
 
         worker_heartbeat = getattr(manager, 'heartbeat_worker', None)
         health_state = getattr(manager, 'health_state', None)
+        subscribe_wakeup = getattr(
+            getattr(manager, '_store', None), 'subscribe_queue_wakeup', None
+        )
+        wake_subscription = None
+        next_wake_retry = 0.0
 
         if worker_heartbeat is not None:
             worker_heartbeat(active_jobs=0, draining=False)
@@ -414,7 +420,23 @@ class RedisJobWorkerRuntime:
         )
         manager._worker_executor = executor
         try:
+            if subscribe_wakeup is not None:
+                try:
+                    wake_subscription = subscribe_wakeup()
+                except Exception:
+                    next_wake_retry = monotonic() + 5.0
             while True:
+                if (
+                    wake_subscription is None
+                    and subscribe_wakeup is not None
+                    and monotonic() >= next_wake_retry
+                ):
+                    try:
+                        wake_subscription = subscribe_wakeup()
+                    except Exception:
+                        next_wake_retry = monotonic() + 5.0
+                    if wake_subscription is None:
+                        next_wake_retry = monotonic() + 5.0
                 if worker_heartbeat is not None and monotonic() >= next_heartbeat:
                     worker_heartbeat(
                         active_jobs=len(futures),
@@ -482,14 +504,36 @@ class RedisJobWorkerRuntime:
                         ))
                 if not futures:
                     manager.recover_stale_jobs()
-                    sleep(min(max(float(poll_timeout), 0.05), 1.0))
+                if (
+                    wake_subscription is not None
+                    and not draining
+                    and len(futures) < manager.max_concurrency
+                    and self.accepting_new_work()
+                ):
+                    try:
+                        wake_subscription.get_message(timeout=poll_interval)
+                    except Exception:
+                        try:
+                            wake_subscription.close()
+                        except Exception:
+                            pass
+                        wake_subscription = None
+                        next_wake_retry = monotonic() + 5.0
+                        sleep(poll_interval)
+                elif not futures:
+                    sleep(poll_interval)
                 else:
                     wait(
                         futures,
-                        timeout=min(max(float(poll_timeout), 0.05), 1.0),
+                        timeout=poll_interval,
                         return_when=FIRST_COMPLETED,
                     )
         finally:
+            if wake_subscription is not None:
+                try:
+                    wake_subscription.close()
+                except Exception:
+                    pass
             if draining:
                 manager._metrics.draining(
                     manager.worker_id,

@@ -3,6 +3,7 @@ import time
 import unittest
 
 from src.redis_job_worker import RedisJobWorkerRuntime
+from src.redis_job_store import RedisQueueStore
 
 
 class RecordingMetrics:
@@ -40,7 +41,90 @@ class DrainManager:
         self.release.wait(timeout=2)
 
 
+class WakeSubscription:
+    def __init__(self):
+        self.waiting = threading.Event()
+        self.wake = threading.Event()
+        self.closed = False
+        self.channel = None
+
+    def subscribe(self, channel):
+        self.channel = channel
+
+    def get_message(self, timeout):
+        self.waiting.set()
+        received = self.wake.wait(timeout)
+        self.wake.clear()
+        return {'type': 'message'} if received else None
+
+    def close(self):
+        self.closed = True
+
+
+class WakeRedis:
+    def __init__(self):
+        self.subscription = WakeSubscription()
+        self.items = []
+        self.lock = threading.Lock()
+        self.published = []
+
+    def pubsub(self, ignore_subscribe_messages=False):
+        assert ignore_subscribe_messages
+        return self.subscription
+
+    def lpush(self, key, value):
+        with self.lock:
+            self.items.append((key, value))
+
+    def publish(self, channel, payload):
+        self.published.append((channel, payload))
+        self.subscription.wake.set()
+
+    def pop(self):
+        with self.lock:
+            return self.items.pop(0)[1] if self.items else None
+
+
 class WorkerDrainTests(unittest.TestCase):
+    def test_queue_notification_wakes_idle_worker(self):
+        redis = WakeRedis()
+        store = RedisQueueStore(redis, 'test')
+        manager = DrainManager()
+        manager._store = store
+        stop_event = threading.Event()
+        runtime = RedisJobWorkerRuntime(manager)
+        runtime.next_job = redis.pop
+        runtime.complete_queued_item = manager._complete_queued_item
+        thread = threading.Thread(target=lambda: runtime.run_forever(
+            poll_timeout=5,
+            stop_event=stop_event,
+            drain_timeout_seconds=1,
+        ))
+        thread.start()
+        try:
+            self.assertTrue(redis.subscription.waiting.wait(timeout=1))
+            store.enqueue('job-1')
+            started = manager.started.wait(timeout=0.7)
+        finally:
+            stop_event.set()
+            manager.release.set()
+            thread.join(timeout=2)
+        self.assertTrue(started)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(redis.published, [('test:jobs:wakeup', '1')])
+        self.assertEqual(redis.subscription.channel, 'test:jobs:wakeup')
+        self.assertTrue(redis.subscription.closed)
+
+    def test_publish_failure_keeps_enqueued_job(self):
+        class FailingWakeRedis(WakeRedis):
+            def publish(self, channel, payload):
+                raise ConnectionError('wakeup unavailable')
+
+        redis = FailingWakeRedis()
+        store = RedisQueueStore(redis, 'test')
+        store.enqueue('job-1')
+        self.assertEqual(redis.pop(), 'job-1')
+
     def test_backpressure_pauses_claiming_new_jobs(self):
         class PausedStateStore:
             @staticmethod

@@ -47,6 +47,10 @@ class RedisQueueStore:
         return f'{self.namespace}:jobs:queue'
 
     @property
+    def queue_wakeup_channel(self):
+        return f'{self.namespace}:jobs:wakeup'
+
+    @property
     def high_queue_key(self):
         return f'{self.namespace}:jobs:queue:high'
 
@@ -402,6 +406,24 @@ class RedisQueueStore:
             self.queue_for_priority(priority, route_id),
             str(job_id),
         )
+        publish = getattr(self.redis, 'publish', None)
+        if publish is not None:
+            try:
+                publish(self.queue_wakeup_channel, '1')
+            except Exception:
+                pass
+
+    def subscribe_queue_wakeup(self):
+        pubsub_factory = getattr(self.redis, 'pubsub', None)
+        if pubsub_factory is None:
+            return None
+        pubsub = pubsub_factory(ignore_subscribe_messages=True)
+        try:
+            pubsub.subscribe(self.queue_wakeup_channel)
+        except Exception:
+            pubsub.close()
+            raise
+        return pubsub
 
     def next_job(self, route_ids=None, include_legacy=True):
         move = getattr(self.redis, 'rpoplpush', None)
