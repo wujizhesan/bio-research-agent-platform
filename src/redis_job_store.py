@@ -180,6 +180,8 @@ class RedisQueueStore:
         output.pop('_execution_key', None)
         output.pop('_claim_ticket', None)
         output.pop('_dispatch_generation', None)
+        output.pop('_retry_not_before', None)
+        output.pop('_deferred_attempt', None)
         output.pop('_started_epoch', None)
         output.pop('_capability_routing', None)
         revision = output.pop('_revision', None)
@@ -256,7 +258,7 @@ class RedisQueueStore:
         if persist_state:
             self._persist_state_store(record, event_id)
 
-    def atomic_update(self, job_id, updater, retries=8):
+    def atomic_update(self, job_id, updater, retries=8, persist_state=True):
         key = self.key(str(job_id))
         pipeline_factory = getattr(self.redis, 'pipeline', None)
         if pipeline_factory is None:
@@ -267,14 +269,18 @@ class RedisQueueStore:
                 updated = updater(dict(current), self.server_time())
                 if updated is None:
                     return current, False
-                updated['_revision'] = int(current.get('_revision', 0)) + 1
+                updated['_revision'] = max(
+                    int(current.get('_revision', 0)) + 1,
+                    int(updated.get('_revision', 0)),
+                )
                 score = updated.get('_created_score', self.server_time())
                 updated['_created_score'] = score
                 payload = json.dumps(updated, ensure_ascii=False, default=str)
                 self.redis.set(key, payload)
                 self.redis.zadd(self.index_key, {updated['job_id']: score})
                 event_id = self._append_event(self.redis, updated)
-                self._persist_state_store(updated, event_id)
+                if persist_state:
+                    self._persist_state_store(updated, event_id)
                 return updated, True
 
         for _ in range(max(int(retries), 1)):
@@ -292,7 +298,10 @@ class RedisQueueStore:
                 if updated is None:
                     pipe.unwatch()
                     return current, False
-                updated['_revision'] = int(current.get('_revision', 0)) + 1
+                updated['_revision'] = max(
+                    int(current.get('_revision', 0)) + 1,
+                    int(updated.get('_revision', 0)),
+                )
                 score = updated.get('_created_score', self.server_time())
                 updated['_created_score'] = score
                 encoded = json.dumps(updated, ensure_ascii=False, default=str)
@@ -311,7 +320,8 @@ class RedisQueueStore:
                 event_id = results[2] if len(results) > 2 else None
                 if isinstance(event_id, bytes):
                     event_id = event_id.decode('utf-8')
-                self._persist_state_store(updated, event_id)
+                if persist_state:
+                    self._persist_state_store(updated, event_id)
                 return updated, True
             except WatchError:
                 continue

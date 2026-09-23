@@ -11,10 +11,12 @@ import re
 from threading import BoundedSemaphore, Event, Lock
 
 try:
+    from .external_service_policy import ServiceRetryDeferredError
     from .job_execution import ExecutionLimits, ProcessToolExecutor
     from .observability import bind_context, configure_logging, log_event
     from .run_context import bind_run_context
 except ImportError:
+    from external_service_policy import ServiceRetryDeferredError
     from job_execution import ExecutionLimits, ProcessToolExecutor
     from observability import bind_context, configure_logging, log_event
     from run_context import bind_run_context
@@ -240,6 +242,12 @@ class SandboxHandler(BaseHTTPRequestHandler):
                 'ok': False,
                 'error_code': 'sandbox_invalid_request',
                 'error': 'plugin sandbox rejected the request',
+            })
+        except ServiceRetryDeferredError as exc:
+            self._write(503, {
+                'ok': False,
+                'error': 'external service requested retry later',
+                **exc.as_payload(),
             })
         except Exception as exc:
             log_event(

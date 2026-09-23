@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 
 import yaml
 
+from src.external_service_policy import ServiceRetryDeferredError
 from src.job_execution import (
     ExecutionLimits,
     JobExecutionCancelled,
@@ -280,6 +281,37 @@ class PluginContainerTests(unittest.TestCase):
         })
         self.assertNotIn('secret-value', str(response))
         self.assertNotIn('/srv/private', str(response))
+
+    def test_sandbox_preserves_deferred_retry_metadata(self):
+        worker = Mock()
+        worker.execute.side_effect = ServiceRetryDeferredError('uniprot', 45, 429)
+        with tempfile.TemporaryDirectory(prefix='deferred_sandbox_') as raw:
+            server = create_server(
+                '127.0.0.1', 0, TOKEN,
+                runtime=SandboxRuntime(
+                    executor_factory=lambda: worker,
+                    workspace_root=raw,
+                ),
+            )
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            executor = ContainerToolExecutor(
+                f'http://127.0.0.1:{server.server_port}',
+                TOKEN,
+                limits=self.limits(),
+                input_workspace_root=raw,
+            )
+            try:
+                with self.assertRaises(ServiceRetryDeferredError) as raised:
+                    executor.execute('demo_run', {})
+            finally:
+                executor.shutdown()
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+        self.assertEqual(raised.exception.service, 'uniprot')
+        self.assertEqual(raised.exception.retry_after_seconds, 45)
+        self.assertEqual(raised.exception.status_code, 429)
 
     def test_secure_compose_has_container_and_scanner_boundaries(self):
         root = Path(__file__).resolve().parent.parent

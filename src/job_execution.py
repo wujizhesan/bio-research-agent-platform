@@ -12,6 +12,10 @@ from threading import Event, Lock
 from time import monotonic, sleep
 
 try:
+    from .external_service_policy import (
+        ServiceRetryDeferredError,
+        retry_deferred_from_payload,
+    )
     from .observability import (
         TOOL_DURATION,
         TOOL_EXECUTIONS,
@@ -21,6 +25,10 @@ try:
     from .run_context import current_run_context
     from .storage_workspace import materialize_storage_references
 except ImportError:
+    from external_service_policy import (
+        ServiceRetryDeferredError,
+        retry_deferred_from_payload,
+    )
     from observability import (
         TOOL_DURATION,
         TOOL_EXECUTIONS,
@@ -34,6 +42,7 @@ except ImportError:
 _PUBLIC_EXECUTION_MESSAGES = {
     'execution_failed': 'job execution failed',
     'execution_indeterminate': 'job outcome requires manual review',
+    'external_retry_deferred': 'external service requested retry later',
     'job_execution_cancelled': 'job execution was cancelled',
     'job_execution_timed_out': 'job execution timed out',
     'sandbox_authentication_required': 'plugin sandbox authentication failed',
@@ -68,6 +77,13 @@ class JobExecutionTimedOut(JobExecutionError):
 
 
 def public_execution_failure(exc):
+    if isinstance(exc, ServiceRetryDeferredError):
+        return {
+            'status': 'error',
+            'error_code': 'external_retry_deferred',
+            'error': _PUBLIC_EXECUTION_MESSAGES['external_retry_deferred'],
+            'retry_after_seconds': exc.retry_after_seconds,
+        }
     code = (
         exc.error_code
         if isinstance(exc, JobExecutionError)
@@ -423,6 +439,9 @@ class ProcessToolExecutor:
                     execution_mode='process',
                 )
             if not payload.get('ok'):
+                deferred = retry_deferred_from_payload(payload)
+                if deferred is not None:
+                    raise deferred
                 raise JobExecutionError(payload.get('error') or 'isolated worker failed')
             return payload.get('result')
 

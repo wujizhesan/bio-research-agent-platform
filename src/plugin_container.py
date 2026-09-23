@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 try:
+    from .external_service_policy import retry_deferred_from_payload
     from .job_execution import (
         ExecutionLimits,
         JobExecutionCancelled,
@@ -23,6 +24,7 @@ try:
     from .run_context import current_run_context
     from .storage_workspace import materialize_storage_references
 except ImportError:
+    from external_service_policy import retry_deferred_from_payload
     from job_execution import (
         ExecutionLimits,
         JobExecutionCancelled,
@@ -215,6 +217,9 @@ class ContainerToolExecutor:
                 failure = json.loads(body.decode('utf-8'))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 failure = {}
+            deferred = retry_deferred_from_payload(failure)
+            if deferred is not None:
+                raise deferred from exc
             raise JobExecutionError(
                 f'plugin sandbox rejected request with HTTP {exc.code}',
                 error_code=failure.get('error_code'),
@@ -423,6 +428,9 @@ class ContainerToolExecutor:
         if not isinstance(response, dict):
             raise JobExecutionError('plugin sandbox returned an invalid response')
         if not response.get('ok'):
+            deferred = retry_deferred_from_payload(response)
+            if deferred is not None:
+                raise deferred
             raise JobExecutionError(
                 'plugin sandbox execution failed',
                 error_code=response.get('error_code'),

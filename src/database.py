@@ -6,6 +6,7 @@ from functools import lru_cache
 import hashlib
 import hmac
 import json
+import math
 from pathlib import Path
 import os
 import re
@@ -655,10 +656,11 @@ def _event_values(record):
     for key in (
         'started_at', 'finished_at', 'result', 'artifacts', 'error', 'retry_of',
         'trace_id', 'request_id', 'run_context', 'execution_identity',
-        'routing', 'execution', 'resolution',
+        'routing', 'execution', 'resolution', 'scheduling',
     ):
-        if values.get(key) is not None:
-            payload[key] = values[key]
+        value = record.get(key) if key == 'scheduling' else values.get(key)
+        if value is not None:
+            payload[key] = value
     if values['cancel_requested']:
         payload['cancel_requested'] = True
     return {
@@ -1376,7 +1378,13 @@ class Database:
         statement = (
             select(JobOutboxRow, JobRow)
             .join(JobRow, JobRow.job_id == JobOutboxRow.job_id)
-            .where(~JobRow.status.in_(TERMINAL_STATUSES))
+            .where(
+                ~JobRow.status.in_(TERMINAL_STATUSES),
+                or_(
+                    JobOutboxRow.next_attempt_at.is_(None),
+                    JobOutboxRow.next_attempt_at <= time(),
+                ),
+            )
             .order_by(JobOutboxRow.created_at)
             .limit(size)
         )
@@ -1584,9 +1592,16 @@ class Database:
                     with_for_update=True,
                 )
                 job = await session.get(JobRow, str(job_id), with_for_update=True)
+                outbox = await session.get(JobOutboxRow, str(job_id))
                 valid = bool(
                     capability_row is not None
                     and job is not None
+                    and outbox is not None
+                    and (
+                        outbox.next_attempt_at is None
+                        or float(outbox.next_attempt_at) <= current_time
+                    )
+                    and not job.cancel_requested
                     and capability_row.capability == str(capability)
                     and capability_row.claim_ticket_sha256 == ticket_hash
                     and capability_row.claim_ticket_redeemed_at is None
@@ -1641,6 +1656,115 @@ class Database:
             await session.commit()
             return dict(claim) if claim else None
 
+    async def defer_pure_job(
+        self,
+        execution_key,
+        job_id,
+        fencing_token,
+        attempt,
+        worker_id,
+        delay_seconds,
+        max_attempts,
+        record_revision=0,
+    ):
+        delay = float(delay_seconds)
+        if not math.isfinite(delay) or not 0 < delay <= 604800:
+            raise ValueError('external retry delay must be within seven days')
+        attempt = int(attempt)
+        max_attempts = int(max_attempts)
+        if attempt < 1 or max_attempts < 2:
+            return None
+        async with self.sessions() as session:
+            if self.url.startswith('postgresql'):
+                deferred = await session.scalar(
+                    text(
+                        'SELECT bioagent_defer_pure_job('
+                        ':job_id, :execution_key, :worker_id, :fencing_token, '
+                        ':attempt, :delay_seconds, :max_attempts, :record_revision)'
+                    ),
+                    {
+                        'job_id': str(job_id),
+                        'execution_key': str(execution_key),
+                        'worker_id': str(worker_id),
+                        'fencing_token': str(fencing_token),
+                        'attempt': attempt,
+                        'delay_seconds': delay,
+                        'max_attempts': max_attempts,
+                        'record_revision': max(int(record_revision), 0),
+                    },
+                )
+                await session.commit()
+                return dict(deferred) if deferred else None
+
+            claim = await session.get(
+                JobWorkerCapabilityRow, str(job_id), with_for_update=True
+            )
+            job = await session.get(JobRow, str(job_id), with_for_update=True)
+            outbox = await session.get(JobOutboxRow, str(job_id), with_for_update=True)
+            if not all((claim, job, outbox)):
+                return None
+            if (
+                job.status != 'running'
+                or job.cancel_requested
+                or job.worker_id != str(worker_id)
+                or str(outbox.payload.get('execution_semantics')) != 'pure'
+                or claim.capability != str(execution_key)
+                or claim.claimed_worker_id != str(worker_id)
+                or claim.fencing_token != str(fencing_token)
+                or int(claim.attempt or 0) != attempt
+                or attempt >= max_attempts
+            ):
+                return None
+            retry_at = time() + delay
+            revision = await session.scalar(
+                select(func.max(JobEventRow.revision)).where(
+                    JobEventRow.job_id == str(job_id)
+                )
+            )
+            revision = max(int(revision or 0), int(record_revision or 0)) + 1
+            job.status = 'queued'
+            job.started_at = None
+            job.worker_id = None
+            job.lease_until = None
+            job.attempts = attempt
+            outbox.next_attempt_at = retry_at
+            outbox.dispatch_owner = None
+            outbox.dispatch_lease_until = None
+            outbox.dispatch_generation = int(outbox.dispatch_generation or 0) + 1
+            outbox.payload = {
+                **outbox.payload,
+                '_retry_not_before': retry_at,
+                '_deferred_attempt': attempt,
+                '_revision': revision,
+                'scheduling': {
+                    'status': 'waiting_for_external_service',
+                    'retry_at': retry_at,
+                },
+            }
+            claim.claimed_worker_id = None
+            claim.fencing_token = None
+            claim.claim_ticket_sha256 = None
+            claim.claim_ticket_expires_at = None
+            claim.claim_ticket_redeemed_at = None
+            claim.updated_at = datetime.now(timezone.utc).isoformat()
+            execution = await session.get(
+                JobExecutionResultRow, str(execution_key), with_for_update=True
+            )
+            if (
+                execution is not None
+                and execution.job_id == str(job_id)
+                and execution.fencing_token == str(fencing_token)
+                and execution.status == 'running'
+            ):
+                execution.status = 'deferred'
+                execution.updated_at = claim.updated_at
+            event_record = _public_row(job)
+            event_record['scheduling'] = outbox.payload['scheduling']
+            event_record['_revision'] = revision
+            await self._persist_job_events(session, [event_record])
+            await session.commit()
+            return {'job_id': str(job_id), 'retry_at': retry_at, 'revision': revision}
+
     async def upsert_worker_job(
         self,
         record,
@@ -1650,7 +1774,46 @@ class Database:
         attempt,
     ):
         if not self.url.startswith('postgresql'):
-            return await self.upsert_job(record)
+            values = _row_values(record)
+            async with self.sessions() as session:
+                claim = await session.get(
+                    JobWorkerCapabilityRow,
+                    values['job_id'],
+                    with_for_update=True,
+                )
+                row = await session.get(
+                    JobRow, values['job_id'], with_for_update=True
+                )
+                if (
+                    claim is None
+                    or row is None
+                    or claim.capability != str(capability)
+                    or claim.claimed_worker_id != str(worker_id)
+                    or claim.fencing_token != str(fencing_token)
+                    or int(claim.attempt or 0) != int(attempt)
+                ):
+                    raise PermissionError('worker claim is invalid or stale')
+                if row.status in TERMINAL_STATUSES and values['status'] not in TERMINAL_STATUSES:
+                    return
+                for key in (
+                    'status', 'started_at', 'finished_at', 'result', 'artifacts',
+                    'error', 'attempts', 'worker_id',
+                    'lease_until', 'execution',
+                ):
+                    setattr(row, key, values[key])
+                row.cancel_requested = bool(
+                    row.cancel_requested or values['cancel_requested']
+                )
+                await self._persist_job_events(
+                    session,
+                    [{**record, 'project_id': row.project_id}],
+                )
+                if values['status'] in TERMINAL_STATUSES:
+                    await session.execute(delete(JobOutboxRow).where(
+                        JobOutboxRow.job_id == values['job_id']
+                    ))
+                await session.commit()
+            return
         values = _row_values(record)
         async with self.sessions() as session:
             claimed = await session.scalar(
@@ -1676,10 +1839,13 @@ class Database:
                 return
             for key in (
                 'status', 'started_at', 'finished_at', 'result', 'artifacts', 'error',
-                'attempts', 'cancel_requested', 'worker_id', 'lease_until',
+                'attempts', 'worker_id', 'lease_until',
                 'execution',
             ):
                 setattr(row, key, values[key])
+            row.cancel_requested = bool(
+                row.cancel_requested or values['cancel_requested']
+            )
             await self._persist_job_events(
                 session,
                 [{**record, 'project_id': row.project_id}],
@@ -1791,6 +1957,36 @@ class Database:
                     .limit(size)
                 )
                 rows = (await session.execute(statement)).scalars().all()
+            elif cursor.startswith('r-') and cursor[2:].isdigit():
+                cursor_revision = int(cursor[2:])
+                if cursor_revision > 2147483647:
+                    rows = []
+                else:
+                    statement = (
+                        select(JobEventRow)
+                        .where(
+                            JobEventRow.job_id == selected_job_id,
+                            JobEventRow.revision > cursor_revision,
+                        )
+                        .order_by(JobEventRow.revision)
+                        .limit(size)
+                    )
+                    rows = (await session.execute(statement)).scalars().all()
+                if not rows:
+                    latest_revision = await session.scalar(
+                        select(func.max(JobEventRow.revision)).where(
+                            JobEventRow.job_id == selected_job_id
+                        )
+                    )
+                    if latest_revision is not None and cursor_revision > latest_revision:
+                        replay_gap = True
+                        statement = (
+                            select(JobEventRow)
+                            .where(JobEventRow.job_id == selected_job_id)
+                            .order_by(JobEventRow.revision.desc())
+                            .limit(1)
+                        )
+                        rows = (await session.execute(statement)).scalars().all()
             else:
                 cursor_revision = await session.scalar(
                     select(JobEventRow.revision).where(
@@ -1802,10 +1998,7 @@ class Database:
                     replay_gap = True
                     statement = (
                         select(JobEventRow)
-                        .where(
-                            JobEventRow.job_id == selected_job_id,
-                            JobEventRow.terminal.is_(True),
-                        )
+                        .where(JobEventRow.job_id == selected_job_id)
                         .order_by(JobEventRow.revision.desc())
                         .limit(1)
                     )
@@ -3209,7 +3402,69 @@ class Database:
     async def get_job(self, job_id):
         async with self.sessions() as session:
             row = await session.get(JobRow, str(job_id))
-            return _public_row(row) if row else None
+            if row is None:
+                return None
+            record = _public_row(row)
+            if row.status == 'queued':
+                outbox = await session.get(JobOutboxRow, str(job_id))
+                if outbox is not None and outbox.next_attempt_at is not None:
+                    scheduling = (outbox.payload or {}).get('scheduling')
+                    if (
+                        isinstance(scheduling, dict)
+                        and scheduling.get('status') == 'waiting_for_external_service'
+                        and outbox.next_attempt_at > time()
+                    ):
+                        record['scheduling'] = scheduling
+            return record
+
+    async def request_job_cancel(
+        self, job_id, require_deferred=False, known_waiting=False
+    ):
+        selected_job_id = str(job_id)
+        async with self.sessions() as session:
+            row = await session.get(JobRow, selected_job_id, with_for_update=True)
+            if row is None:
+                return None
+            outbox = await session.get(
+                JobOutboxRow, selected_job_id, with_for_update=True
+            )
+            scheduling = (
+                (outbox.payload or {}).get('scheduling')
+                if outbox is not None else None
+            )
+            durable_waiting = bool(
+                outbox is not None
+                and row.status == 'queued'
+                and outbox.next_attempt_at is not None
+                and isinstance(scheduling, dict)
+                and scheduling.get('status') == 'waiting_for_external_service'
+            )
+            if require_deferred and not durable_waiting:
+                return None
+            if row.status in TERMINAL_STATUSES:
+                return _public_row(row)
+            row.cancel_requested = True
+            if durable_waiting or known_waiting:
+                row.status = 'cancelled'
+                row.finished_at = datetime.now(timezone.utc).isoformat()
+                row.error = 'job cancelled by user'
+            record = _public_row(row)
+            record['_cancel_requested'] = True
+            record['_attempts'] = row.attempts
+            revision = await session.scalar(
+                select(func.max(JobEventRow.revision)).where(
+                    JobEventRow.job_id == selected_job_id
+                )
+            )
+            record['_revision'] = int(revision or 0) + 1
+            await self._persist_job_events(session, [record])
+            if row.status == 'cancelled' and outbox is not None:
+                await session.delete(outbox)
+            await session.commit()
+            return _public_row(row)
+
+    async def cancel_deferred_job(self, job_id):
+        return await self.request_job_cancel(job_id, require_deferred=True)
 
     async def list_jobs(self, limit=20):
         size = min(max(int(limit), 1), 100)

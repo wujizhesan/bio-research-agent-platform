@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,13 +22,13 @@ try:
         resolve_artifact_path,
     )
     from .auth import Principal
-    from .observability import JOB_STATUS, JOB_SUBMISSIONS
+    from .observability import JOB_STATUS, JOB_SUBMISSIONS, log_event
     from .run_context import bind_run_actor
     from .storage_workspace import S3ObjectReference, StorageIntegrityError
 except ImportError:
     from api_contracts import JobCreate, JobResolution, iter_artifact_values, resolve_artifact_path
     from auth import Principal
-    from observability import JOB_STATUS, JOB_SUBMISSIONS
+    from observability import JOB_STATUS, JOB_SUBMISSIONS, log_event
     from run_context import bind_run_actor
     from storage_workspace import S3ObjectReference, StorageIntegrityError
 
@@ -540,7 +541,13 @@ def _register_job_event_routes(
             default=None,
             alias='Last-Event-ID',
             max_length=128,
-            pattern=r'^[0-9]+-[0-9]+$',
+            pattern=r'^(?:r-[0-9]+|[0-9]+-[0-9]+)$',
+        ),
+        query_last_event_id: str | None = Query(
+            default=None,
+            alias='last_event_id',
+            max_length=128,
+            pattern=r'^(?:r-[0-9]+|[0-9]+-[0-9]+)$',
         ),
         principal: Principal = Depends(stream_principal),
     ):
@@ -553,9 +560,20 @@ def _register_job_event_routes(
         subscriber = None
         event_reader = None
         durable_event_reader = None
+        durable_mode = False
         if app.state.job_backend == 'redis':
             event_reader = getattr(jobs, 'read_job_events', None)
             durable_event_reader = getattr(database, 'list_job_events', None)
+            if durable_event_reader is not None:
+                try:
+                    durable_mode = await database.get_job(job_id) is not None
+                except Exception as exc:
+                    log_event(
+                        'job.sse_durable_lookup_failed',
+                        level=logging.ERROR,
+                        job_id=job_id,
+                        error_type=type(exc).__name__,
+                    )
             if event_reader is None:
                 subscribe = getattr(jobs, 'subscribe_job_events', None)
                 if subscribe is not None:
@@ -563,7 +581,12 @@ def _register_job_event_routes(
 
         async def stream():
             last_signature = None
-            event_cursor = last_event_id or '0-0'
+            event_cursor = last_event_id or query_last_event_id or '0-0'
+            if not durable_mode and event_cursor.startswith('r-'):
+                event_cursor = '0-0'
+            redis_wake_cursor = '$'
+            redis_wake_error_reported = False
+            durable_replay_error_reported = False
             deadline = monotonic() + timeout_seconds
             next_access_check = monotonic() + 1.0
             try:
@@ -589,6 +612,152 @@ def _register_job_event_routes(
                             )
                             return
                         next_access_check = now + 1.0
+                    if durable_mode:
+                        durable_failed = False
+                        try:
+                            durable_events = await durable_event_reader(
+                                job_id,
+                                after_event_id=event_cursor,
+                                limit=100,
+                            )
+                            durable_replay_error_reported = False
+                        except Exception as exc:
+                            durable_events = []
+                            durable_failed = True
+                            if not durable_replay_error_reported:
+                                log_event(
+                                    'job.sse_durable_replay_failed',
+                                    level=logging.ERROR,
+                                    job_id=job_id,
+                                    error_type=type(exc).__name__,
+                                )
+                            durable_replay_error_reported = True
+                        for durable_event in durable_events:
+                            durable_event_id = f"r-{durable_event['revision']}"
+                            durable_record = durable_event['job']
+                            event_cursor = durable_event_id
+                            signature = json.dumps(
+                                durable_record,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                default=str,
+                            )
+                            if signature == last_signature:
+                                continue
+                            payload = {
+                                'status': 'ok',
+                                'job': durable_record,
+                                **(
+                                    {'replay_gap': True}
+                                    if durable_event.get('replay_gap') else {}
+                                ),
+                            }
+                            yield (
+                                f'id: {durable_event_id}\n'
+                                'event: job\n'
+                                'data: '
+                                + json.dumps(
+                                    payload, ensure_ascii=False, default=str
+                                )
+                                + '\n\n'
+                            )
+                            last_signature = signature
+                            if durable_event.get('terminal'):
+                                return
+                        if durable_events:
+                            continue
+                        if durable_failed or last_signature is None or monotonic() >= deadline:
+                            try:
+                                record = (
+                                    await read_job(job_id)
+                                    if durable_failed else await database.get_job(job_id)
+                                )
+                            except Exception as exc:
+                                log_event(
+                                    'job.sse_durable_snapshot_failed',
+                                    level=logging.ERROR,
+                                    job_id=job_id,
+                                    error_type=type(exc).__name__,
+                                )
+                                record = await read_job(job_id)
+                            if record is None:
+                                yield (
+                                    'event: error\n'
+                                    'data: '
+                                    + json.dumps({
+                                        'status': 'error',
+                                        'error': f'job not found: {job_id}',
+                                    }, ensure_ascii=False)
+                                    + '\n\n'
+                                )
+                                return
+                            signature = json.dumps(
+                                record,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                default=str,
+                            )
+                            if signature != last_signature:
+                                yield (
+                                    'event: job\n'
+                                    'data: '
+                                    + json.dumps(
+                                        {'status': 'ok', 'job': record},
+                                        ensure_ascii=False,
+                                        default=str,
+                                    )
+                                    + '\n\n'
+                                )
+                                last_signature = signature
+                            if record.get('status') in {
+                                'completed', 'failed', 'cancelled', 'indeterminate',
+                            }:
+                                return
+                            if monotonic() >= deadline:
+                                yield (
+                                    'event: timeout\n'
+                                    'data: '
+                                    + json.dumps(
+                                        {'status': 'timeout', 'job': record},
+                                        ensure_ascii=False,
+                                        default=str,
+                                    )
+                                    + '\n\n'
+                                )
+                                return
+                        else:
+                            yield ': keep-alive\n\n'
+                        started_wait = monotonic()
+                        woke = False
+                        if event_reader is not None:
+                            try:
+                                wake_events = await asyncio.to_thread(
+                                    event_reader,
+                                    job_id,
+                                    redis_wake_cursor,
+                                    1000,
+                                    100,
+                                )
+                                if wake_events:
+                                    redis_wake_cursor = wake_events[-1][0]
+                                    woke = True
+                                redis_wake_error_reported = False
+                            except Exception as exc:
+                                if not redis_wake_error_reported:
+                                    log_event(
+                                        'job.sse_redis_wake_failed',
+                                        level=logging.WARNING,
+                                        job_id=job_id,
+                                        error_type=type(exc).__name__,
+                                    )
+                                redis_wake_error_reported = True
+                        if not woke:
+                            await asyncio.sleep(max(
+                                0,
+                                max(float(interval_seconds), 1.0)
+                                - (monotonic() - started_wait),
+                            ))
+                        continue
                     record = None
                     if event_reader is not None:
                         events = await asyncio.to_thread(
@@ -772,9 +941,29 @@ def _register_job_mutation_routes(
         try:
             record = jobs.cancel(job_id)
         except ValueError as exc:
-            status_code = 404 if str(exc).startswith('job not found:') else 400
-            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
-        await database.upsert_job(record)
+            record = (
+                await database.cancel_deferred_job(job_id)
+                if app.state.job_backend == 'redis'
+                and str(exc).startswith('job not found:')
+                else None
+            )
+            if record is None:
+                status_code = 404 if str(exc).startswith('job not found:') else 400
+                raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        else:
+            if app.state.job_backend == 'redis':
+                persisted = await database.request_job_cancel(
+                    job_id,
+                    known_waiting=(
+                        record['status'] == 'cancelled'
+                        and (record.get('scheduling') or {}).get('status')
+                        == 'waiting_for_external_service'
+                    ),
+                )
+                if persisted is not None and persisted['status'] == 'cancelled':
+                    record = persisted
+            else:
+                await database.upsert_job(record)
         JOB_STATUS.labels(record['tool'], record['status']).set(1)
         await audit.record(
             principal,
@@ -783,10 +972,10 @@ def _register_job_mutation_routes(
             job_id,
             {'status': record['status']},
         )
-        if record['status'] in {'completed', 'failed', 'cancelled', 'indeterminate'}:
-            response_status = 'already_terminal'
-        elif record['status'] == 'cancelled':
+        if record['status'] == 'cancelled':
             response_status = 'cancelled'
+        elif record['status'] in {'completed', 'failed', 'indeterminate'}:
+            response_status = 'already_terminal'
         else:
             response_status = 'cancellation_requested'
         return {'status': response_status, 'job': record}

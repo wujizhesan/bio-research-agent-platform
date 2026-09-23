@@ -1,6 +1,8 @@
 """Metrics and structured lifecycle events for Redis jobs."""
 
 from datetime import datetime, timezone
+import logging
+from prometheus_client import Counter, Histogram
 
 try:
     from .observability import (
@@ -42,6 +44,23 @@ except ImportError:
     )
 
 
+REDIS_DEFERRED_CACHE_SYNC_FAILURES = Counter(
+    'bio_agent_redis_deferred_cache_sync_failures_total',
+    'Durable deferrals committed in PostgreSQL but not synchronized to Redis.',
+    ['namespace'],
+)
+REDIS_DEFERRED_RECONCILIATIONS = Counter(
+    'bio_agent_redis_deferred_reconciliations_total',
+    'Deferred jobs reconciled from the durable outbox.',
+    ['namespace', 'mode'],
+)
+REDIS_DEFERRED_RECONCILE_LAG = Histogram(
+    'bio_agent_redis_deferred_reconcile_lag_seconds',
+    'Seconds elapsed after a deferred retry became due before Redis reconciliation.',
+    ['namespace', 'mode'],
+)
+
+
 class RedisJobMetrics:
     def __init__(self, namespace, backend='redis'):
         self.namespace = namespace
@@ -67,6 +86,23 @@ class RedisJobMetrics:
             job_id=record['job_id'],
             tool=tool,
             priority=record.get('priority', 0),
+        )
+
+    def deferred_cache_sync_failed(self, job_id, error):
+        REDIS_DEFERRED_CACHE_SYNC_FAILURES.labels(self.namespace).inc()
+        log_event(
+            'job.external_retry_cache_sync_failed',
+            level=logging.ERROR,
+            backend=self.backend,
+            job_id=job_id,
+            error_type=type(error).__name__,
+        )
+
+    def deferred_reconciled(self, record, mode, now):
+        REDIS_DEFERRED_RECONCILIATIONS.labels(self.namespace, mode).inc()
+        retry_at = float(record.get('_retry_not_before') or 0)
+        REDIS_DEFERRED_RECONCILE_LAG.labels(self.namespace, mode).observe(
+            max(float(now) - retry_at, 0)
         )
 
     @staticmethod

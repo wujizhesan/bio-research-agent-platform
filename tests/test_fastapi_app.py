@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 import src.fastapi_app as fastapi_module
 from src.audit_log import AuditLogger
 from src.auth import AuthService
-from src.database import Database
+from src.database import Database, JobOutboxRow
 from src.fastapi_app import create_app
 from src.file_storage import LocalFileStorage, StoredFile
 from src.job_manager import JobManager
@@ -128,6 +128,11 @@ class RedisLostEventJobManager(RedisReadJobManager):
 
     def read_job_events(self, *_args, **_kwargs):
         return []
+
+
+class RedisLostCancelJobManager(RedisLostEventJobManager):
+    def cancel(self, job_id):
+        raise ValueError(f'job not found: {job_id}')
 
 
 class RedisRevocationJobManager(RedisReadJobManager):
@@ -805,9 +810,64 @@ class FastApiAppTests(unittest.TestCase):
                     ) as events:
                         body = ''.join(events.iter_text())
                     self.assertEqual(events.status_code, 200)
-                    self.assertIn('id: 4000-0', body)
+                    self.assertIn('id: r-4', body)
                     self.assertIn('"status": "completed"', body)
                     self.assertIn('"replay_gap": true', body)
+            finally:
+                self._close_app(app)
+
+    def test_redis_sse_replays_running_job_after_stream_loss(self):
+        class RedisDisconnectedJobManager(RedisLostEventJobManager):
+            def read_job_events(self, *_args, **_kwargs):
+                raise ConnectionError('Redis unavailable')
+
+        with tempfile.TemporaryDirectory(prefix='fastapi_running_sse_') as raw:
+            manager = RedisDisconnectedJobManager()
+            database = Database(
+                f"sqlite+aiosqlite:///{(Path(raw) / 'api.sqlite3').as_posix()}"
+            )
+            asyncio.run(database.init_schema())
+            asyncio.run(database.upsert_jobs([{
+                'job_id': 'running-event-job',
+                'tool': 'research_catalog',
+                'status': 'queued',
+                'created_at': '2026-09-23T00:00:00+00:00',
+                '_revision': 1,
+                '_event_id': '1001-0',
+            }, {
+                'job_id': 'running-event-job',
+                'tool': 'research_catalog',
+                'status': 'running',
+                'created_at': '2026-09-23T00:00:00+00:00',
+                '_revision': 2,
+                '_event_id': '1002-0',
+            }]))
+            app = create_app(
+                job_manager=manager,
+                plugin_manager=PluginManager(state_path=Path(raw) / 'plugins.json'),
+                database=database,
+                audit_log=AuditLogger(Path(raw) / 'audit.jsonl'),
+            )
+            try:
+                with TestClient(app) as client:
+                    with client.stream(
+                        'GET',
+                        '/api/v1/jobs/running-event-job/events?timeout_seconds=1&last_event_id=r-1',
+                    ) as events:
+                        body = ''.join(events.iter_text())
+                    self.assertEqual(events.status_code, 200)
+                    self.assertIn('id: r-2', body)
+                    self.assertIn('"status": "running"', body)
+                    self.assertNotIn('"replay_gap": true', body)
+                    with client.stream(
+                        'GET',
+                        '/api/v1/jobs/running-event-job/events?timeout_seconds=1',
+                        headers={'Last-Event-ID': '9999-0'},
+                    ) as events:
+                        legacy_body = ''.join(events.iter_text())
+                    self.assertEqual(events.status_code, 200)
+                    self.assertIn('id: r-2', legacy_body)
+                    self.assertIn('"replay_gap": true', legacy_body)
             finally:
                 self._close_app(app)
 
@@ -1440,6 +1500,57 @@ class FastApiAppTests(unittest.TestCase):
                                 break
                             time.sleep(0.05)
                         self.assertEqual(record['status'], 'cancelled')
+            finally:
+                self._close_app(app)
+
+    def test_cancel_deferred_job_after_redis_loss(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_deferred_cancel_') as raw:
+            database = Database(
+                f"sqlite+aiosqlite:///{(Path(raw) / 'api.sqlite3').as_posix()}"
+            )
+            asyncio.run(database.init_schema())
+            asyncio.run(database.stage_job({
+                'job_id': 'deferred-job',
+                'tool': 'research_catalog',
+                'status': 'queued',
+                'created_at': '2026-09-23T00:00:00+00:00',
+                '_arguments': {},
+                '_execution_key': 'deferred-job-capability-' + ('a' * 32),
+                'execution_semantics': 'pure',
+                'resources': {},
+                'priority': 0,
+            }))
+
+            async def schedule_retry():
+                async with database.sessions() as session:
+                    outbox = await session.get(JobOutboxRow, 'deferred-job')
+                    retry_at = time.time() + 300
+                    outbox.next_attempt_at = retry_at
+                    outbox.payload = {
+                        **outbox.payload,
+                        '_retry_not_before': retry_at,
+                        'scheduling': {
+                            'status': 'waiting_for_external_service',
+                            'retry_at': retry_at,
+                        },
+                    }
+                    await session.commit()
+
+            asyncio.run(schedule_retry())
+            app = create_app(
+                job_manager=RedisLostCancelJobManager(),
+                plugin_manager=PluginManager(state_path=Path(raw) / 'plugins.json'),
+                database=database,
+                audit_log=AuditLogger(Path(raw) / 'audit.jsonl'),
+            )
+            try:
+                with TestClient(app) as client:
+                    response = client.post('/api/v1/jobs/deferred-job/cancel')
+                    self.assertEqual(response.status_code, 202)
+                    self.assertEqual(response.json()['status'], 'cancelled')
+                    self.assertEqual(response.json()['job']['status'], 'cancelled')
+                self.assertEqual(asyncio.run(database.get_job('deferred-job'))['status'], 'cancelled')
+                self.assertEqual(asyncio.run(database.list_dispatchable_jobs()), [])
             finally:
                 self._close_app(app)
 

@@ -74,6 +74,35 @@ describe('useJobRunner', () => {
     expect(refresh).toHaveBeenCalledOnce()
   })
 
+  it('把重连和轮询状态记录到执行轨迹', async () => {
+    const queued = job('queued')
+    const completed = job('completed')
+    vi.mocked(apiFetch).mockResolvedValue({ job: queued })
+    vi.mocked(followJob).mockImplementation(async (_base, _token, _jobId, onEvent, _signal, onConnectionState) => {
+      onConnectionState?.('reconnecting')
+      onConnectionState?.('connected')
+      onConnectionState?.('polling')
+      onEvent('job', { job: completed })
+    })
+    const { result } = renderHook(() => useJobRunner({
+      apiBase: 'https://api.example.test',
+      token: 'secret',
+      selectedProjectId: 'project-1',
+      refresh,
+      upsertJob,
+      setError,
+      showReportPreview,
+    }))
+
+    await act(() => result.current.submitToolJob('sequence_workbench', {}, '任务已接收'))
+
+    expect(result.current.events.map((event) => event.type)).toEqual([
+      'accepted', 'reconnecting', 'connected', 'polling', 'job',
+    ])
+    expect(result.current.events.find((event) => event.type === 'polling')?.detail).toContain('定期查询')
+    expect(result.current.connectionMode).toBe('idle')
+  })
+
   it('取消运行任务后同步任务和事件状态', async () => {
     const running = job('running')
     const cancelled = job('cancelled')

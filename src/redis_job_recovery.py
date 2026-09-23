@@ -92,6 +92,9 @@ class RedisLeaseRecovery:
                         self.store.acknowledge(job_id)
                         continue
                     if record.get('status') == 'queued':
+                        if float(record.get('_retry_not_before') or 0) > now:
+                            self.store.acknowledge(job_id)
+                            continue
                         if not self.store.queue_contains(job_id):
                             def mark_recovered(current, _server_now):
                                 if current.get('status') != 'queued':

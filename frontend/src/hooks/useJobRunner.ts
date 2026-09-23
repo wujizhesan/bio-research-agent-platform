@@ -1,6 +1,6 @@
 import type { Dispatch, SetStateAction } from 'react'
 import { useCallback, useState } from 'react'
-import { apiFetch, followJob } from '../app/api'
+import { apiFetch, followJob, type JobConnectionState } from '../app/api'
 import { browserSessionRequest } from '../app/browserSession'
 import { statusLabels } from '../app/constants'
 import { parseJob, parseJobPayload } from '../app/platformPayloadValidation'
@@ -30,6 +30,7 @@ export function useJobRunner({ apiBase, token, selectedProjectId, refresh, upser
   const [selectedJob, setSelectedJob] = useState<Job | null>(null)
   const [events, setEvents] = useState<EventItem[]>([])
   const [loading, setLoading] = useState(false)
+  const [connectionMode, setConnectionMode] = useState<JobConnectionState | 'idle'>('idle')
   const { beginJobStream, isCurrentStream, finishJobStream } = useManagedJobStream()
 
   function updateJob(job: Job) {
@@ -57,7 +58,21 @@ export function useJobRunner({ apiBase, token, selectedProjectId, refresh, upser
       updateJob(nextJob)
       if (nextJob.status === 'completed') onCompleted?.(nextJob)
       appendJobEvent(type, nextJob)
-    }, controller.signal)
+    }, controller.signal, (state) => {
+      if (!isCurrentStream(controller)) return
+      setConnectionMode(state)
+      const detail = state === 'reconnecting'
+        ? '实时连接中断，正在重连；任务仍在后台运行'
+        : state === 'polling'
+          ? '实时连接暂不可用，改为定期查询任务状态'
+          : '实时连接已恢复'
+      setEvents((current) => [...current, {
+        at: formatTime(new Date().toISOString()),
+        type: state,
+        status: current.at(-1)?.status || job.status,
+        detail,
+      }])
+    })
   }
 
   async function submitToolJob(
@@ -72,6 +87,7 @@ export function useJobRunner({ apiBase, token, selectedProjectId, refresh, upser
     }
     const controller = beginJobStream()
     setLoading(true)
+    setConnectionMode('connected')
     setError('')
     setEvents([])
     try {
@@ -93,6 +109,7 @@ export function useJobRunner({ apiBase, token, selectedProjectId, refresh, upser
       if (isCurrentStream(controller)) {
         finishJobStream(controller)
         setLoading(false)
+        setConnectionMode('idle')
         void refresh()
       }
     }
@@ -122,6 +139,7 @@ export function useJobRunner({ apiBase, token, selectedProjectId, refresh, upser
     if (!['failed', 'cancelled', 'indeterminate'].includes(sourceJob.status)) return
     const controller = beginJobStream()
     setLoading(true)
+    setConnectionMode('connected')
     setError('')
     setEvents([])
     try {
@@ -138,6 +156,7 @@ export function useJobRunner({ apiBase, token, selectedProjectId, refresh, upser
       if (isCurrentStream(controller)) {
         finishJobStream(controller)
         setLoading(false)
+        setConnectionMode('idle')
         void refresh()
       }
     }
@@ -237,16 +256,19 @@ export function useJobRunner({ apiBase, token, selectedProjectId, refresh, upser
   const selectJob = useCallback((job: Job) => {
     setSelectedJob(job)
     setEvents([])
+    setConnectionMode('idle')
   }, [])
 
   const resetJobSelection = useCallback(() => {
     setSelectedJob(null)
     setEvents([])
+    setConnectionMode('idle')
   }, [])
 
   return {
     selectedJob,
     events,
+    connectionMode,
     loading,
     submitToolJob,
     cancelSelectedJob,

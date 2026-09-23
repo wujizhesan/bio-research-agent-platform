@@ -11,7 +11,9 @@ from unittest.mock import patch
 from prometheus_client import generate_latest
 
 from src.artifact_store import LocalArtifactStore
-from src.database import Database
+from src.database import Database, JobOutboxRow
+from src.external_service_policy import ServiceRetryDeferredError
+from src.job_execution import InlineToolExecutor
 from src.job_state_store import DatabaseStateWriter
 from src.redis_job_coordinator import RedisExecutionCoordinator
 from src.redis_job_manager import RedisJobManager
@@ -125,6 +127,281 @@ class InMemoryRedis:
 
 
 class RedisJobManagerTests(unittest.TestCase):
+    def test_durable_retry_reconciles_after_redis_transition_failure(self):
+        with tempfile.TemporaryDirectory(prefix='durable_retry_torn_write_') as raw:
+            url = f"sqlite+aiosqlite:///{(Path(raw) / 'jobs.sqlite3').as_posix()}"
+            redis = InMemoryRedis()
+            calls = []
+
+            def execute(_tool, _arguments):
+                calls.append(True)
+                if len(calls) == 1:
+                    raise ServiceRetryDeferredError('uniprot', 45, 429)
+                return {'status': 'ok', 'attempt': len(calls)}
+
+            with patch.dict('os.environ', {'AUTO_CREATE_SCHEMA': 'true'}):
+                writer = DatabaseStateWriter(url, require_job_scope=True)
+            database = Database(url)
+            manager = RedisJobManager(
+                redis_client=redis,
+                namespace='durable-retry-torn-write',
+                worker_id='retry-worker',
+                state_store=writer,
+                tool_executor=InlineToolExecutor(execute),
+            )
+            try:
+                prepared = manager.prepare_durable('research_catalog', {})
+                job_id = prepared['job_id']
+                asyncio.run(database.stage_job(prepared))
+                first = asyncio.run(database.claim_dispatch_batch(
+                    'first-dispatcher', limit=1
+                ))[0]
+                manager.rebuild_durable_queue(loader=lambda limit: [first])
+                self.assertEqual(manager._next_job(), job_id)
+                original_update = manager._store.atomic_update
+
+                def fail_cache_transition(*args, **kwargs):
+                    if kwargs.get('persist_state') is False:
+                        raise ConnectionError('simulated Redis transition failure')
+                    return original_update(*args, **kwargs)
+
+                with patch.object(
+                    manager._store, 'atomic_update', side_effect=fail_cache_transition
+                ):
+                    manager._complete_queued_item(job_id, 0.05)
+                writer.flush()
+                self.assertEqual(manager.get(job_id)['status'], 'running')
+                self.assertEqual(
+                    asyncio.run(database.get_job(job_id))['scheduling']['status'],
+                    'waiting_for_external_service',
+                )
+                self.assertFalse(manager._store.processing_contains(job_id))
+                self.assertIsNone(manager._next_job())
+                self.assertIn(
+                    'bio_agent_redis_deferred_cache_sync_failures_total'
+                    '{namespace="durable-retry-torn-write"} 1.0',
+                    generate_latest().decode('utf-8'),
+                )
+                self.assertEqual(asyncio.run(database.claim_dispatch_batch(
+                    'early-dispatcher', limit=1
+                )), [])
+
+                async def release_retry():
+                    async with database.sessions() as session:
+                        outbox = await session.get(JobOutboxRow, job_id)
+                        outbox.next_attempt_at = time() - 1
+                        payload = dict(outbox.payload)
+                        payload['_retry_not_before'] = time() - 1
+                        outbox.payload = payload
+                        await session.commit()
+
+                asyncio.run(release_retry())
+                second = asyncio.run(database.claim_dispatch_batch(
+                    'second-dispatcher', limit=1
+                ))[0]
+                self.assertEqual(manager.rebuild_durable_queue(
+                    loader=lambda limit: [second]
+                ), [job_id])
+                self.assertIn(
+                    'bio_agent_redis_deferred_reconciliations_total'
+                    '{mode="stale_cache",namespace="durable-retry-torn-write"} 1.0',
+                    generate_latest().decode('utf-8'),
+                )
+                self.assertEqual(manager._next_job(), job_id)
+                manager._complete_queued_item(job_id, 0.05)
+                writer.flush()
+                self.assertEqual(manager.get(job_id)['status'], 'completed')
+                self.assertEqual(len(calls), 2)
+            finally:
+                manager.shutdown()
+                writer.close()
+                asyncio.run(database.close())
+
+    def test_durable_external_retry_waits_and_survives_redis_loss(self):
+        with tempfile.TemporaryDirectory(prefix='durable_retry_') as raw:
+            url = f"sqlite+aiosqlite:///{(Path(raw) / 'jobs.sqlite3').as_posix()}"
+            redis = InMemoryRedis()
+            calls = []
+
+            def execute(_tool, _arguments):
+                calls.append(True)
+                if len(calls) == 1:
+                    raise ServiceRetryDeferredError('uniprot', 45, 429)
+                return {'status': 'ok', 'attempt': len(calls)}
+
+            with patch.dict('os.environ', {'AUTO_CREATE_SCHEMA': 'true'}):
+                writer = DatabaseStateWriter(url, require_job_scope=True)
+            database = Database(url)
+            manager = RedisJobManager(
+                redis_client=redis,
+                namespace='durable-retry',
+                worker_id='first-worker',
+                state_store=writer,
+                tool_executor=InlineToolExecutor(execute),
+            )
+            recovered = None
+            try:
+                prepared = manager.prepare_durable('research_catalog', {})
+                job_id = prepared['job_id']
+                asyncio.run(database.stage_job(prepared))
+                first_dispatch = asyncio.run(database.claim_dispatch_batch(
+                    'first-dispatcher', limit=1
+                ))[0]
+                self.assertEqual(manager.rebuild_durable_queue(
+                    loader=lambda limit: [first_dispatch]
+                ), [job_id])
+                self.assertEqual(manager._next_job(), job_id)
+                manager._complete_queued_item(job_id, 0.05)
+                writer.flush()
+
+                waiting = manager.get(job_id)
+                self.assertEqual(waiting['status'], 'queued')
+                self.assertEqual(waiting['attempts'], 1)
+                self.assertEqual(
+                    waiting['scheduling']['status'],
+                    'waiting_for_external_service',
+                )
+                self.assertEqual(
+                    asyncio.run(database.get_job(job_id))['scheduling']['status'],
+                    'waiting_for_external_service',
+                )
+                writer.save({
+                    **prepared,
+                    'status': 'running',
+                    '_worker_id': 'first-worker',
+                    '_fencing_token': '1',
+                    '_attempts': 1,
+                })
+                writer.flush()
+                self.assertEqual(
+                    asyncio.run(database.get_job(job_id))['status'], 'queued'
+                )
+                self.assertEqual(manager.run_job(job_id)['status'], 'queued')
+                self.assertEqual(len(calls), 1)
+                self.assertIsNone(manager._next_job())
+                self.assertEqual(asyncio.run(database.claim_dispatch_batch(
+                    'early-dispatcher', limit=1
+                )), [])
+                self.assertIsNone(asyncio.run(database.claim_worker_job(
+                    job_id,
+                    prepared['_execution_key'],
+                    'stale-worker',
+                    first_dispatch['_claim_ticket'],
+                    30,
+                )))
+                with self.assertRaisesRegex(RuntimeError, 'deferred'):
+                    asyncio.run(database.store_execution_result(
+                        prepared['_execution_key'],
+                        job_id,
+                        {'status': 'ok', 'stale': True},
+                        '1',
+                    ))
+
+                redis.values.clear()
+                redis.sorted_sets.clear()
+                redis.lists.clear()
+                redis.sets.clear()
+                recovered = RedisJobManager(
+                    redis_client=redis,
+                    namespace='durable-retry',
+                    worker_id='second-worker',
+                    state_store=writer,
+                    tool_executor=InlineToolExecutor(execute),
+                )
+                self.assertEqual(recovered.rebuild_durable_queue(), [])
+                self.assertIsNone(recovered._next_job())
+
+                async def release_retry():
+                    async with database.sessions() as session:
+                        outbox = await session.get(JobOutboxRow, job_id)
+                        outbox.next_attempt_at = time() - 1
+                        payload = dict(outbox.payload)
+                        payload['_retry_not_before'] = time() - 1
+                        outbox.payload = payload
+                        await session.commit()
+
+                asyncio.run(release_retry())
+                second_dispatch = asyncio.run(database.claim_dispatch_batch(
+                    'second-dispatcher', limit=1
+                ))[0]
+                self.assertEqual(recovered.rebuild_durable_queue(
+                    loader=lambda limit: [second_dispatch]
+                ), [job_id])
+                self.assertEqual(recovered._next_job(), job_id)
+                recovered._complete_queued_item(job_id, 0.05)
+                writer.flush()
+                self.assertEqual(recovered.get(job_id)['status'], 'completed')
+                self.assertEqual(recovered.get(job_id)['result']['attempt'], 2)
+                self.assertEqual(
+                    asyncio.run(database.get_job(job_id))['status'],
+                    'completed',
+                )
+                events = asyncio.run(database.list_job_events(job_id))
+                waiting_event = next(
+                    item for item in events
+                    if (item['job'].get('scheduling') or {}).get('status')
+                    == 'waiting_for_external_service'
+                )
+                replayed = asyncio.run(database.list_job_events(
+                    job_id, after_event_id=waiting_event['event_id']
+                ))
+                self.assertTrue(any(
+                    item['status'] == 'completed'
+                    and item['revision'] > waiting_event['revision']
+                    for item in replayed
+                ))
+            finally:
+                if recovered is not None:
+                    recovered.shutdown()
+                manager.shutdown()
+                writer.close()
+                asyncio.run(database.close())
+
+    def test_cancelling_deferred_retry_removes_durable_dispatch(self):
+        with tempfile.TemporaryDirectory(prefix='cancel_deferred_retry_') as raw:
+            url = f"sqlite+aiosqlite:///{(Path(raw) / 'jobs.sqlite3').as_posix()}"
+            redis = InMemoryRedis()
+            with patch.dict('os.environ', {'AUTO_CREATE_SCHEMA': 'true'}):
+                writer = DatabaseStateWriter(url, require_job_scope=True)
+            database = Database(url)
+
+            def defer(_tool, _arguments):
+                raise ServiceRetryDeferredError('uniprot', 45, 429)
+
+            manager = RedisJobManager(
+                redis_client=redis,
+                namespace='cancel-deferred-retry',
+                state_store=writer,
+                tool_executor=InlineToolExecutor(defer),
+            )
+            try:
+                prepared = manager.prepare_durable('research_catalog', {})
+                job_id = prepared['job_id']
+                asyncio.run(database.stage_job(prepared))
+                dispatched = asyncio.run(database.claim_dispatch_batch(
+                    'cancel-dispatcher', limit=1
+                ))[0]
+                manager.rebuild_durable_queue(loader=lambda limit: [dispatched])
+                self.assertEqual(manager._next_job(), job_id)
+                manager._complete_queued_item(job_id, 0.05)
+                writer.flush()
+                redis.values.clear()
+                redis.sorted_sets.clear()
+                redis.lists.clear()
+                redis.sets.clear()
+                cancelled = asyncio.run(database.cancel_deferred_job(job_id))
+                self.assertEqual(cancelled['status'], 'cancelled')
+                self.assertEqual(
+                    asyncio.run(database.get_job(job_id))['status'],
+                    'cancelled',
+                )
+                self.assertEqual(asyncio.run(database.list_dispatchable_jobs()), [])
+                self.assertEqual(manager.rebuild_durable_queue(), [])
+            finally:
+                manager.shutdown()
+                writer.close()
+                asyncio.run(database.close())
+
     def test_worker_registry_expires_and_filters_capabilities(self):
         redis = InMemoryRedis()
         registry = RedisWorkerRegistry(redis, 'registry', ttl_seconds=5)
@@ -663,6 +940,45 @@ class RedisJobManagerTests(unittest.TestCase):
             self.assertEqual(
                 redis.lists['test:jobs:dead-letter'], [submitted['job_id']]
             )
+        finally:
+            manager.shutdown()
+
+    def test_deferred_external_retry_is_not_reported_as_success(self):
+        class DeferredExecutor:
+            def execute(self, *_args, **_kwargs):
+                raise ServiceRetryDeferredError('uniprot', 45, 429)
+
+        class StateStore:
+            def __init__(self):
+                self.deferred = 0
+
+            def save(self, _record):
+                return None
+
+            def defer_pure_job(self, *_args):
+                self.deferred += 1
+                return None
+
+        redis = InMemoryRedis()
+        state_store = StateStore()
+        manager = RedisJobManager(
+            redis_client=redis,
+            namespace='deferred-external',
+            tool_executor=DeferredExecutor(),
+            state_store=state_store,
+            max_attempts=1,
+        )
+        try:
+            submitted = manager.submit('research_catalog', {})
+            failed = manager.run_job(submitted['job_id'])
+            self.assertEqual(failed['status'], 'failed')
+            self.assertEqual(failed['error_code'], 'external_retry_deferred')
+            self.assertEqual(failed['result']['retry_after_seconds'], 45)
+            self.assertEqual(
+                redis.lists['deferred-external:jobs:dead-letter'],
+                [submitted['job_id']],
+            )
+            self.assertEqual(state_store.deferred, 0)
         finally:
             manager.shutdown()
 

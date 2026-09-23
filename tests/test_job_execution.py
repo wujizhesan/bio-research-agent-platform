@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -19,6 +20,8 @@ from src.job_execution import (
     job_max_workers_from_env,
     public_execution_failure,
 )
+from src.external_service_policy import ServiceRetryDeferredError
+from src import job_subprocess
 from src.job_manager import JobManager
 from src.observability import bind_context
 from src.run_context import bind_run_context, build_run_context
@@ -44,6 +47,18 @@ result = {'path': str(path), 'content': path.read_text(encoding='utf-8')}
 Path(sys.argv[2]).write_text(json.dumps({'ok': True, 'result': result}), encoding='utf-8')
 """
 
+DEFERRED_HELPER = """import json
+from pathlib import Path
+import sys
+Path(sys.argv[2]).write_text(json.dumps({
+    'ok': False,
+    'error_code': 'external_retry_deferred',
+    'service': 'uniprot',
+    'retry_after_seconds': 120,
+    'status_code': 429,
+}), encoding='utf-8')
+"""
+
 
 class JobExecutionTests(unittest.TestCase):
     def test_public_execution_failure_hides_internal_details(self):
@@ -57,6 +72,46 @@ class JobExecutionTests(unittest.TestCase):
         })
         self.assertNotIn('secret-value', str(failure))
         self.assertNotIn('/srv/private', str(failure))
+
+    def test_public_deferred_failure_exposes_only_retry_delay(self):
+        failure = public_execution_failure(
+            ServiceRetryDeferredError('private-service', 120, 429)
+        )
+        self.assertEqual(failure, {
+            'status': 'error',
+            'error_code': 'external_retry_deferred',
+            'error': 'external service requested retry later',
+            'retry_after_seconds': 120,
+        })
+
+    def test_job_subprocess_serializes_deferred_retry(self):
+        with tempfile.TemporaryDirectory(prefix='deferred_subprocess_') as raw:
+            request_path = Path(raw) / 'request.json'
+            response_path = Path(raw) / 'response.json'
+            request_path.write_text(json.dumps({
+                'tool': 'literature_search',
+                'arguments': {},
+                'limits': {},
+            }), encoding='utf-8')
+            with patch(
+                'src.domain_registry.run_tool',
+                side_effect=ServiceRetryDeferredError('uniprot', 120, 429),
+            ):
+                code = job_subprocess.main([str(request_path), str(response_path)])
+            payload = json.loads(response_path.read_text(encoding='utf-8'))
+        self.assertEqual(code, 1)
+        self.assertFalse(payload['ok'])
+        self.assertEqual(payload['error_code'], 'external_retry_deferred')
+        self.assertEqual(payload['retry_after_seconds'], 120)
+
+    def test_process_executor_reconstructs_deferred_retry(self):
+        with tempfile.TemporaryDirectory(prefix='deferred_executor_') as raw:
+            executor = self._executor(raw)
+            executor.runner_path.write_text(DEFERRED_HELPER, encoding='utf-8')
+            with self.assertRaises(ServiceRetryDeferredError) as raised:
+                executor.execute('literature_search', {})
+        self.assertEqual(raised.exception.retry_after_seconds, 120)
+        self.assertEqual(raised.exception.status_code, 429)
 
     def _executor(self, root, **overrides):
         runner = Path(root) / 'helper.py'

@@ -9,9 +9,11 @@ from time import perf_counter
 import traceback
 
 try:
+    from .external_service_policy import ServiceRetryDeferredError
     from .observability import bind_context
     from .run_context import bind_run_context
 except ImportError:
+    from external_service_policy import ServiceRetryDeferredError
     from observability import bind_context
     from run_context import bind_run_context
 
@@ -61,6 +63,9 @@ def main(argv=None):
             'type': exc.__class__.__name__,
             'traceback': traceback.format_exc(limit=20),
         }
+        if isinstance(exc, ServiceRetryDeferredError):
+            payload.update(exc.as_payload())
+            payload['error'] = 'external service requested retry later'
         exit_code = 1
     tool = str(request.get('tool') or 'unknown')
     result_status = (

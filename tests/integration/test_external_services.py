@@ -16,6 +16,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from src.auth import Principal, roles_sha256
+from src.external_service_policy import ServiceRetryDeferredError
 from src.database import (
     Database,
     _signed_tenant_context,
@@ -1697,6 +1698,165 @@ class ExternalServiceTests(unittest.TestCase):
                         await database.close()
 
                 asyncio.run(cleanup_job())
+
+    def test_real_services_deferred_retry_survives_redis_loss(self):
+        import redis
+
+        client, namespace = self._real_redis()
+        project_id = f'deferred-retry-project-{uuid4().hex}'
+        attempts = []
+
+        def execute(_tool, _arguments):
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise ServiceRetryDeferredError('uniprot', 45, 429)
+            return {'status': 'ok', 'attempt': len(attempts)}
+
+        writer = DatabaseStateWriter(
+            os.environ['WORKER_DATABASE_URL'], require_job_scope=True
+        )
+        dispatcher = DatabaseDispatchSource(
+            os.environ['DISPATCHER_DATABASE_URL']
+        )
+        manager = RedisJobManager(
+            redis_client=client,
+            namespace=namespace,
+            worker_id='deferred-retry-worker',
+            state_store=writer,
+            tool_executor=InlineToolExecutor(execute),
+        )
+        job_id = None
+        recovered = None
+        owner = Database(os.environ['DATABASE_URL'])
+        api = Database(os.environ['API_DATABASE_URL'])
+        try:
+            asyncio.run(owner.create_project(
+                project_id,
+                'Deferred retry integration',
+                None,
+                'alice',
+                '2026-09-23T00:00:00+00:00',
+            ))
+            set_database_principal(Principal('alice', ('researcher',), 'jwt'))
+            prepared = manager.prepare_durable(
+                'research_catalog', {}, project_id=project_id
+            )
+            job_id = prepared['job_id']
+            asyncio.run(api.stage_job(prepared, project_id=project_id))
+            set_database_principal()
+
+            first = next(
+                item for item in dispatcher.claim_dispatchable(limit=1000)
+                if item['job_id'] == job_id
+            )
+            manager.rebuild_durable_queue(loader=lambda limit: [first])
+            self.assertEqual(manager._next_job(), job_id)
+            manager._complete_queued_item(job_id, 0.05)
+            writer.flush()
+            self.assertEqual(manager.get(job_id)['status'], 'queued')
+            self.assertEqual(
+                manager.get(job_id)['scheduling']['status'],
+                'waiting_for_external_service',
+            )
+            self.assertEqual(len(attempts), 1)
+            waiting_event = next(
+                item for item in asyncio.run(owner.list_job_events(job_id))
+                if (item['job'].get('scheduling') or {}).get('status')
+                == 'waiting_for_external_service'
+            )
+            self.assertEqual(waiting_event['status'], 'queued')
+            self.assertEqual(
+                waiting_event['job']['scheduling']['retry_at'],
+                manager.get(job_id)['scheduling']['retry_at'],
+            )
+            self.assertNotIn(
+                job_id,
+                {item['job_id'] for item in dispatcher.claim_dispatchable(limit=1000)},
+            )
+            first_attempt = asyncio.run(owner.get_execution_result(
+                prepared['_execution_key']
+            ))
+            self.assertEqual(first_attempt['status'], 'deferred')
+            with self.assertRaisesRegex(RuntimeError, 'deferred'):
+                asyncio.run(owner.store_execution_result(
+                    prepared['_execution_key'],
+                    job_id,
+                    {'status': 'ok', 'stale': True},
+                    first_attempt['fencing_token'],
+                ))
+
+            keys = list(client.scan_iter(f'{namespace}:*'))
+            if keys:
+                client.delete(*keys)
+            recovered = RedisJobManager(
+                redis_client=redis.Redis.from_url(
+                    os.environ['REDIS_URL'], decode_responses=True
+                ),
+                namespace=namespace,
+                worker_id='deferred-retry-worker-restarted',
+                state_store=writer,
+                tool_executor=InlineToolExecutor(execute),
+            )
+            self.assertEqual(
+                recovered.rebuild_durable_queue(loader=lambda limit: []),
+                [],
+            )
+            async def make_due():
+                async with owner.engine.begin() as connection:
+                    await connection.execute(text(
+                        "UPDATE job_outbox SET next_attempt_at = "
+                        "EXTRACT(EPOCH FROM clock_timestamp()) - 1, "
+                        "payload = jsonb_set(payload::jsonb, "
+                        "'{_retry_not_before}', "
+                        "to_jsonb((EXTRACT(EPOCH FROM clock_timestamp()) - 1)"
+                        "::double precision))::json WHERE job_id = :job_id"
+                    ), {'job_id': job_id})
+
+            asyncio.run(make_due())
+            second = next(
+                item for item in dispatcher.claim_dispatchable(limit=1000)
+                if item['job_id'] == job_id
+            )
+            self.assertEqual(recovered.rebuild_durable_queue(
+                loader=lambda limit: [second]
+            ), [job_id])
+            self.assertEqual(recovered._next_job(), job_id)
+            recovered._complete_queued_item(job_id, 0.05)
+            writer.flush()
+            self.assertEqual(recovered.get(job_id)['status'], 'completed')
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(asyncio.run(owner.get_job(job_id))['status'], 'completed')
+            replayed = asyncio.run(owner.list_job_events(
+                job_id, after_event_id=waiting_event['event_id']
+            ))
+            self.assertTrue(any(item['status'] == 'completed' for item in replayed))
+            canonical_replay = asyncio.run(owner.list_job_events(
+                job_id, after_event_id=f"r-{waiting_event['revision']}"
+            ))
+            self.assertTrue(any(
+                item['status'] == 'completed' for item in canonical_replay
+            ))
+        finally:
+            set_database_principal()
+            if recovered is not None:
+                recovered.shutdown()
+            manager.shutdown()
+            writer.close()
+            if job_id is not None:
+                async def cleanup():
+                    async with owner.engine.begin() as connection:
+                        await connection.execute(
+                            text('DELETE FROM job_records WHERE job_id = :job_id'),
+                            {'job_id': job_id},
+                        )
+                        await connection.execute(
+                            text('DELETE FROM projects WHERE project_id = :project_id'),
+                            {'project_id': project_id},
+                        )
+
+                asyncio.run(cleanup())
+            asyncio.run(api.close())
+            asyncio.run(owner.close())
 
     def test_postgres_execution_result_prevents_reexecution_after_redis_loss(self):
         import redis

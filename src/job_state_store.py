@@ -154,13 +154,17 @@ class DatabaseStateWriter:
                                     if claim is None:
                                         continue
                                     with database_worker_scope(**claim):
-                                        await database.upsert_worker_job(
-                                            item,
-                                            claim['capability'],
-                                            claim['worker_id'],
-                                            claim['fencing_token'],
-                                            claim['attempt'],
-                                        )
+                                        try:
+                                            await database.upsert_worker_job(
+                                                item,
+                                                claim['capability'],
+                                                claim['worker_id'],
+                                                claim['fencing_token'],
+                                                claim['attempt'],
+                                            )
+                                        except PermissionError as exc:
+                                            if 'worker claim is invalid or stale' not in str(exc):
+                                                raise
                             else:
                                 await database.upsert_jobs(batch)
                             self._last_error = None
@@ -306,6 +310,37 @@ class DatabaseStateWriter:
             fencing_token,
             attempt,
             semantics,
+            scope=scope,
+        )
+
+    def defer_pure_job(
+        self,
+        execution_key,
+        job_id,
+        fencing_token,
+        attempt,
+        worker_id,
+        delay_seconds,
+        max_attempts,
+        record_revision=0,
+    ):
+        scope = self._execution_scope(
+            execution_key,
+            job_id,
+            fencing_token,
+            worker_id,
+            attempt,
+        )
+        return self._database_call(
+            'defer_pure_job',
+            execution_key,
+            job_id,
+            fencing_token,
+            attempt,
+            worker_id,
+            delay_seconds,
+            max_attempts,
+            record_revision,
             scope=scope,
         )
 
@@ -520,20 +555,21 @@ class DatabaseStateWriter:
                     if scope is None:
                         return await getattr(database, method)(*args)
                     with database_worker_scope(**scope):
-                        async with database.sessions() as session:
-                            claimed = await session.scalar(
-                                text(
-                                    'SELECT bioagent_bind_worker_claim('
-                                    ':job_id, :capability, :worker_id, '
-                                    ':fencing_token, :attempt)'
-                                ),
-                                scope,
-                            )
-                            if not claimed:
-                                raise PermissionError(
-                                    'worker claim is invalid or stale'
+                        if database.url.startswith('postgresql'):
+                            async with database.sessions() as session:
+                                claimed = await session.scalar(
+                                    text(
+                                        'SELECT bioagent_bind_worker_claim('
+                                        ':job_id, :capability, :worker_id, '
+                                        ':fencing_token, :attempt)'
+                                    ),
+                                    scope,
                                 )
-                            await session.commit()
+                                if not claimed:
+                                    raise PermissionError(
+                                        'worker claim is invalid or stale'
+                                    )
+                                await session.commit()
                         return await getattr(database, method)(*args)
                 finally:
                     await database.close()

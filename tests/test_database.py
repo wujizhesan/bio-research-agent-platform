@@ -361,6 +361,106 @@ class DatabaseStateTests(unittest.TestCase):
             self.assertEqual(first['fencing_token'], '1')
             self.assertIsNone(replay)
 
+    def test_side_effecting_job_cannot_enter_automatic_retry_wait(self):
+        with tempfile.TemporaryDirectory(prefix='bio_database_retry_semantics_') as raw:
+            url = f"sqlite+aiosqlite:///{(Path(raw) / 'jobs.sqlite3').as_posix()}"
+            capability = 'side-effecting-capability-' + ('a' * 32)
+            database = Database(url)
+            try:
+                with patch.dict(os.environ, {'AUTO_CREATE_SCHEMA': 'true'}, clear=False):
+                    asyncio.run(database.init_schema())
+                asyncio.run(database.stage_job({
+                    'job_id': 'side-effecting-retry-job',
+                    'tool': 'research_catalog',
+                    'status': 'queued',
+                    'created_at': '2026-09-23T00:00:00+00:00',
+                    '_arguments': {},
+                    '_execution_key': capability,
+                    'execution_semantics': 'side_effecting',
+                    'resources': {},
+                    'priority': 0,
+                }))
+                dispatched = asyncio.run(database.claim_dispatch_batch(
+                    'side-effecting-dispatcher', limit=1
+                ))[0]
+                claim = asyncio.run(database.claim_worker_job(
+                    'side-effecting-retry-job',
+                    capability,
+                    'worker-a',
+                    dispatched['_claim_ticket'],
+                    30,
+                ))
+                self.assertIsNone(asyncio.run(database.defer_pure_job(
+                    capability,
+                    'side-effecting-retry-job',
+                    claim['fencing_token'],
+                    claim['attempt'],
+                    'worker-a',
+                    45,
+                    3,
+                )))
+                self.assertEqual(
+                    asyncio.run(database.get_job('side-effecting-retry-job'))['status'],
+                    'running',
+                )
+            finally:
+                asyncio.run(database.close())
+
+    def test_deferred_pure_job_persists_replayable_wait_event(self):
+        with tempfile.TemporaryDirectory(prefix='bio_database_retry_event_') as raw:
+            url = f"sqlite+aiosqlite:///{(Path(raw) / 'jobs.sqlite3').as_posix()}"
+            capability = 'pure-capability-' + ('a' * 32)
+            database = Database(url)
+            try:
+                with patch.dict(os.environ, {'AUTO_CREATE_SCHEMA': 'true'}, clear=False):
+                    asyncio.run(database.init_schema())
+                asyncio.run(database.stage_job({
+                    'job_id': 'pure-retry-job',
+                    'tool': 'research_catalog',
+                    'status': 'queued',
+                    'created_at': '2026-09-23T00:00:00+00:00',
+                    '_arguments': {},
+                    '_execution_key': capability,
+                    '_revision': 1,
+                    'execution_semantics': 'pure',
+                    'resources': {},
+                    'priority': 0,
+                }))
+                initial_event = asyncio.run(
+                    database.list_job_events('pure-retry-job')
+                )[0]
+                dispatched = asyncio.run(database.claim_dispatch_batch(
+                    'retry-dispatcher', limit=1
+                ))[0]
+                claim = asyncio.run(database.claim_worker_job(
+                    'pure-retry-job', capability, 'worker-a',
+                    dispatched['_claim_ticket'], 30,
+                ))
+                asyncio.run(database.begin_execution_attempt(
+                    capability, 'pure-retry-job', claim['fencing_token'],
+                    claim['attempt'], 'pure',
+                ))
+                deferred = asyncio.run(database.defer_pure_job(
+                    capability, 'pure-retry-job', claim['fencing_token'],
+                    claim['attempt'], 'worker-a', 45, 3, 4,
+                ))
+                events = asyncio.run(database.list_job_events(
+                    'pure-retry-job', after_event_id=initial_event['event_id']
+                ))
+                outbox = asyncio.run(database.list_worker_dispatchable_jobs(100))
+                stored = asyncio.run(database.get_job('pure-retry-job'))
+            finally:
+                asyncio.run(database.close())
+            self.assertEqual(deferred['revision'], 5)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]['revision'], 5)
+            self.assertEqual(events[0]['job']['scheduling']['status'],
+                             'waiting_for_external_service')
+            self.assertEqual(events[0]['job']['scheduling']['retry_at'],
+                             deferred['retry_at'])
+            self.assertEqual(stored['status'], 'queued')
+            self.assertEqual(outbox, [])
+
     def test_tenant_ownership_is_immutable_and_queries_are_scoped(self):
         with tempfile.TemporaryDirectory(prefix='bio_database_tenant_') as raw:
             url = f"sqlite+aiosqlite:///{(Path(raw) / 'tenant.sqlite3').as_posix()}"
@@ -599,10 +699,17 @@ class DatabaseStateTests(unittest.TestCase):
                         'event-job',
                         after_event_id='1000-0',
                     ))
+                    canonical_replay = asyncio.run(database.list_job_events(
+                        'event-job',
+                        after_event_id='r-1',
+                    ))
                 finally:
                     asyncio.run(database.close())
             self.assertEqual([item['event_id'] for item in events], ['1000-0', '1001-0'])
             self.assertEqual([item['event_id'] for item in replay], ['1001-0'])
+            self.assertEqual(
+                [item['revision'] for item in canonical_replay], [2]
+            )
             self.assertTrue(replay[0]['terminal'])
             self.assertNotIn('secret_input', str(events))
 
@@ -637,6 +744,11 @@ class DatabaseStateTests(unittest.TestCase):
                         'long-event-job',
                         after_event_id='missing-0',
                     ))
+                    canonical_replay = asyncio.run(database.list_job_events(
+                        'long-event-job',
+                        after_event_id='r-120',
+                        limit=10,
+                    ))
                 finally:
                     asyncio.run(database.close())
             self.assertEqual(
@@ -646,6 +758,39 @@ class DatabaseStateTests(unittest.TestCase):
             self.assertNotIn('replay_gap', replay[0])
             self.assertEqual(reset[0]['event_id'], '1150-0')
             self.assertTrue(reset[0]['replay_gap'])
+            self.assertEqual(
+                [item['revision'] for item in canonical_replay],
+                list(range(121, 131)),
+            )
+
+    def test_unknown_stream_cursor_replays_latest_running_snapshot(self):
+        with tempfile.TemporaryDirectory(prefix='bio_database_running_gap_') as raw:
+            url = f"sqlite+aiosqlite:///{(Path(raw) / 'events.sqlite3').as_posix()}"
+            database = Database(url)
+            try:
+                with patch.dict(os.environ, {'AUTO_CREATE_SCHEMA': 'true'}, clear=False):
+                    asyncio.run(database.init_schema())
+                asyncio.run(database.upsert_jobs([{
+                    'job_id': 'running-gap-job',
+                    'tool': 'research_catalog',
+                    'status': 'running',
+                    'created_at': '2026-09-23T00:00:00+00:00',
+                    '_revision': 3,
+                    '_event_id': '1003-0',
+                }]))
+                events = asyncio.run(database.list_job_events(
+                    'running-gap-job', after_event_id='9999-0'
+                ))
+                future = asyncio.run(database.list_job_events(
+                    'running-gap-job', after_event_id='r-2147483648'
+                ))
+            finally:
+                asyncio.run(database.close())
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]['status'], 'running')
+            self.assertTrue(events[0]['replay_gap'])
+            self.assertEqual(future[0]['status'], 'running')
+            self.assertTrue(future[0]['replay_gap'])
 
     def test_execution_result_is_persisted_idempotently(self):
         with tempfile.TemporaryDirectory(prefix='bio_database_result_') as raw:

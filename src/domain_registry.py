@@ -19,6 +19,7 @@ try:
     from . import sequence_plugin as SEQUENCE_PLUGIN
     from .plugin_registry import DomainRegistry, validate_tool_map
     from .plugin_manifest import build_manifest, validate_install_candidate
+    from .external_service_policy import ServiceRetryDeferredError
     from .observability import (
         TOOL_ACTIVE,
         TOOL_DURATION,
@@ -47,6 +48,7 @@ except ImportError:
     import sequence_plugin as SEQUENCE_PLUGIN
     from plugin_registry import DomainRegistry, validate_tool_map
     from plugin_manifest import build_manifest, validate_install_candidate
+    from external_service_policy import ServiceRetryDeferredError
     from observability import (
         TOOL_ACTIVE,
         TOOL_DURATION,
@@ -356,6 +358,8 @@ def _run_tool(name, args=None):
             "error_type": "plugin_security",
             "error": str(exc),
         }
+    except ServiceRetryDeferredError:
+        raise
     except Exception as exc:
         return {
             "status": "error",

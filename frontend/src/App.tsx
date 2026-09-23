@@ -126,6 +126,7 @@ function App() {
   const {
     selectedJob,
     events,
+    connectionMode,
     loading,
     submitToolJob,
     cancelSelectedJob,
@@ -438,7 +439,7 @@ function App() {
                   <div className="mt-6 flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2 font-mono text-[10px] text-[#7fa49c]"><CircleDot size={13} className="text-[#70e3ad]" />异步 / 可追溯 / 可重放</div><button onClick={submitRun} disabled={loading || (mode === 'research' ? !task.trim() : mode === 'rnaseq' ? !rnaseqTask.trim() || rnaseqPreflight.pairMismatch : mode === 'variant' ? !variantTask.trim() : mode === 'sequence' ? !protein.trim() : false)} className="group inline-flex items-center gap-2 rounded-xl bg-[#a8f0d2] px-4 py-2.5 text-sm font-semibold text-[#092521] transition hover:bg-[#c6f8e1] disabled:cursor-not-allowed disabled:opacity-50">{loading ? <RefreshCw size={15} className="animate-spin" /> : <Play size={15} />}{loading ? '执行中…' : '开始运行'}<ArrowUpRight size={14} className="transition group-hover:translate-x-0.5 group-hover:-translate-y-0.5" /></button></div>
                 </div>
 
-                <ExecutionStream job={selectedJob} events={events} />
+                <ExecutionStream job={selectedJob} events={events} connectionMode={connectionMode} />
               </section>
 
               {selectedJob?.status === 'completed' && <JobResultSection job={selectedJob} pluginId={selectedJobPluginId} structureId={sequenceStructureId} onDownload={(path) => void downloadJobArtifact(selectedJob.job_id, path)} onOpenReport={(path) => void previewJobArtifact(selectedJob.job_id, path)} onError={reportBoundaryError} />}

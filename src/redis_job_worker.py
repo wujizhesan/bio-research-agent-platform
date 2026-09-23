@@ -9,12 +9,14 @@ from time import monotonic, sleep
 try:
     from .artifact_store import pack_execution_result, unpack_execution_result
     from .execution_semantics import ArtifactTransaction, execution_semantics
+    from .external_service_policy import ServiceRetryDeferredError
     from .job_execution import public_execution_failure, public_tool_failure
     from .job_manager import TERMINAL_STATUSES
     from .observability import log_event
 except ImportError:
     from artifact_store import pack_execution_result, unpack_execution_result
     from execution_semantics import ArtifactTransaction, execution_semantics
+    from external_service_policy import ServiceRetryDeferredError
     from job_execution import public_execution_failure, public_tool_failure
     from job_manager import TERMINAL_STATUSES
     from observability import log_event
@@ -162,6 +164,21 @@ class RedisJobWorkerRuntime:
                     'external state must be reviewed before manual retry',
                     fencing_token=fencing_token,
                 )
+            if isinstance(exc, ServiceRetryDeferredError):
+                try:
+                    deferred = manager.defer_external_retry(
+                        record, exc.retry_after_seconds
+                    )
+                except Exception as defer_exc:
+                    log_event(
+                        'job.external_retry_defer_failed',
+                        level=logging.ERROR,
+                        job_id=job_id,
+                        error_type=type(defer_exc).__name__,
+                    )
+                    return manager._public_record(manager._load(job_id))
+                if deferred is not None:
+                    return deferred
             failure = public_execution_failure(exc)
             return manager._finish(
                 job_id,
@@ -329,6 +346,14 @@ class RedisJobWorkerRuntime:
             manager._ack(job_id)
         elif outcome and outcome.get('status') == 'queued':
             manager._ack(job_id)
+            retry_at = max(
+                float(record.get('_retry_not_before') or 0),
+                float((outcome.get('scheduling') or {}).get('retry_at') or 0),
+            )
+            if retry_at > manager._store.server_time():
+                return
+            if record.get('status') != 'queued':
+                return
             route_id = (
                 manager._store.register_route(record)
                 if record.get('_capability_routing') else None

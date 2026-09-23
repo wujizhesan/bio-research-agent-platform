@@ -48,6 +48,8 @@ class RedisExecutionCoordinator:
                 return current
             if current.get('_cancel_requested'):
                 return current
+            if float(current.get('_retry_not_before') or 0) > self.store.server_time():
+                return current
             lease_until = current.get('_lease_until')
             server_now = self.store.server_time()
             if (
@@ -326,6 +328,8 @@ class RedisExecutionCoordinator:
                 return current
 
             record, _ = self.store.atomic_update(job_id, cancel)
+            return self.store.public_record(record)
+        if float(record.get('_retry_not_before') or 0) > self.store.server_time():
             return self.store.public_record(record)
         resources = ResourceRequest.from_mapping(record.get('resources'))
         if (

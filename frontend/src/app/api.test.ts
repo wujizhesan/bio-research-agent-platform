@@ -27,8 +27,8 @@ class MockEventSource {
     this.closed = true
   }
 
-  emit(type: string, payload: unknown) {
-    const event = { data: typeof payload === 'string' ? payload : JSON.stringify(payload) } as MessageEvent<string>
+  emit(type: string, payload: unknown, lastEventId = '') {
+    const event = { data: typeof payload === 'string' ? payload : JSON.stringify(payload), lastEventId } as MessageEvent<string>
     this.listeners.get(type)?.forEach((listener) => listener(event))
   }
 
@@ -226,13 +226,14 @@ describe('followJob', () => {
     await vi.advanceTimersByTimeAsync(0)
     expect(MockEventSource.instances).toHaveLength(1)
 
-    MockEventSource.instances[0].emit('job', { job: running })
+    MockEventSource.instances[0].emit('job', { job: running }, 'r-2')
     MockEventSource.instances[0].fail()
     await vi.advanceTimersByTimeAsync(500)
     expect(MockEventSource.instances).toHaveLength(2)
+    expect(MockEventSource.instances[1].url).toContain('last_event_id=r-2')
 
-    MockEventSource.instances[1].emit('job', { job: running })
-    MockEventSource.instances[1].emit('job', { job: completedJob() })
+    MockEventSource.instances[1].emit('job', { job: running }, 'r-2')
+    MockEventSource.instances[1].emit('job', { job: completedJob() }, 'r-3')
 
     await expect(operation).resolves.toBeUndefined()
     expect(onEvent).toHaveBeenCalledTimes(2)
@@ -240,9 +241,14 @@ describe('followJob', () => {
     expect(fetch).toHaveBeenCalledTimes(2)
   })
 
-  it('连续三次连接失败后停止重试并关闭全部连接', async () => {
+  it('连续三次连接失败后切换轮询并接收终态', async () => {
     vi.useFakeTimers()
-    const operation = followJob('https://api.example.test', 'secret', 'job-1', vi.fn())
+    const onEvent = vi.fn()
+    const onConnectionState = vi.fn()
+    vi.mocked(fetch).mockImplementation(async (input) => String(input).endsWith('/events/ticket')
+      ? jsonResponse({ ticket: 'ticket', expires_in: 60 })
+      : jsonResponse({ job: completedJob() }))
+    const operation = followJob('https://api.example.test', 'secret', 'job-1', onEvent, undefined, onConnectionState)
     await vi.advanceTimersByTimeAsync(0)
 
     MockEventSource.instances[0].fail()
@@ -251,23 +257,118 @@ describe('followJob', () => {
     await vi.advanceTimersByTimeAsync(1000)
     MockEventSource.instances[2].fail()
 
-    await expect(operation).rejects.toThrow('任务 SSE 连接断开')
+    await expect(operation).resolves.toBeUndefined()
     expect(MockEventSource.instances).toHaveLength(3)
     expect(MockEventSource.instances.every((source) => source.closed)).toBe(true)
+    expect(onConnectionState.mock.calls.map((call) => call[0])).toEqual(['reconnecting', 'polling'])
+    expect(onEvent).toHaveBeenCalledWith('job', { job: completedJob() })
+    expect(fetch).toHaveBeenCalledWith('https://api.example.test/api/v1/jobs/job-1', expect.objectContaining({ signal: undefined }))
   })
 
-  it('拒绝格式错误的 SSE 消息', async () => {
+  it('拒绝格式错误的 SSE 消息且不继续重连', async () => {
     vi.useFakeTimers()
     const operation = followJob('https://api.example.test', 'secret', 'job-1', vi.fn())
     await vi.advanceTimersByTimeAsync(0)
 
     MockEventSource.instances[0].emit('job', '{bad json')
-    await vi.advanceTimersByTimeAsync(500)
-    MockEventSource.instances[1].emit('job', '{bad json')
-    await vi.advanceTimersByTimeAsync(1000)
-    MockEventSource.instances[2].emit('job', '{bad json')
-
     await expect(operation).rejects.toThrow('任务流消息格式无效')
+    expect(MockEventSource.instances).toHaveLength(1)
+  })
+
+  it('服务端流超时后换票继续读取同一游标', async () => {
+    vi.useFakeTimers()
+    const onEvent = vi.fn()
+    const operation = followJob('https://api.example.test', 'secret', 'job-1', onEvent)
+    await vi.advanceTimersByTimeAsync(0)
+
+    MockEventSource.instances[0].emit('job', { job: completedJob({ status: 'running' }) }, 'r-4')
+    MockEventSource.instances[0].emit('timeout', {})
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(MockEventSource.instances).toHaveLength(2)
+    expect(MockEventSource.instances[1].url).toContain('last_event_id=r-4')
+    MockEventSource.instances[1].emit('job', { job: completedJob() }, 'r-5')
+    await expect(operation).resolves.toBeUndefined()
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('轮询期间短暂失败后仍能追到完成状态', async () => {
+    vi.useFakeTimers()
+    const onEvent = vi.fn()
+    let polls = 0
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      if (String(input).endsWith('/events/ticket')) return jsonResponse({ ticket: 'ticket', expires_in: 60 })
+      polls += 1
+      return polls === 1
+        ? jsonResponse({ detail: '暂时不可用' }, { ok: false, status: 503 })
+        : jsonResponse({ job: completedJob() })
+    })
+    const operation = followJob('https://api.example.test', 'secret', 'job-1', onEvent)
+    await vi.advanceTimersByTimeAsync(0)
+    MockEventSource.instances[0].fail()
+    await vi.advanceTimersByTimeAsync(500)
+    MockEventSource.instances[1].fail()
+    await vi.advanceTimersByTimeAsync(1000)
+    MockEventSource.instances[2].fail()
+    await vi.advanceTimersByTimeAsync(1000)
+
+    await expect(operation).resolves.toBeUndefined()
+    expect(polls).toBe(2)
+    expect(onEvent).toHaveBeenCalledWith('job', { job: completedJob() })
+  })
+
+  it('轮询鉴权失败时立即停止', async () => {
+    vi.useFakeTimers()
+    vi.mocked(fetch).mockImplementation(async (input) => String(input).endsWith('/events/ticket')
+      ? jsonResponse({ ticket: 'ticket', expires_in: 60 })
+      : jsonResponse({ detail: '无权访问' }, { ok: false, status: 403 }))
+    const operation = followJob('https://api.example.test', 'secret', 'job-1', vi.fn())
+    await vi.advanceTimersByTimeAsync(0)
+    MockEventSource.instances[0].fail()
+    await vi.advanceTimersByTimeAsync(500)
+    MockEventSource.instances[1].fail()
+    await vi.advanceTimersByTimeAsync(1000)
+    MockEventSource.instances[2].fail()
+
+    await expect(operation).rejects.toThrow('无权访问')
+    expect(fetch).toHaveBeenCalledTimes(4)
+  })
+
+  it('退避等待中取消时立即停止且不再创建连接', async () => {
+    vi.useFakeTimers()
+    const controller = new AbortController()
+    const operation = followJob('https://api.example.test', 'secret', 'job-1', vi.fn(), controller.signal)
+    await vi.advanceTimersByTimeAsync(0)
+    MockEventSource.instances[0].fail()
+
+    controller.abort()
+
+    await expect(operation).rejects.toMatchObject({ name: 'AbortError' })
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(MockEventSource.instances).toHaveLength(1)
+  })
+
+  it('轮询等待中取消时不继续请求任务', async () => {
+    vi.useFakeTimers()
+    const controller = new AbortController()
+    vi.mocked(fetch).mockImplementation(async (input) => String(input).endsWith('/events/ticket')
+      ? jsonResponse({ ticket: 'ticket', expires_in: 60 })
+      : jsonResponse({ job: completedJob({ status: 'running' }) }))
+    const operation = followJob('https://api.example.test', 'secret', 'job-1', vi.fn(), controller.signal)
+    await vi.advanceTimersByTimeAsync(0)
+    MockEventSource.instances[0].fail()
+    await vi.advanceTimersByTimeAsync(500)
+    MockEventSource.instances[1].fail()
+    await vi.advanceTimersByTimeAsync(1000)
+    MockEventSource.instances[2].fail()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetch).toHaveBeenCalledTimes(4)
+
+    controller.abort()
+
+    await expect(operation).rejects.toMatchObject({ name: 'AbortError' })
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(fetch).toHaveBeenCalledTimes(4)
   })
 
   it('中止信号立即关闭 SSE 且不再重连', async () => {

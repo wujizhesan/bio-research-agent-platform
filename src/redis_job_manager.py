@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from contextlib import nullcontext
+import math
 from threading import RLock
 from uuid import uuid4
 
@@ -547,6 +548,8 @@ class RedisJobManager:
                 raise ValueError(f'job not found: {job_id}')
             if record.get('status') != 'queued':
                 return self._public_record(record)
+            if float(record.get('_retry_not_before') or 0) > self._store.server_time():
+                return self._public_record(record)
             route_id = None
             if record.get('_capability_routing'):
                 route_id = self._store.register_route(record)
@@ -604,15 +607,59 @@ class RedisJobManager:
             with self._lock, guard:
                 existing = self._load(job_id)
                 if existing is not None:
+                    deferred_attempt = durable.get('_deferred_attempt')
+                    if (
+                        deferred_attempt is not None
+                        and durable.get('status') == 'queued'
+                        and int(existing.get('_attempts', 0)) <= int(deferred_attempt)
+                        and existing.get('status') != 'queued'
+                    ):
+                        def restore_deferred(current, _server_now):
+                            if int(current.get('_attempts', 0)) > int(deferred_attempt):
+                                return None
+                            current['status'] = 'queued'
+                            current['_attempts'] = int(deferred_attempt)
+                            current['_revision'] = max(
+                                int(current.get('_revision', 0)),
+                                int(durable.get('_revision', 0)),
+                            )
+                            current['_retry_not_before'] = durable['_retry_not_before']
+                            current['scheduling'] = dict(durable.get('scheduling') or {})
+                            for key in (
+                                'started_at', 'finished_at', 'result', 'error',
+                                '_worker_id', '_lease_until', '_fencing_token',
+                                '_started_epoch',
+                            ):
+                                current.pop(key, None)
+                            return current
+
+                        existing, restored = self._store.atomic_update(
+                            job_id, restore_deferred, persist_state=False
+                        )
+                        if restored:
+                            self._metrics.deferred_reconciled(
+                                durable, 'stale_cache', self._store.server_time()
+                            )
                     claim_ticket = durable.get('_claim_ticket')
                     if claim_ticket and existing.get('status') == 'queued':
                         def refresh_claim_ticket(current, _server_now):
                             if current.get('status') != 'queued':
                                 return None
                             current['_claim_ticket'] = str(claim_ticket)
+                            current['_revision'] = max(
+                                int(current.get('_revision', 0)),
+                                int(durable.get('_revision', 0)),
+                            )
                             current['_dispatch_generation'] = int(
                                 durable.get('_dispatch_generation') or 0
                             )
+                            current.pop('_retry_not_before', None)
+                            current.pop('_deferred_attempt', None)
+                            if (
+                                (current.get('scheduling') or {}).get('status')
+                                == 'waiting_for_external_service'
+                            ):
+                                current.pop('scheduling', None)
                             return current
 
                         refreshed, changed = self._store.atomic_update(
@@ -626,6 +673,8 @@ class RedisJobManager:
                         saver(existing)
                     if (
                         existing.get('status') == 'queued'
+                        and float(existing.get('_retry_not_before') or 0)
+                        <= self._store.server_time()
                         and not self._store.queue_contains(job_id)
                         and not self._store.processing_contains(job_id)
                     ):
@@ -654,7 +703,22 @@ class RedisJobManager:
                 record.setdefault('_attempts', 0)
                 record.setdefault('_cancel_requested', False)
                 record.setdefault('_created_score', self._store.server_time())
+                was_deferred = record.get('_deferred_attempt') is not None
+                if record.get('_claim_ticket'):
+                    record.pop('_retry_not_before', None)
+                    record.pop('_deferred_attempt', None)
+                    if (
+                        (record.get('scheduling') or {}).get('status')
+                        == 'waiting_for_external_service'
+                    ):
+                        record.pop('scheduling', None)
                 self._save(record)
+                if was_deferred:
+                    self._metrics.deferred_reconciled(
+                        record, 'redis_loss', self._store.server_time()
+                    )
+                if float(record.get('_retry_not_before') or 0) > self._store.server_time():
+                    continue
                 route_id = (
                     self._store.register_route(record)
                     if record.get('_capability_routing') else None
@@ -693,6 +757,19 @@ class RedisJobManager:
         def request_cancel(current, _server_now):
             if current.get('status') in TERMINAL_STATUSES:
                 return None
+            if (
+                current.get('status') == 'queued'
+                and (current.get('scheduling') or {}).get('status')
+                == 'waiting_for_external_service'
+            ):
+                current.update({
+                    'status': 'cancelled',
+                    'finished_at': _now(),
+                    'error': 'job cancelled by user',
+                    '_cancel_requested': True,
+                })
+                current.pop('_retry_not_before', None)
+                return current
             current['_cancel_requested'] = True
             return current
 
@@ -930,6 +1007,73 @@ class RedisJobManager:
             reason,
             fencing_token=fencing_token,
         )
+
+    def defer_external_retry(self, record, delay_seconds):
+        callback = getattr(self.state_store, 'defer_pure_job', None)
+        if callback is None or record.get('execution_semantics') != 'pure':
+            return None
+        delay = float(delay_seconds)
+        if not math.isfinite(delay) or not 0 < delay <= 604800:
+            return None
+        attempt = int(record.get('_attempts', 0))
+        if attempt >= self.max_attempts:
+            return None
+        job_id = str(record['job_id'])
+        fencing_token = str(record['_fencing_token'])
+        deferred = callback(
+            record['_execution_key'],
+            job_id,
+            fencing_token,
+            attempt,
+            self.worker_id,
+            delay,
+            self.max_attempts,
+            int(record.get('_revision', 0)),
+        )
+        if not deferred:
+            return None
+        retry_at = float(deferred['retry_at'])
+
+        def transition(current, _server_now):
+            if (
+                current.get('status') != 'running'
+                or current.get('_worker_id') != self.worker_id
+                or str(current.get('_fencing_token')) != fencing_token
+            ):
+                return None
+            current['status'] = 'queued'
+            current['_revision'] = max(
+                int(current.get('_revision', 0)),
+                int(deferred.get('revision') or 0),
+            )
+            current['_retry_not_before'] = retry_at
+            current['_deferred_attempt'] = attempt
+            current['scheduling'] = {
+                'status': 'waiting_for_external_service',
+                'retry_at': retry_at,
+            }
+            for key in (
+                'started_at', '_worker_id', '_lease_until',
+                '_fencing_token', '_started_epoch',
+            ):
+                current.pop(key, None)
+            return current
+
+        try:
+            current, _ = self._store.atomic_update(
+                job_id, transition, persist_state=False
+            )
+        except Exception as exc:
+            self._metrics.deferred_cache_sync_failed(job_id, exc)
+            return {
+                **self._public_record(record),
+                'status': 'queued',
+                'scheduling': {
+                    'status': 'waiting_for_external_service',
+                    'retry_at': retry_at,
+                },
+            }
+        return self._public_record(current) if current else None
 
     def recover_stale_jobs(self):
         return self._recovery.recover_stale_jobs()
