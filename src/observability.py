@@ -246,6 +246,11 @@ JOB_QUEUE_DURATION = Histogram(
     'Time jobs spend queued before execution.',
     ['backend', 'tool'],
 )
+JOB_QUEUE_PHASE_DURATION = Histogram(
+    'bio_agent_job_queue_phase_duration_seconds',
+    'Duration of each durable job queue phase before first execution.',
+    ['backend', 'tool', 'phase'],
+)
 JOB_ACTIVE = Gauge(
     'bio_agent_job_active',
     'Jobs currently executing.',

@@ -1224,11 +1224,12 @@ class Database:
                 if outbox is not None:
                     await session.delete(outbox)
             elif outbox is None:
-                session.add(JobOutboxRow(
+                outbox = JobOutboxRow(
                     job_id=values['job_id'],
                     payload=payload,
                     created_at=values['created_at'],
-                ))
+                )
+                session.add(outbox)
             else:
                 outbox.payload = payload
                 outbox.last_error = None
@@ -1279,6 +1280,11 @@ class Database:
                     job_id=values['job_id'],
                     created_at=ownership_created_at or values['created_at'],
                 ))
+            if outbox is not None and values['status'] not in TERMINAL_STATUSES:
+                outbox.payload = {
+                    **payload,
+                    '_outbox_staged_at': datetime.now(timezone.utc).isoformat(),
+                }
             try:
                 await session.commit()
             except IntegrityError:
@@ -1465,6 +1471,9 @@ class Database:
                         raise PermissionError('dispatcher claim ticket issuance denied')
                     record['_claim_ticket'] = ticket
                 await session.commit()
+                claimed_at = datetime.now(timezone.utc).isoformat()
+                for record in records:
+                    record['_dispatch_claimed_at'] = claimed_at
                 return records
 
             current_time = time()
@@ -1510,6 +1519,9 @@ class Database:
                 record['_claim_ticket'] = ticket
                 records.append(record)
             await session.commit()
+            claimed_at = datetime.now(timezone.utc).isoformat()
+            for record in records:
+                record['_dispatch_claimed_at'] = claimed_at
             return records
 
     async def complete_dispatch_claims(

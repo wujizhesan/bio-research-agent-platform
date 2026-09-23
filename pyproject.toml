@@ -181,6 +181,7 @@ py-modules = [
   "redis_job_metrics",
   "redis_job_recovery",
   "redis_job_store",
+  "queue_timing",
   "redis_job_worker",
   "redis_worker_registry",
   "job_state_store",

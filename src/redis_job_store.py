@@ -8,6 +8,11 @@ from time import time
 from uuid import uuid4
 
 try:
+    from .queue_timing import queue_phase_seconds
+except ImportError:
+    from queue_timing import queue_phase_seconds
+
+try:
     from redis.exceptions import WatchError
 except ImportError:
     class WatchError(Exception):
@@ -170,6 +175,15 @@ class RedisQueueStore:
     @staticmethod
     def public_record(record):
         output = dict(record)
+        phases = queue_phase_seconds(record)
+        if phases is not None:
+            output['queue_phase_seconds'] = {
+                phase: round(duration, 3)
+                for phase, duration in phases.items()
+            }
+        output.pop('_outbox_staged_at', None)
+        output.pop('_dispatch_claimed_at', None)
+        output.pop('_redis_enqueued_at', None)
         output.pop('_arguments', None)
         output.pop('_cancel_requested', None)
         output.pop('_created_score', None)

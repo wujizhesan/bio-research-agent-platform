@@ -44,12 +44,22 @@ def job_timings(job, client_seconds):
     execution_seconds = (finished - started).total_seconds()
     if queue_seconds < 0 or execution_seconds < 0:
         raise RuntimeError('benchmark job timestamps are out of order')
+    phases = job.get('queue_phase_seconds') or {}
+    expected_phases = ('submission', 'outbox_wait', 'dispatch', 'worker_wait')
+    if any(phase not in phases for phase in expected_phases):
+        raise RuntimeError('benchmark job missing queue phase timings')
+    phase_seconds = {phase: float(phases[phase]) for phase in expected_phases}
+    if any(value < 0 for value in phase_seconds.values()) or abs(
+        sum(phase_seconds.values()) - queue_seconds
+    ) > 0.01:
+        raise RuntimeError('benchmark queue phase timings do not match queue duration')
     return {
         'job_id': str(job['job_id']),
         'client_seconds': round(client_seconds, 3),
         'queue_seconds': round(queue_seconds, 3),
         'execution_seconds': round(execution_seconds, 3),
         'server_total_seconds': round((finished - created).total_seconds(), 3),
+        **{f'{phase}_seconds': value for phase, value in phase_seconds.items()},
     }
 
 
@@ -127,6 +137,10 @@ def benchmark(
         'queue_seconds',
         'execution_seconds',
         'server_total_seconds',
+        'submission_seconds',
+        'outbox_wait_seconds',
+        'dispatch_seconds',
+        'worker_wait_seconds',
     )
     return {
         'tool': 'knowledge_search',

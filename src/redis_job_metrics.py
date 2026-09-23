@@ -9,6 +9,7 @@ try:
         JOB_ACTIVE,
         JOB_DURATION,
         JOB_EXECUTIONS,
+        JOB_QUEUE_PHASE_DURATION,
         JOB_QUEUE_DURATION,
         JOB_TRANSITIONS,
         REDIS_DEAD_LETTER_DEPTH,
@@ -23,11 +24,13 @@ try:
         REDIS_WORKER_DRAINING,
         log_event,
     )
+    from .queue_timing import queue_phase_seconds
 except ImportError:
     from observability import (
         JOB_ACTIVE,
         JOB_DURATION,
         JOB_EXECUTIONS,
+        JOB_QUEUE_PHASE_DURATION,
         JOB_QUEUE_DURATION,
         JOB_TRANSITIONS,
         REDIS_DEAD_LETTER_DEPTH,
@@ -42,6 +45,7 @@ except ImportError:
         REDIS_WORKER_DRAINING,
         log_event,
     )
+    from queue_timing import queue_phase_seconds
 
 
 REDIS_DEFERRED_CACHE_SYNC_FAILURES = Counter(
@@ -127,6 +131,12 @@ class RedisJobMetrics:
 
     def claimed(self, record, worker_id):
         tool = record['tool']
+        phases = queue_phase_seconds(record)
+        if phases is not None:
+            for phase, duration in phases.items():
+                JOB_QUEUE_PHASE_DURATION.labels(
+                    self.backend, tool, phase
+                ).observe(duration)
         if record.get('_attempts', 0) > 1 or record.get('retry_of'):
             REDIS_JOB_RETRIES.labels(tool).inc()
         REDIS_WORKER_ACTIVE.labels(self.namespace).inc()

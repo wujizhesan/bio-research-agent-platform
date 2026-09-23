@@ -1,6 +1,7 @@
 import asyncio
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 import json
 from pathlib import Path
 from threading import Event
@@ -127,6 +128,54 @@ class InMemoryRedis:
 
 
 class RedisJobManagerTests(unittest.TestCase):
+    def test_durable_job_reports_queue_phase_durations(self):
+        with tempfile.TemporaryDirectory(prefix='durable_queue_timing_') as raw:
+            url = f"sqlite+aiosqlite:///{(Path(raw) / 'jobs.sqlite3').as_posix()}"
+            database = Database(url)
+            manager = RedisJobManager(
+                redis_client=InMemoryRedis(),
+                namespace='durable-queue-timing',
+                tool_executor=InlineToolExecutor(
+                    lambda _tool, _arguments: {'status': 'ok'}
+                ),
+            )
+            try:
+                asyncio.run(database.init_schema())
+                prepared = manager.prepare_durable('research_catalog', {})
+                asyncio.run(database.stage_job(prepared))
+                dispatched = asyncio.run(database.claim_dispatch_batch(
+                    'queue-timing-dispatcher', limit=1
+                ))[0]
+                self.assertIn('_outbox_staged_at', dispatched, dispatched)
+                self.assertEqual(
+                    manager.rebuild_durable_queue(
+                        loader=lambda limit: [dispatched]
+                    ),
+                    [prepared['job_id']],
+                )
+                self.assertEqual(manager._next_job(), prepared['job_id'])
+                manager._complete_queued_item(prepared['job_id'], 0.05)
+                result = manager.get(prepared['job_id'])
+                self.assertIn('queue_phase_seconds', result, manager._load(prepared['job_id']))
+                phases = result['queue_phase_seconds']
+                self.assertEqual(
+                    set(phases),
+                    {'submission', 'outbox_wait', 'dispatch', 'worker_wait'},
+                )
+                self.assertTrue(all(value >= 0 for value in phases.values()))
+                self.assertLess(
+                    abs(sum(phases.values()) - (
+                        datetime.fromisoformat(result['started_at'])
+                        - datetime.fromisoformat(result['created_at'])
+                    ).total_seconds()),
+                    0.01,
+                )
+                self.assertNotIn('_dispatch_claimed_at', result)
+                self.assertNotIn('_redis_enqueued_at', result)
+            finally:
+                manager.shutdown()
+                asyncio.run(database.close())
+
     def test_worker_claim_after_successful_dispatch_reconciliation_delay(self):
         with tempfile.TemporaryDirectory(prefix='worker_claim_dispatch_') as raw:
             url = f"sqlite+aiosqlite:///{(Path(raw) / 'jobs.sqlite3').as_posix()}"

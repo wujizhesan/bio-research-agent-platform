@@ -646,6 +646,10 @@ class RedisJobManager:
                             if current.get('status') != 'queued':
                                 return None
                             current['_claim_ticket'] = str(claim_ticket)
+                            if not current.get('_redis_enqueued_at'):
+                                for key in ('_outbox_staged_at', '_dispatch_claimed_at'):
+                                    if durable.get(key):
+                                        current[key] = durable[key]
                             current['_revision'] = max(
                                 int(current.get('_revision', 0)),
                                 int(durable.get('_revision', 0)),
@@ -682,6 +686,17 @@ class RedisJobManager:
                             self._store.register_route(existing)
                             if existing.get('_capability_routing') else None
                         )
+                        def mark_enqueued(current, _server_now):
+                            if current.get('status') != 'queued':
+                                return None
+                            current['_redis_enqueued_at'] = _now()
+                            return current
+
+                        existing, marked = self._store.atomic_update(
+                            job_id, mark_enqueued, persist_state=False
+                        )
+                        if not marked:
+                            continue
                         self._store.enqueue(
                             job_id,
                             int(existing.get('priority', 0)),
@@ -712,17 +727,21 @@ class RedisJobManager:
                         == 'waiting_for_external_service'
                     ):
                         record.pop('scheduling', None)
+                due = float(record.get('_retry_not_before') or 0) <= self._store.server_time()
+                route_id = None
+                if due:
+                    route_id = (
+                        self._store.register_route(record)
+                        if record.get('_capability_routing') else None
+                    )
+                    record['_redis_enqueued_at'] = _now()
                 self._save(record)
                 if was_deferred:
                     self._metrics.deferred_reconciled(
                         record, 'redis_loss', self._store.server_time()
                     )
-                if float(record.get('_retry_not_before') or 0) > self._store.server_time():
+                if not due:
                     continue
-                route_id = (
-                    self._store.register_route(record)
-                    if record.get('_capability_routing') else None
-                )
                 self._store.enqueue(
                     job_id,
                     int(record.get('priority', 0)),

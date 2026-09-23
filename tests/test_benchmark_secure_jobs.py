@@ -29,12 +29,19 @@ class SecureJobBenchmarkTests(unittest.TestCase):
             index = int(path.rsplit('-', 1)[-1])
             created = base + timedelta(minutes=index)
             started = created + timedelta(seconds=queue_delays[index])
+            delay = queue_delays[index]
             return {'job': {
                 'job_id': f'job-{index}',
                 'status': 'completed',
                 'created_at': created.isoformat(),
                 'started_at': started.isoformat(),
                 'finished_at': (started + timedelta(seconds=1)).isoformat(),
+                'queue_phase_seconds': {
+                    'submission': 0.05,
+                    'outbox_wait': round(delay - 0.15, 3),
+                    'dispatch': 0.05,
+                    'worker_wait': 0.05,
+                },
             }}
 
         report = benchmark(
@@ -48,6 +55,7 @@ class SecureJobBenchmarkTests(unittest.TestCase):
         self.assertEqual(report['summary_seconds']['queue_seconds']['p50'], 0.3)
         self.assertEqual(report['summary_seconds']['execution_seconds']['p95'], 1.0)
         self.assertEqual(report['summary_seconds']['server_total_seconds']['max'], 1.4)
+        self.assertEqual(report['summary_seconds']['outbox_wait_seconds']['p50'], 0.15)
 
     def test_job_timings_rejects_invalid_timestamp_order(self):
         job = {
