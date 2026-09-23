@@ -9,14 +9,19 @@ from types import SimpleNamespace
 
 from jsonschema import ValidationError, validate
 
+_KNOWLEDGE_ONLY = os.environ.get('BIO_AGENT_EXECUTION_DOMAIN') == 'knowledge'
+
 try:
-    from . import agent as CADD_PLUGIN
-    from . import imaging_plugin as IMAGING_PLUGIN
-    from . import knowledge_plugin as KNOWLEDGE_PLUGIN
-    from . import literature_plugin as LITERATURE_PLUGIN
-    from . import omics_agent as OMICS_PLUGIN
-    from . import research_agent as RESEARCH_PLUGIN
-    from . import sequence_plugin as SEQUENCE_PLUGIN
+    if _KNOWLEDGE_ONLY:
+        from . import knowledge_plugin as KNOWLEDGE_PLUGIN
+    else:
+        from . import agent as CADD_PLUGIN
+        from . import imaging_plugin as IMAGING_PLUGIN
+        from . import knowledge_plugin as KNOWLEDGE_PLUGIN
+        from . import literature_plugin as LITERATURE_PLUGIN
+        from . import omics_agent as OMICS_PLUGIN
+        from . import research_agent as RESEARCH_PLUGIN
+        from . import sequence_plugin as SEQUENCE_PLUGIN
     from .plugin_registry import DomainRegistry, validate_tool_map
     from .plugin_manifest import build_manifest, validate_install_candidate
     from .external_service_policy import ServiceRetryDeferredError
@@ -39,13 +44,16 @@ try:
         derive_run_context,
     )
 except ImportError:
-    import agent as CADD_PLUGIN
-    import imaging_plugin as IMAGING_PLUGIN
-    import knowledge_plugin as KNOWLEDGE_PLUGIN
-    import literature_plugin as LITERATURE_PLUGIN
-    import omics_agent as OMICS_PLUGIN
-    import research_agent as RESEARCH_PLUGIN
-    import sequence_plugin as SEQUENCE_PLUGIN
+    if _KNOWLEDGE_ONLY:
+        import knowledge_plugin as KNOWLEDGE_PLUGIN
+    else:
+        import agent as CADD_PLUGIN
+        import imaging_plugin as IMAGING_PLUGIN
+        import knowledge_plugin as KNOWLEDGE_PLUGIN
+        import literature_plugin as LITERATURE_PLUGIN
+        import omics_agent as OMICS_PLUGIN
+        import research_agent as RESEARCH_PLUGIN
+        import sequence_plugin as SEQUENCE_PLUGIN
     from plugin_registry import DomainRegistry, validate_tool_map
     from plugin_manifest import build_manifest, validate_install_candidate
     from external_service_policy import ServiceRetryDeferredError
@@ -75,7 +83,17 @@ ENTRY_POINT_GROUP = "cadd_agent.domains"
 class PluginDependencyError(ValueError):
     pass
 
-BUILTIN_DOMAINS = (
+_KNOWLEDGE_DOMAIN = (
+    "knowledge",
+    KNOWLEDGE_PLUGIN,
+    {
+        "name": "Local scientific knowledge retrieval",
+        "kind": "builtin_adapter",
+        "version": "0.1.0",
+    },
+)
+
+_ALL_BUILTIN_DOMAINS = (
     (
         "cadd",
         CADD_PLUGIN,
@@ -104,15 +122,7 @@ BUILTIN_DOMAINS = (
             "version": "0.1.0",
         },
     ),
-    (
-        "knowledge",
-        KNOWLEDGE_PLUGIN,
-        {
-            "name": "Local scientific knowledge retrieval",
-            "kind": "builtin_adapter",
-            "version": "0.1.0",
-        },
-    ),
+    _KNOWLEDGE_DOMAIN,
     (
         "imaging",
         IMAGING_PLUGIN,
@@ -122,10 +132,11 @@ BUILTIN_DOMAINS = (
             "version": "0.1.0",
         },
     ),
-)
+) if not _KNOWLEDGE_ONLY else ()
+BUILTIN_DOMAINS = (_KNOWLEDGE_DOMAIN,) if _KNOWLEDGE_ONLY else _ALL_BUILTIN_DOMAINS
 
 BUILTIN_DOMAIN_NAMES = frozenset(
-    [key for key, _, _ in BUILTIN_DOMAINS] + ["sequence"]
+    ("cadd", "omics", "research", "literature", "knowledge", "imaging", "sequence")
 )
 
 
@@ -185,27 +196,33 @@ def _build_registry():
             metadata=metadata,
         )
 
-    sequence_status = SEQUENCE_PLUGIN.plugin_status()
-    sequence_tools = SEQUENCE_PLUGIN.load_tools()
-    sequence_available = bool(sequence_tools)
-    registry.register(
-        "sequence",
-        SEQUENCE_PLUGIN,
-        sequence_tools or {},
-        kind="external",
-        status="available" if sequence_available else "unavailable",
-        health=sequence_status,
-        metadata={
-            "name": SEQUENCE_PLUGIN.PLUGIN_NAME,
-            "kind": "external",
-            "version": SEQUENCE_PLUGIN.PLUGIN_VERSION,
-            **sequence_status,
-        },
-    )
+    sequence_status = {}
+    sequence_tools = {}
+    if not _KNOWLEDGE_ONLY:
+        sequence_status = SEQUENCE_PLUGIN.plugin_status()
+        sequence_tools = SEQUENCE_PLUGIN.load_tools()
+        sequence_available = bool(sequence_tools)
+        registry.register(
+            "sequence",
+            SEQUENCE_PLUGIN,
+            sequence_tools or {},
+            kind="external",
+            status="available" if sequence_available else "unavailable",
+            health=sequence_status,
+            metadata={
+                "name": SEQUENCE_PLUGIN.PLUGIN_NAME,
+                "kind": "external",
+                "version": SEQUENCE_PLUGIN.PLUGIN_VERSION,
+                **sequence_status,
+            },
+        )
 
-    discovered, sources, errors = _discover_external_domains(
-        reserved_domains=registry.domains
-    )
+    if _KNOWLEDGE_ONLY:
+        discovered, sources, errors = {}, {}, {}
+    else:
+        discovered, sources, errors = _discover_external_domains(
+            reserved_domains=registry.domains
+        )
     for domain, tools in discovered.items():
         registry.register(
             domain,
@@ -247,8 +264,8 @@ def _build_registry():
     EXTERNAL_DOMAIN_ERRORS,
 ) = _build_registry()
 
-SEQUENCE_PLUGIN_NAME = SEQUENCE_PLUGIN.PLUGIN_NAME
-SEQUENCE_PLUGIN_VERSION = SEQUENCE_PLUGIN.PLUGIN_VERSION
+SEQUENCE_PLUGIN_NAME = None if _KNOWLEDGE_ONLY else SEQUENCE_PLUGIN.PLUGIN_NAME
+SEQUENCE_PLUGIN_VERSION = None if _KNOWLEDGE_ONLY else SEQUENCE_PLUGIN.PLUGIN_VERSION
 DOMAIN_TOOLS = REGISTRY.tool_maps
 DOMAIN_SOURCES = REGISTRY.sources
 DOMAIN_METADATA = REGISTRY.metadata

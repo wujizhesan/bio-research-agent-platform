@@ -45,6 +45,8 @@ def main(argv=None):
     try:
         request = json.loads(request_path.read_text(encoding='utf-8'))
         _apply_posix_limits(request.get('limits', {}))
+        if request.get('execution_domain') == 'knowledge':
+            os.environ['BIO_AGENT_EXECUTION_DOMAIN'] = 'knowledge'
         registry_started = perf_counter()
         try:
             from .domain_registry import run_tool

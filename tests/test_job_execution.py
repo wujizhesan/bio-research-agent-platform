@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -135,6 +136,43 @@ class JobExecutionTests(unittest.TestCase):
         self.assertGreaterEqual(phases['registry_import'], 0)
         self.assertGreaterEqual(phases['tool_run'], 0)
         self.assertGreaterEqual(phases['process_boundary'], 0)
+
+    def test_isolated_knowledge_registry_skips_unrelated_domains(self):
+        environment = os.environ.copy()
+        environment['BIO_AGENT_EXECUTION_DOMAIN'] = 'knowledge'
+        completed = subprocess.run(
+            [
+                sys.executable,
+                '-c',
+                'import json, sys; from src import domain_registry; '
+                'print(json.dumps({"domains": domain_registry.available_domains(), '
+                '"omics_loaded": "src.omics_agent" in sys.modules}))',
+            ],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=20,
+        )
+        payload = json.loads(completed.stdout)
+        self.assertEqual(payload['domains'], ['knowledge'])
+        self.assertFalse(payload['omics_loaded'])
+
+    def test_isolated_research_plan_keeps_cross_domain_catalog(self):
+        executor = ProcessToolExecutor(ExecutionLimits(
+            timeout_seconds=45,
+            memory_limit_mb=0,
+            cpu_time_seconds=0,
+            max_result_bytes=1024 * 1024,
+            poll_interval_seconds=0.01,
+            terminate_grace_seconds=1,
+        ))
+        result = executor.execute('research_plan', {
+            'task': '分析 RNA-seq 差异表达并设计 mRNA 序列',
+        })
+        self.assertEqual(result['status'], 'planned')
+        self.assertEqual(result['selected_domains'], ['omics', 'sequence'])
 
     def test_process_executor_reconstructs_deferred_retry(self):
         with tempfile.TemporaryDirectory(prefix='deferred_executor_') as raw:

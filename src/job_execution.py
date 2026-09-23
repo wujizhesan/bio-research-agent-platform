@@ -115,6 +115,17 @@ def _nonnegative_duration(value):
     return duration if math.isfinite(duration) and duration >= 0 else None
 
 
+def _tool_spec(tool):
+    try:
+        from .domain_registry import active_tool_specs
+    except ImportError:
+        from domain_registry import active_tool_specs
+    return next(
+        (item for item in active_tool_specs() if item['name'] == tool),
+        None,
+    )
+
+
 def _env_int(name, default, minimum=0):
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -141,17 +152,12 @@ def _env_float(name, default, minimum=0.01):
     return value
 
 
-def _sandbox_environment(tool, temporary_root):
+def _sandbox_environment(tool, temporary_root, spec=None):
     try:
-        from .domain_registry import active_tool_specs
         from .plugin_security import sandbox_environment
     except ImportError:
-        from domain_registry import active_tool_specs
         from plugin_security import sandbox_environment
-    spec = next(
-        (item for item in active_tool_specs() if item['name'] == tool),
-        None,
-    )
+    spec = spec if spec is not None else _tool_spec(tool)
     if spec is None:
         return None
     environment = sandbox_environment(
@@ -352,7 +358,8 @@ class ProcessToolExecutor:
             request_path = root / 'request.json'
             response_path = root / 'response.json'
             error_path = root / 'stderr.log'
-            child_environment = _sandbox_environment(tool, root)
+            spec = _tool_spec(tool)
+            child_environment = _sandbox_environment(tool, root, spec)
             resolved_arguments = materialize_storage_references(
                 arguments,
                 root / 'inputs',
@@ -362,6 +369,9 @@ class ProcessToolExecutor:
                 json.dumps(
                     {
                         'tool': tool,
+                        'execution_domain': (
+                            'knowledge' if spec and spec['domain'] == 'knowledge' else None
+                        ),
                         'arguments': resolved_arguments,
                         'limits': self.limits.as_dict(),
                         'observability': current_context(),
