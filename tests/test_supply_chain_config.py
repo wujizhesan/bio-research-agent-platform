@@ -123,6 +123,11 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertNotIn("environment", verify)
         self.assertNotIn("secrets.", json.dumps(verify))
         self.assertEqual(deploy["environment"], {"name": "production"})
+        checkout = deploy["steps"][0]
+        self.assertEqual(
+            checkout["with"]["ref"],
+            "${{ needs.verify.outputs.source_commit }}",
+        )
         deployment = json.dumps(deploy)
         deployment_script = (ROOT / "scripts" / "deploy_transaction.sh").read_text(
             encoding="utf-8"
@@ -131,6 +136,7 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn("gh attestation verify", json.dumps(verify))
         self.assertIn("--signer-workflow", json.dumps(verify))
         self.assertIn("--source-ref", json.dumps(verify))
+        self.assertIn("--source-digest", json.dumps(verify))
         self.assertIn("scripts/deploy_transaction.sh", deployment)
         self.assertIn("scripts/verify_public_deployment.py", deployment)
         self.assertIn("^https://", deployment)
@@ -245,6 +251,30 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         )
         self.assertIn("release-images.next.env", workflow)
         self.assertIn("deploy_transaction.sh", workflow)
+        self.assertLess(
+            workflow.index('scripts/deploy_transaction.sh scripts/verify_public_deployment.py'),
+            workflow.index('"$script_path" "$DEPLOY_PATH" "$HEALTH_URL"'),
+        )
+        self.assertIn('RELEASE_CONFIG_VERSION=(2|3)', workflow)
+        self.assertIn('RELEASE_BUNDLE_DIR=%s', workflow)
+        self.assertIn('RELEASE_BUNDLE_SHA256=%s', workflow)
+        self.assertIn('test "$(git rev-parse HEAD)" = "$GIT_SHA"', workflow)
+        self.assertIn('$DEPLOY_PATH/$bundle_dir/monitoring/', workflow)
+        self.assertIn('--project-directory "$deploy_path"', script)
+        self.assertIn('release_bundle_digest', script)
+        self.assertIn('deploy_transaction.sh docker-compose.yml', script)
+        script_bundle_files = script.split('release_bundle_files=(', 1)[1].split(')', 1)[0].split()
+        workflow_bundle_files = workflow.split('bundle_files=(', 1)[1].split(')', 1)[0].split()
+        self.assertEqual(workflow_bundle_files, script_bundle_files)
+        self.assertEqual(workflow.count('--source-digest "$SOURCE_COMMIT"'), 2)
+        secret_names = set(
+            script.split('release_secret_names=(', 1)[1].split(')', 1)[0].split()
+        )
+        required_secrets = set(re.findall(
+            r'\$\{([A-Z0-9_]+)_FILE:\?required\}',
+            (ROOT / 'docker-compose.deploy.yml').read_text(encoding='utf-8'),
+        ))
+        self.assertLessEqual(required_secrets | {'DEPLOY_SMOKE_PASSWORD'}, secret_names)
         self.assertIn("release-images.previous.env", script)
         self.assertIn('run --rm --no-deps recovery-evidence-publisher', script)
         self.assertIn('run --rm --no-deps recovery-check', script)
@@ -256,7 +286,7 @@ class SupplyChainConfigurationTests(unittest.TestCase):
             script,
         )
         self.assertIn('verify_database_roles.py', script)
-        self.assertIn('rolling back to previous image digests', script)
+        self.assertIn('rolling back to previous release state', script)
         self.assertIn('RECOVERY_EVIDENCE_PATH=', script)
         self.assertIn("check_expand_contract_migrations.py", ci)
         self.assertIn('DATABASE_URL="$API_DATABASE_URL" DATABASE_ROLE=api', ci)

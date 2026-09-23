@@ -4,14 +4,15 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 from src.api_dependencies import ApiDependencies
-from src.auth import Principal
+from src.auth import AuthService, Principal
 
 
-class FakeAuth:
-    jwt_secret = 'test-secret-that-is-long-enough-for-hs256'
-    issuer = 'test-issuer'
-    session_cookie_name = 'bioagent_session'
-    csrf_cookie_name = 'bioagent_csrf'
+class FakeAuth(AuthService):
+    def __init__(self):
+        super().__init__(
+            jwt_secret='test-secret-that-is-long-enough-for-hs256',
+            issuer='test-issuer',
+        )
 
     def authenticate(self, authorization):
         if authorization != 'Bearer valid':

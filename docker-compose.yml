@@ -52,8 +52,10 @@ services:
       NCBI_API_KEY: ${NCBI_API_KEY:-}
       CADD_JWT_SECRET: ${CADD_JWT_SECRET:-}
       CADD_JWT_SECRET_FILE: ${CADD_JWT_SECRET_FILE:-}
+      CADD_JWT_SECRET_SHA256: ${CADD_JWT_SECRET_SHA256:-}
       RLS_CONTEXT_SIGNING_KEY: ${RLS_CONTEXT_SIGNING_KEY:-}
       RLS_CONTEXT_SIGNING_KEY_FILE: ${RLS_CONTEXT_SIGNING_KEY_FILE:-}
+      RLS_CONTEXT_SIGNING_KEY_SHA256: ${RLS_CONTEXT_SIGNING_KEY_SHA256:-}
       RLS_CONTEXT_KEY_ID: ${RLS_CONTEXT_KEY_ID:-primary}
       CADD_AUTH_USERS_JSON: ${CADD_AUTH_USERS_JSON:-}
       CADD_AUTH_USERS_FILE: ${CADD_AUTH_USERS_FILE:-}
@@ -157,7 +159,9 @@ services:
       DATABASE_ROLE: migration
       RLS_CONTEXT_SIGNING_KEY: ${RLS_CONTEXT_SIGNING_KEY:-}
       RLS_CONTEXT_SIGNING_KEY_FILE: ${RLS_CONTEXT_SIGNING_KEY_FILE:-}
+      RLS_CONTEXT_SIGNING_KEY_SHA256: ${RLS_CONTEXT_SIGNING_KEY_SHA256:-}
       RLS_CONTEXT_KEY_ID: ${RLS_CONTEXT_KEY_ID:-primary}
+      RLS_CONTEXT_ROTATION_GRACE_SECONDS: ${RLS_CONTEXT_ROTATION_GRACE_SECONDS:-3600}
       API_DATABASE_URL: ${API_DATABASE_URL:-}
       DISPATCHER_DATABASE_URL: ${DISPATCHER_DATABASE_URL:-}
       WORKER_DATABASE_URL: ${WORKER_DATABASE_URL:-}
@@ -401,6 +405,8 @@ services:
       RESEARCH_PLANNER_MODEL: ${RESEARCH_PLANNER_MODEL:-}
       NCBI_EMAIL: ${NCBI_EMAIL:-}
       NCBI_API_KEY: ${NCBI_API_KEY:-}
+      RLS_CONTEXT_KEY_ID: ${RLS_CONTEXT_KEY_ID:-primary}
+      RLS_CONTEXT_SIGNING_KEY_SHA256: ${RLS_CONTEXT_SIGNING_KEY_SHA256:-}
       REDIS_URL: ${WORKER_REDIS_URL:-redis://redis:6379/0}
       REDIS_NAMESPACE: ${REDIS_NAMESPACE:-bioagent}
       REDIS_SOCKET_TIMEOUT: ${REDIS_SOCKET_TIMEOUT:-15}
@@ -516,8 +522,8 @@ services:
     expose:
       - "9090"
     volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./monitoring/storage-deletion-alerts.yml:/etc/prometheus/rules/storage-deletion-alerts.yml:ro
+      - ${MONITORING_CONFIG_DIR:-./monitoring}/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ${MONITORING_CONFIG_DIR:-./monitoring}/storage-deletion-alerts.yml:/etc/prometheus/rules/storage-deletion-alerts.yml:ro
       - prometheus_data:/prometheus
     secrets:
       - metrics_scrape_token
@@ -547,7 +553,7 @@ services:
     expose:
       - "9093"
     volumes:
-      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ${MONITORING_CONFIG_DIR:-./monitoring}/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
       - alertmanager_data:/alertmanager
     secrets:
       - alertmanager_webhook_url

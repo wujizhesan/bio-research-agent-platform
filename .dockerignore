@@ -14,6 +14,11 @@ data/*.sdf
 data/*.pdbqt
 tools/*.exe
 .env
+.env.production
+release-images*.env
+release-bundles/
+.release-bootstrap.*
+.release-candidate.*
 .session_summary.json
 AGENTS.md
 SESSION_LOG.md

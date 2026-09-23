@@ -1,3 +1,4 @@
+import hashlib
 import os
 import subprocess
 import tempfile
@@ -7,11 +8,30 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "deploy_transaction.sh"
+BUNDLE_FILES = (
+    "deploy_transaction.sh",
+    "docker-compose.yml",
+    "docker-compose.secure.yml",
+    "docker-compose.deploy.yml",
+    "verify_public_deployment.py",
+    "monitoring/prometheus.yml",
+    "monitoring/alertmanager.yml",
+    "monitoring/storage-deletion-alerts.yml",
+)
+
+
+def bundle_digest(bundle, *, version=3):
+    files = BUNDLE_FILES if version == 3 else BUNDLE_FILES[1:]
+    manifest = "".join(
+        f"{hashlib.sha256((bundle / name).read_bytes()).hexdigest()}  {name}\n"
+        for name in files
+    )
+    return hashlib.sha256(manifest.encode()).hexdigest()
 
 
 @unittest.skipIf(os.name == "nt", "requires a POSIX shell")
 class DeployTransactionTests(unittest.TestCase):
-    def prepare(self, directory, *, current=False):
+    def prepare(self, directory, *, current=False, bootstrap_current=True):
         root = Path(directory)
         deploy = root / "deploy"
         binaries = root / "bin"
@@ -88,9 +108,32 @@ class DeployTransactionTests(unittest.TestCase):
         ):
             (deploy / name).write_text("services: {}\n", encoding="utf-8")
         (deploy / "verify_public_deployment.py").write_text("", encoding="utf-8")
+        (deploy / "deploy_transaction.sh").write_text("legacy: true\n", encoding="utf-8")
+        monitoring = deploy / "monitoring"
+        monitoring.mkdir()
+        for name in (
+            "prometheus.yml", "alertmanager.yml", "storage-deletion-alerts.yml",
+        ):
+            (monitoring / name).write_text("legacy: true\n", encoding="utf-8")
+        candidate = deploy / "release-bundles" / "candidate"
+        (candidate / "monitoring").mkdir(parents=True)
+        for name in (
+            "deploy_transaction.sh",
+            "docker-compose.yml", "docker-compose.secure.yml",
+            "docker-compose.deploy.yml", "verify_public_deployment.py",
+        ):
+            (candidate / name).write_text("candidate: true\n", encoding="utf-8")
+        for name in (
+            "prometheus.yml", "alertmanager.yml", "storage-deletion-alerts.yml",
+        ):
+            (candidate / "monitoring" / name).write_text(
+                "candidate: true\n", encoding="utf-8",
+            )
         (deploy / "release-images.next.env").write_text(
             "BACKEND_IMAGE=next-backend\nFRONTEND_IMAGE=next-frontend\n"
-            "RELEASE_TAG=v0.2.0-rc.1\nGIT_SHA=" + "a" * 40 + "\n",
+            "RELEASE_TAG=v0.2.0-rc.1\nGIT_SHA=" + "a" * 40 + "\n"
+            "RELEASE_BUNDLE_DIR=release-bundles/candidate\n"
+            f"RELEASE_BUNDLE_SHA256={bundle_digest(candidate)}\n",
             encoding="utf-8",
         )
         if current:
@@ -103,6 +146,43 @@ class DeployTransactionTests(unittest.TestCase):
         docker.write_text(
             """#!/usr/bin/env bash
 printf 'docker %s\\n' "$*" >> "$COMMAND_LOG"
+if [[ "$*" == *" config --hash "* ]]; then
+  printf '%s %064d\\n' "${@: -1}" 0
+  exit 0
+fi
+if [[ "$*" == *" ps -q "* ]]; then
+  if [[ "${BOOTSTRAP_MISSING_CONTAINER:-0}" != "1" ]]; then
+    printf 'container-%s\\n' "${@: -1}"
+  fi
+  exit 0
+fi
+if [[ "$1" == inspect ]]; then
+  if [[ "$3" == *Config.Image* ]]; then
+    if [[ "${BOOTSTRAP_IMAGE_MISMATCH:-0}" == "1" ]]; then
+      printf 'stale-image\\n'
+    elif [[ "$4" == container-web ]]; then
+      printf 'current-frontend\\n'
+    else
+      printf 'current-backend\\n'
+    fi
+  elif [[ "$3" == *config-hash* ]]; then
+    if [[ "${BOOTSTRAP_HASH_MISMATCH:-0}" == "1" ]]; then
+      printf '%064d\\n' 1
+    else
+      printf '%064d\\n' 0
+    fi
+  elif [[ "$3" == *State.StartedAt* ]]; then
+    if [[ "${BOOTSTRAP_STALE_SECRET:-0}" == "1" ]]; then
+      printf '2000-01-01T00:00:00Z\\n'
+    else
+      printf '2100-01-01T00:00:00Z\\n'
+    fi
+  fi
+  exit 0
+fi
+if [[ -n "${BACKEND_IMAGE:-}" ]]; then
+  printf 'backend-image-override %s\\n' "$BACKEND_IMAGE" >> "$COMMAND_LOG"
+fi
 if [[ "${NEXT_UP_FAIL:-0}" == "1" && "$*" == *"release-images.next.env"* && "$*" == *" up -d "* ]]; then
   exit 1
 fi
@@ -138,11 +218,18 @@ exit "${VERIFY_EXIT:-0}"
                 "DEPLOY_HEALTH_INTERVAL_SECONDS": "0",
             }
         )
+        if current and bootstrap_current:
+            result = self.run_deploy(deploy, environment, bootstrap=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            log.unlink(missing_ok=True)
         return deploy, log, environment
 
-    def run_deploy(self, deploy, environment):
+    def run_deploy(self, deploy, environment, *, bootstrap=False):
+        command = ["bash", str(SCRIPT), str(deploy), "https://platform.example/health"]
+        if bootstrap:
+            command.append("--bootstrap-config")
         return subprocess.run(
-            ["bash", str(SCRIPT), str(deploy), "https://platform.example/health"],
+            command,
             capture_output=True,
             text=True,
             env=environment,
@@ -157,9 +244,17 @@ exit "${VERIFY_EXIT:-0}"
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse((deploy / "release-images.next.env").exists())
             self.assertIn("next-backend", (deploy / "release-images.env").read_text())
+            self.assertIn(
+                "RELEASE_CONFIG_VERSION=3",
+                (deploy / "release-images.env").read_text(),
+            )
             storage = next(
                 i for i, line in enumerate(commands)
                 if "run --rm --no-deps storage-check" in line
+            )
+            auth_config = next(
+                i for i, line in enumerate(commands)
+                if "run --rm --no-deps api python -c" in line
             )
             recovery = next(
                 i for i, line in enumerate(commands)
@@ -179,11 +274,18 @@ exit "${VERIFY_EXIT:-0}"
                 i for i, line in enumerate(commands)
                 if "configure_tenant_context.py --enable" in line
             )
+            staging = next(
+                i for i, line in enumerate(commands)
+                if "configure_tenant_context.py --stage" in line
+            )
+            self.assertLess(auth_config, storage)
             self.assertLess(storage, recovery)
             self.assertLess(recovery, pitr)
             self.assertLess(pitr, migration)
             self.assertLess(recovery, migration)
             self.assertLess(migration, rollout)
+            self.assertLess(migration, staging)
+            self.assertLess(staging, rollout)
             self.assertLess(rollout, health)
             self.assertLess(rollout, enforcement)
             self.assertLess(enforcement, health)
@@ -205,13 +307,256 @@ exit "${VERIFY_EXIT:-0}"
             self.assertEqual(current, previous)
             self.assertTrue((deploy / "release-images.next.env").exists())
             self.assertIn("release-images.next.env up -d", commands)
+            self.assertIn("configure_tenant_context.py --stage", commands)
             self.assertNotIn("configure_tenant_context.py --disable", commands)
             self.assertIn("release-images.env up -d", commands)
             rollback_start = commands.index("release-images.env up -d")
             rollback_enforcement = commands.index(
                 "release-images.env run --rm migration python scripts/configure_tenant_context.py --enable"
             )
-            self.assertLess(rollback_start, rollback_enforcement)
+            self.assertLess(rollback_enforcement, rollback_start)
+            self.assertIn("backend-image-override next-backend", commands)
+            self.assertIn("rollback completed", result.stderr)
+
+    def test_existing_release_requires_explicit_config_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(
+                directory, current=True, bootstrap_current=False,
+            )
+            result = self.run_deploy(deploy, environment)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("lacks a bundle snapshot", result.stderr)
+            self.assertFalse(log.exists())
+            bootstrap = self.run_deploy(deploy, environment, bootstrap=True)
+            self.assertEqual(bootstrap.returncode, 0, bootstrap.stderr)
+            self.assertIn(
+                "--env-file .env.production --env-file release-images.env config --hash api",
+                log.read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "RELEASE_CONFIG_VERSION=3",
+                (deploy / "release-images.env").read_text(),
+            )
+            self.assertNotIn(
+                "RELEASE_CONFIG_VERSION=3",
+                (deploy / "release-images.prebootstrap.env").read_text(),
+            )
+
+    def test_upgrades_version_one_snapshot_before_bundle_staging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, _, environment = self.prepare(
+                directory, current=True, bootstrap_current=False,
+            )
+            config = (deploy / ".env.production").read_text(encoding="utf-8")
+            images = (deploy / "release-images.env").read_text(encoding="utf-8")
+            root = deploy.parent
+            old_state = (
+                config + "\n" + images + "RELEASE_CONFIG_VERSION=1\n"
+                + "CADD_JWT_SECRET_SHA256="
+                + hashlib.sha256((root / "cadd_jwt_secret").read_bytes()).hexdigest()
+                + "\nRLS_CONTEXT_SIGNING_KEY_SHA256="
+                + hashlib.sha256((root / "rls_context_signing_key").read_bytes()).hexdigest()
+                + "\n"
+            )
+            (deploy / "release-images.env").write_text(old_state, encoding="utf-8")
+            result = self.run_deploy(deploy, environment, bootstrap=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "RELEASE_CONFIG_VERSION=3",
+                (deploy / "release-images.env").read_text(encoding="utf-8"),
+            )
+
+    def test_bootstrap_rejects_live_config_or_image_mismatch(self):
+        for mismatch in ("BOOTSTRAP_HASH_MISMATCH", "BOOTSTRAP_IMAGE_MISMATCH"):
+            with self.subTest(mismatch=mismatch):
+                with tempfile.TemporaryDirectory() as directory:
+                    deploy, _, environment = self.prepare(
+                        directory, current=True, bootstrap_current=False,
+                    )
+                    environment[mismatch] = "1"
+                    result = self.run_deploy(deploy, environment, bootstrap=True)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("differs from current release", result.stderr)
+                    self.assertNotIn(
+                        "RELEASE_CONFIG_VERSION=3",
+                        (deploy / "release-images.env").read_text(),
+                    )
+
+    def test_bootstrap_rejects_missing_live_container(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, _, environment = self.prepare(
+                directory, current=True, bootstrap_current=False,
+            )
+            environment["BOOTSTRAP_MISSING_CONTAINER"] = "1"
+            result = self.run_deploy(deploy, environment, bootstrap=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("has no running container", result.stderr)
+
+    def test_bootstrap_rejects_secret_changed_since_api_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, _, environment = self.prepare(
+                directory, current=True, bootstrap_current=False,
+            )
+            environment["BOOTSTRAP_STALE_SECRET"] = "1"
+            result = self.run_deploy(deploy, environment, bootstrap=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("file changed after live API started", result.stderr)
+
+    def test_bootstrap_rejects_unhealthy_current_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, _, environment = self.prepare(
+                directory, current=True, bootstrap_current=False,
+            )
+            environment["CURL_EXIT"] = "1"
+            result = self.run_deploy(deploy, environment, bootstrap=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("current release health check failed", result.stderr)
+
+    def test_rejects_in_place_secret_replacement_before_rollout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory, current=True)
+            old_secret = deploy.parent / "rls_context_signing_key"
+            old_secret.write_text("changed-rls-secret-" * 3, encoding="utf-8")
+            result = self.run_deploy(deploy, environment)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("file changed after release snapshot", result.stderr)
+            self.assertFalse(log.exists())
+
+    def test_rejects_in_place_database_credential_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory, current=True)
+            old_secret = deploy.parent / "api_database_url"
+            old_secret.write_text(
+                "postgresql+asyncpg://api:new@postgres.example:5432/bioagent",
+                encoding="utf-8",
+            )
+            result = self.run_deploy(deploy, environment)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("API_DATABASE_URL file changed after release snapshot", result.stderr)
+            self.assertFalse(log.exists())
+
+    def test_rejects_modified_current_release_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory, current=True)
+            state = (deploy / "release-images.env").read_text(encoding="utf-8")
+            bundle = next(
+                line.split("=", 1)[1] for line in state.splitlines()
+                if line.startswith("RELEASE_BUNDLE_DIR=")
+            )
+            (deploy / bundle / "docker-compose.yml").write_text(
+                "tampered: true\n", encoding="utf-8",
+            )
+            result = self.run_deploy(deploy, environment)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("release bundle changed after snapshot", result.stderr)
+            self.assertFalse(log.exists())
+
+    def test_rejects_modified_candidate_script_before_running_compose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory)
+            (deploy / "release-bundles" / "candidate" / "deploy_transaction.sh").write_text(
+                "tampered: true\n", encoding="utf-8",
+            )
+            result = self.run_deploy(deploy, environment)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("candidate release bundle differs from verified source", result.stderr)
+            self.assertFalse(log.exists())
+
+    def test_rejects_modified_previous_script_before_running_compose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory, current=True)
+            state = (deploy / "release-images.env").read_text(encoding="utf-8")
+            bundle = next(
+                line.split("=", 1)[1] for line in state.splitlines()
+                if line.startswith("RELEASE_BUNDLE_DIR=")
+            )
+            (deploy / bundle / "deploy_transaction.sh").write_text(
+                "tampered: true\n", encoding="utf-8",
+            )
+            result = self.run_deploy(deploy, environment)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("release bundle changed after snapshot", result.stderr)
+            self.assertFalse(log.exists())
+
+    def test_version_two_snapshot_remains_verifiable_during_rollback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory, current=True)
+            state_path = deploy / "release-images.env"
+            state = state_path.read_text(encoding="utf-8")
+            bundle = next(
+                line.split("=", 1)[1] for line in state.splitlines()
+                if line.startswith("RELEASE_BUNDLE_DIR=")
+            )
+            version_three_digest = bundle_digest(deploy / bundle)
+            version_two_digest = bundle_digest(deploy / bundle, version=2)
+            (deploy / bundle / "deploy_transaction.sh").unlink()
+            state_path.write_text(
+                state.replace("RELEASE_CONFIG_VERSION=3", "RELEASE_CONFIG_VERSION=2")
+                .replace(version_three_digest, version_two_digest),
+                encoding="utf-8",
+            )
+            environment["NEXT_UP_FAIL"] = "1"
+            result = self.run_deploy(deploy, environment)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("rollback completed", result.stderr)
+            self.assertIn("release-images.env up -d", log.read_text(encoding="utf-8"))
+
+    def test_rollback_uses_immutable_previous_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory, current=True)
+            state = (deploy / "release-images.env").read_text(encoding="utf-8")
+            bundle = next(
+                line.split("=", 1)[1] for line in state.splitlines()
+                if line.startswith("RELEASE_BUNDLE_DIR=")
+            )
+            (deploy / "docker-compose.yml").write_text(
+                "overwritten: true\n", encoding="utf-8",
+            )
+            (deploy / "monitoring" / "prometheus.yml").write_text(
+                "overwritten: true\n", encoding="utf-8",
+            )
+            environment["NEXT_UP_FAIL"] = "1"
+            result = self.run_deploy(deploy, environment)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("rollback completed", result.stderr)
+            self.assertEqual(
+                (deploy / "monitoring" / "prometheus.yml").read_text(encoding="utf-8"),
+                "legacy: true\n",
+            )
+            rollback_command = next(
+                line for line in log.read_text(encoding="utf-8").splitlines()
+                if "release-images.env up -d" in line
+            )
+            self.assertIn(f"-f {bundle}/docker-compose.yml", rollback_command)
+            self.assertNotIn("release-bundles/candidate", rollback_command)
+
+    def test_rollback_uses_previous_secret_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory, current=True)
+            old_path = deploy.parent / "rls_context_signing_key"
+            new_path = deploy.parent / "rls_context_signing_key_new"
+            new_path.write_text("new-rls-secret-" * 3, encoding="utf-8")
+            new_path.chmod(0o600)
+            candidate_config = deploy / ".env.production"
+            candidate_config.write_text(
+                candidate_config.read_text(encoding="utf-8").replace(
+                    f"RLS_CONTEXT_SIGNING_KEY_FILE={old_path}",
+                    f"RLS_CONTEXT_SIGNING_KEY_FILE={new_path}",
+                ).replace(
+                    "APP_ENV=production",
+                    "APP_ENV=production\nRLS_CONTEXT_KEY_ID=rotated",
+                ),
+                encoding="utf-8",
+            )
+            environment["NEXT_UP_FAIL"] = "1"
+            result = self.run_deploy(deploy, environment)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(f"RLS_CONTEXT_SIGNING_KEY_FILE={old_path}",
+                          (deploy / "release-images.env").read_text())
+            self.assertIn(f"RLS_CONTEXT_SIGNING_KEY_FILE={new_path}",
+                          (deploy / "release-images.next.env").read_text())
+            commands = log.read_text(encoding="utf-8")
+            self.assertIn("release-images.env up -d", commands)
             self.assertIn("rollback completed", result.stderr)
 
     def test_first_failed_deployment_reports_missing_rollback_target(self):

@@ -163,7 +163,7 @@ def _register_core_routes(
     project_access,
 ):
     def set_browser_session_cookies(response, access_token, principal, max_age):
-        csrf_token = auth.csrf_token(principal.session_id)
+        csrf_token = auth.csrf_token(principal.session_id, principal.key_id)
         cookie_options = {
             'max_age': max(int(max_age), 0),
             'secure': auth.production,

@@ -17,8 +17,13 @@ from sqlalchemy.exc import DBAPIError
 from src.auth import Principal, roles_sha256
 from src.database import (
     Database,
+    _signed_tenant_context,
     database_worker_scope,
     set_database_principal,
+)
+from scripts.configure_tenant_context import (
+    TenantContextConfigurationError,
+    configure as configure_tenant_context,
 )
 from src.job_execution import InlineToolExecutor
 from src.job_state_store import DatabaseDispatchSource, DatabaseStateWriter
@@ -60,6 +65,9 @@ class ExternalServiceTests(unittest.TestCase):
 
     def test_postgres_signed_context_rejects_spoofed_gucs(self):
         asyncio.run(self._postgres_signed_context_rejects_spoofed_gucs())
+
+    def test_postgres_rls_key_rotation_has_bounded_overlap(self):
+        asyncio.run(self._postgres_rls_key_rotation_has_bounded_overlap())
 
     def test_postgres_auth_session_revocation_is_immediate(self):
         asyncio.run(self._postgres_auth_session_revocation_is_immediate())
@@ -543,6 +551,99 @@ class ExternalServiceTests(unittest.TestCase):
                     text('DELETE FROM projects WHERE project_id = :project_id'),
                     {'project_id': project_id},
                 )
+            await owner.close()
+
+    async def _postgres_rls_key_rotation_has_bounded_overlap(self):
+        import asyncpg
+
+        owner_url = os.environ['DATABASE_URL'].replace(
+            'postgresql+asyncpg://', 'postgresql://', 1,
+        )
+        api_url = os.environ['API_DATABASE_URL'].replace(
+            'postgresql+asyncpg://', 'postgresql://', 1,
+        )
+        old_id = os.environ.get('RLS_CONTEXT_KEY_ID', 'primary')
+        old_secret = os.environ['RLS_CONTEXT_SIGNING_KEY']
+        new_id = f'rotation-{uuid4().hex}'
+        owner = await asyncpg.connect(owner_url)
+        api = await asyncpg.connect(api_url)
+        old_row = await owner.fetchrow(
+            'SELECT active, valid_until FROM tenant_context_keys WHERE key_id = $1',
+            old_id,
+        )
+        self.assertIsNotNone(old_row)
+
+        async def signed_context_valid(key_id, secret):
+            async with api.transaction():
+                backend_pid = await api.fetchval('SELECT pg_backend_pid()')
+                with patch.dict(os.environ, {
+                    'RLS_CONTEXT_KEY_ID': key_id,
+                    'RLS_CONTEXT_SIGNING_KEY': secret,
+                }):
+                    signed = _signed_tenant_context('rotation-alice', False, backend_pid)
+                for field in (
+                    'key_id', 'subject', 'is_admin', 'expires_at', 'nonce', 'signature',
+                ):
+                    await api.execute(
+                        'SELECT set_config($1, $2, true)',
+                        f'bioagent.context_{field}', signed[field],
+                    )
+                return await api.fetchval('SELECT bioagent_signed_context_valid()')
+
+        try:
+            with patch.dict(os.environ, {
+                'RLS_CONTEXT_KEY_ID': old_id,
+                'RLS_CONTEXT_SIGNING_KEY': 'different-material-' * 3,
+            }):
+                with self.assertRaises(TenantContextConfigurationError):
+                    await configure_tenant_context(False, stage=True)
+
+            with patch.dict(os.environ, {
+                'RLS_CONTEXT_KEY_ID': new_id,
+                'RLS_CONTEXT_SIGNING_KEY': 'rotation-new-secret-' * 3,
+                'RLS_CONTEXT_ROTATION_GRACE_SECONDS': '3600',
+            }):
+                await configure_tenant_context(False, stage=True)
+                first_deadline = await owner.fetchval(
+                    'SELECT valid_until FROM tenant_context_keys WHERE key_id = $1',
+                    old_id,
+                )
+                await configure_tenant_context(False, stage=True)
+                second_deadline = await owner.fetchval(
+                    'SELECT valid_until FROM tenant_context_keys WHERE key_id = $1',
+                    old_id,
+                )
+            self.assertEqual(first_deadline, second_deadline)
+            self.assertGreater(first_deadline, time.time())
+            self.assertTrue(await signed_context_valid(old_id, old_secret))
+            self.assertTrue(await signed_context_valid(
+                new_id, 'rotation-new-secret-' * 3,
+            ))
+            with patch.dict(os.environ, {
+                'RLS_CONTEXT_KEY_ID': f'rotation-{uuid4().hex}',
+                'RLS_CONTEXT_SIGNING_KEY': 'rotation-third-secret-' * 3,
+            }):
+                with self.assertRaises(TenantContextConfigurationError):
+                    await configure_tenant_context(False, stage=True)
+            await owner.execute(
+                'UPDATE tenant_context_keys SET valid_until = '
+                'EXTRACT(EPOCH FROM clock_timestamp()) - 1 WHERE key_id = $1',
+                old_id,
+            )
+            self.assertFalse(await signed_context_valid(old_id, old_secret))
+            self.assertTrue(await signed_context_valid(
+                new_id, 'rotation-new-secret-' * 3,
+            ))
+        finally:
+            await owner.execute(
+                'UPDATE tenant_context_keys SET active = $2, valid_until = $3 '
+                'WHERE key_id = $1',
+                old_id, old_row['active'], old_row['valid_until'],
+            )
+            await owner.execute(
+                'DELETE FROM tenant_context_keys WHERE key_id = $1', new_id,
+            )
+            await api.close()
             await owner.close()
 
     async def _postgres_auth_session_revocation_is_immediate(self):

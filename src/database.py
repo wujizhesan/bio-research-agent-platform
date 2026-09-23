@@ -2,11 +2,13 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 import hashlib
 import hmac
 import json
 from pathlib import Path
 import os
+import re
 from secrets import token_urlsafe
 from time import time
 from uuid import uuid4
@@ -32,6 +34,23 @@ DATABASE_WORKER_FENCING_TOKEN = ContextVar(
 DATABASE_WORKER_ATTEMPT = ContextVar('bioagent_worker_attempt', default=0)
 
 
+@lru_cache(maxsize=8)
+def _tenant_context_file_secret(path, expected_digest):
+    try:
+        with open(path, 'rb') as handle:
+            value = handle.read(65537)
+    except OSError as exc:
+        raise ValueError('unable to read RLS_CONTEXT_SIGNING_KEY_FILE') from exc
+    if len(value) > 65536:
+        raise ValueError('RLS_CONTEXT_SIGNING_KEY_FILE exceeds 65536 bytes')
+    if expected_digest:
+        if re.fullmatch(r'[0-9a-f]{64}', expected_digest) is None or not hmac.compare_digest(
+            hashlib.sha256(value).hexdigest(), expected_digest,
+        ):
+            raise ValueError('RLS_CONTEXT_SIGNING_KEY_FILE checksum mismatch')
+    return value.decode('utf-8').strip()
+
+
 def _tenant_context_secret():
     direct = os.environ.get('RLS_CONTEXT_SIGNING_KEY', '').strip()
     file_name = os.environ.get('RLS_CONTEXT_SIGNING_KEY_FILE', '').strip()
@@ -44,14 +63,10 @@ def _tenant_context_secret():
         return direct
     if not file_name:
         return ''
-    try:
-        with open(os.path.abspath(file_name), encoding='utf-8') as handle:
-            value = handle.read(65537)
-    except OSError as exc:
-        raise ValueError('unable to read RLS_CONTEXT_SIGNING_KEY_FILE') from exc
-    if len(value) > 65536:
-        raise ValueError('RLS_CONTEXT_SIGNING_KEY_FILE exceeds 65536 bytes')
-    return value.strip()
+    return _tenant_context_file_secret(
+        os.path.abspath(file_name),
+        os.environ.get('RLS_CONTEXT_SIGNING_KEY_SHA256', '').strip(),
+    )
 
 
 def _signed_tenant_context(subject, is_admin, backend_pid, ttl_seconds=60):
@@ -556,6 +571,7 @@ class TenantContextKeyRow(Base):
     key_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     key_digest: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    valid_until: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[str] = mapped_column(String(64), nullable=False)
 
 

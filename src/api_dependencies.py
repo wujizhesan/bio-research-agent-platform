@@ -69,6 +69,7 @@ class ApiDependencies:
                     'jwt_cookie',
                     principal.session_id,
                     principal.token_version,
+                    principal.key_id,
                 )
             await self._validate_session(principal)
             if (
@@ -187,11 +188,9 @@ class ApiDependencies:
             'sid': principal.session_id,
             'ver': principal.token_version,
         }
-        return jwt.encode(
-            payload,
-            self.stream_ticket_secret,
-            algorithm='HS256',
-        )
+        if self.auth.jwt_secret:
+            return self.auth.sign_jwt(payload)
+        return jwt.encode(payload, self.stream_ticket_secret, algorithm='HS256')
 
     async def stream_principal(
         self,
@@ -202,24 +201,23 @@ class ApiDependencies:
     ):
         if ticket:
             try:
-                payload = jwt.decode(
-                    ticket,
-                    self.stream_ticket_secret,
-                    algorithms=['HS256'],
-                    issuer=self.stream_ticket_issuer,
-                    options={
-                        'require': [
-                            'exp',
-                            'iat',
-                            'iss',
-                            'sub',
-                            'job_id',
-                            'purpose',
-                            'sid',
-                            'ver',
-                        ]
-                    },
-                )
+                required = [
+                    'exp', 'iat', 'iss', 'sub', 'job_id', 'purpose', 'sid', 'ver',
+                ]
+                if self.auth.jwt_secret:
+                    payload, _ = self.auth.decode_jwt(
+                        ticket,
+                        issuer=self.stream_ticket_issuer,
+                        required=required,
+                    )
+                else:
+                    payload = jwt.decode(
+                        ticket,
+                        self.stream_ticket_secret,
+                        algorithms=['HS256'],
+                        issuer=self.stream_ticket_issuer,
+                        options={'require': required},
+                    )
             except jwt.PyJWTError as exc:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,

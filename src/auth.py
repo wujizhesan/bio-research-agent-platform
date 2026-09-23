@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 from ipaddress import ip_address, ip_network
 from threading import Lock
@@ -52,13 +53,19 @@ def _read_secret(name: str, file_name: str) -> str | None:
         return direct or None
     path = os.path.abspath(path_value)
     try:
-        with open(path, encoding='utf-8') as handle:
+        with open(path, 'rb') as handle:
             value = handle.read(65537)
     except OSError as exc:
         raise ValueError(f'unable to read {file_name}') from exc
     if len(value) > 65536:
         raise ValueError(f'{file_name} exceeds 65536 bytes')
-    return value.strip() or None
+    expected_digest = os.environ.get(f'{name}_SHA256', '').strip()
+    if expected_digest:
+        if re.fullmatch(r'[0-9a-f]{64}', expected_digest) is None or not hmac.compare_digest(
+            hashlib.sha256(value).hexdigest(), expected_digest,
+        ):
+            raise ValueError(f'{file_name} checksum mismatch')
+    return value.decode('utf-8').strip() or None
 
 
 class LoginRateLimiter:
@@ -250,6 +257,7 @@ class Principal:
     auth_type: str
     session_id: str = ''
     token_version: int = 0
+    key_id: str = ''
 
     def as_dict(self) -> dict[str, Any]:
         return {'sub': self.subject, 'roles': list(self.roles), 'auth_type': self.auth_type}
@@ -299,13 +307,53 @@ class AuthService:
         ttl_seconds=3600,
         issuer='bio-research-agent',
         production=False,
+        jwt_keys=None,
+        jwt_key_id='primary',
+        jwt_retire_at=None,
     ):
         self.legacy_token = legacy_token or None
-        self.jwt_secret = jwt_secret or None
-        if self.jwt_secret and len(self.jwt_secret) < 32:
-            raise ValueError('CADD_JWT_SECRET must be at least 32 characters')
+        if jwt_keys is not None and jwt_secret:
+            raise ValueError('configure JWT key ring or one secret, not both')
+        if not isinstance(jwt_key_id, str):
+            raise ValueError('JWT active kid must be a string')
+        if jwt_keys is not None and not isinstance(jwt_keys, dict):
+            raise ValueError('JWT key ring keys must be an object')
+        if jwt_retire_at is not None and not isinstance(jwt_retire_at, dict):
+            raise ValueError('JWT key retirement deadlines must be an object')
+        self.jwt_key_id = jwt_key_id
+        self.jwt_keys = dict(jwt_keys) if jwt_keys is not None else (
+            {self.jwt_key_id: jwt_secret} if jwt_secret else {}
+        )
+        self.jwt_retire_at = dict(jwt_retire_at or {})
+        if (
+            (jwt_keys is not None and not self.jwt_keys)
+            or (self.jwt_keys and self.jwt_key_id not in self.jwt_keys)
+            or len(self.jwt_keys) > 2
+            or any(
+                not isinstance(key_id, str)
+                or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', key_id) is None
+                or not isinstance(secret, str)
+                or len(secret) < 32
+                for key_id, secret in self.jwt_keys.items()
+            )
+            or len(set(self.jwt_keys.values())) != len(self.jwt_keys)
+            or set(self.jwt_retire_at) != (set(self.jwt_keys) - {self.jwt_key_id})
+            or any(
+                type(deadline) is not int
+                or deadline < 1
+                or deadline > int(time.time()) + 86400
+                for deadline in self.jwt_retire_at.values()
+            )
+        ):
+            raise ValueError('JWT key ring requires distinct strong keys and bounded retirement deadlines')
+        self.jwt_secret = self.jwt_keys.get(self.jwt_key_id)
         self.users = users or {}
-        self.ttl_seconds = max(int(ttl_seconds), 60)
+        try:
+            self.ttl_seconds = int(ttl_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('AUTH_TOKEN_TTL_SECONDS must be between 60 and 86400') from exc
+        if not 60 <= self.ttl_seconds <= 86400:
+            raise ValueError('AUTH_TOKEN_TTL_SECONDS must be between 60 and 86400')
         self.issuer = issuer
         self.production = bool(production)
         self.session_cookie_name = (
@@ -325,9 +373,24 @@ class AuthService:
         legacy_token = os.environ.get('CADD_API_TOKEN', '').strip() or None
         if production and legacy_token:
             raise ValueError('CADD_API_TOKEN is forbidden in production')
-        jwt_secret = _read_secret('CADD_JWT_SECRET', 'CADD_JWT_SECRET_FILE')
-        if production and not jwt_secret:
+        jwt_value = _read_secret('CADD_JWT_SECRET', 'CADD_JWT_SECRET_FILE')
+        if production and not jwt_value:
             raise ValueError('JWT secret is required in production')
+        jwt_keys = None
+        jwt_key_id = 'primary'
+        jwt_retire_at = None
+        if jwt_value and jwt_value.startswith('{'):
+            try:
+                key_ring = json.loads(jwt_value)
+            except json.JSONDecodeError as exc:
+                raise ValueError('invalid JWT key ring JSON') from exc
+            if not isinstance(key_ring, dict) or not {'active_kid', 'keys'} <= set(key_ring) or set(key_ring) - {'active_kid', 'keys', 'retire_at'}:
+                raise ValueError('JWT key ring requires active_kid, keys and optional retire_at')
+            jwt_key_id = key_ring['active_kid']
+            jwt_keys = key_ring['keys']
+            jwt_retire_at = key_ring.get('retire_at')
+            if not isinstance(jwt_keys, dict):
+                raise ValueError('JWT key ring keys must be an object')
         context_secret = _read_secret(
             'RLS_CONTEXT_SIGNING_KEY',
             'RLS_CONTEXT_SIGNING_KEY_FILE',
@@ -365,7 +428,10 @@ class AuthService:
                 )
         return cls(
             legacy_token=None if production else legacy_token,
-            jwt_secret=jwt_secret,
+            jwt_secret=jwt_value if jwt_keys is None else None,
+            jwt_keys=jwt_keys,
+            jwt_key_id=jwt_key_id,
+            jwt_retire_at=jwt_retire_at,
             users=users,
             ttl_seconds=int(os.environ.get('AUTH_TOKEN_TTL_SECONDS', '3600')),
             issuer=os.environ.get('CADD_JWT_ISSUER', 'bio-research-agent'),
@@ -375,6 +441,48 @@ class AuthService:
     @property
     def enabled(self):
         return bool(self.legacy_token or self.jwt_secret)
+
+    def sign_jwt(self, payload):
+        if not self.jwt_secret:
+            raise AuthenticationError('JWT authentication is not configured')
+        return jwt.encode(
+            payload,
+            self.jwt_secret,
+            algorithm='HS256',
+            headers={'kid': self.jwt_key_id},
+        )
+
+    def decode_jwt(self, token, *, issuer, required):
+        header = jwt.get_unverified_header(token)
+        if header.get('alg') != 'HS256':
+            raise jwt.InvalidAlgorithmError('invalid token algorithm')
+        key_id = header.get('kid')
+        if key_id is not None:
+            if not isinstance(key_id, str) or key_id not in self.jwt_keys:
+                raise jwt.InvalidTokenError('unknown token key ID')
+            candidates = ((key_id, self.jwt_keys[key_id]),)
+        else:
+            candidates = tuple(self.jwt_keys.items())
+        now = int(time.time())
+        candidates = tuple(
+            (candidate_id, secret)
+            for candidate_id, secret in candidates
+            if self.jwt_retire_at.get(candidate_id, now + 1) > now
+        )
+        last_error = None
+        for candidate_id, secret in candidates:
+            try:
+                payload = jwt.decode(
+                    token,
+                    secret,
+                    algorithms=['HS256'],
+                    issuer=issuer,
+                    options={'require': required},
+                )
+                return payload, candidate_id
+            except jwt.PyJWTError as exc:
+                last_error = exc
+        raise jwt.InvalidTokenError('invalid token signature or claims') from last_error
 
     def authenticate(self, authorization: str | None) -> Principal:
         if not self.enabled:
@@ -388,14 +496,10 @@ class AuthService:
         if not self.jwt_secret:
             raise AuthenticationError('invalid bearer token')
         try:
-            payload = jwt.decode(
+            payload, key_id = self.decode_jwt(
                 token,
-                self.jwt_secret,
-                algorithms=['HS256'],
                 issuer=self.issuer,
-                options={
-                    'require': ['exp', 'iat', 'iss', 'sub', 'jti', 'ver']
-                },
+                required=['exp', 'iat', 'iss', 'sub', 'jti', 'ver'],
             )
         except jwt.PyJWTError as exc:
             raise AuthenticationError('invalid bearer token') from exc
@@ -417,6 +521,7 @@ class AuthService:
             'jwt',
             jti,
             version,
+            key_id,
         )
 
     def has_permission(self, principal: Principal, permission: str) -> bool:
@@ -425,11 +530,12 @@ class AuthService:
             permissions.update(ROLE_PERMISSIONS.get(role, ()))
         return permission in permissions
 
-    def csrf_token(self, session_id: str) -> str:
-        if not self.jwt_secret or not session_id:
+    def csrf_token(self, session_id: str, key_id: str = '') -> str:
+        secret = self.jwt_keys.get(key_id or self.jwt_key_id)
+        if not secret or not session_id:
             raise AuthenticationError('CSRF protection is unavailable')
         return hmac.new(
-            self.jwt_secret.encode('utf-8'),
+            secret.encode('utf-8'),
             f'bioagent-csrf-v1:{session_id}'.encode('utf-8'),
             hashlib.sha256,
         ).hexdigest()
@@ -439,7 +545,7 @@ class AuthService:
             return True
         if not cookie_token or not header_token:
             return False
-        expected = self.csrf_token(principal.session_id)
+        expected = self.csrf_token(principal.session_id, principal.key_id)
         return (
             hmac.compare_digest(str(cookie_token), expected)
             and hmac.compare_digest(str(header_token), expected)
@@ -481,7 +587,7 @@ class AuthService:
             'ver': token_version,
         }
         return {
-            'access_token': jwt.encode(payload, self.jwt_secret, algorithm='HS256'),
+            'access_token': self.sign_jwt(payload),
             'token_type': 'bearer',
             'expires_in': max(expires_at - issued_at, 0),
             'principal': Principal(
@@ -490,6 +596,7 @@ class AuthService:
                 'jwt',
                 session_id,
                 token_version,
+                self.jwt_key_id,
             ).as_dict(),
         }
 

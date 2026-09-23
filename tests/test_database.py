@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 from pathlib import Path
 from queue import Queue
@@ -9,11 +10,36 @@ import unittest
 from unittest.mock import patch
 
 from src.auth import Principal, roles_sha256
-from src.database import Database, set_database_principal
+from src.database import Database, _tenant_context_secret, set_database_principal
 from src.job_state_store import DatabaseStateWriter
 
 
 class DatabaseStateTests(unittest.TestCase):
+    def test_rls_file_key_is_stable_until_process_uses_a_new_path(self):
+        with tempfile.TemporaryDirectory() as raw:
+            old_path = Path(raw) / 'rls-old.key'
+            new_path = Path(raw) / 'rls-new.key'
+            old_path.write_text('o' * 32, encoding='utf-8')
+            new_path.write_text('n' * 32, encoding='utf-8')
+            with patch.dict(os.environ, {
+                'RLS_CONTEXT_SIGNING_KEY': '',
+                'RLS_CONTEXT_SIGNING_KEY_FILE': str(old_path),
+                'RLS_CONTEXT_SIGNING_KEY_SHA256': hashlib.sha256(
+                    old_path.read_bytes(),
+                ).hexdigest(),
+            }):
+                self.assertEqual(_tenant_context_secret(), 'o' * 32)
+                old_path.write_text('x' * 32, encoding='utf-8')
+                self.assertEqual(_tenant_context_secret(), 'o' * 32)
+                os.environ['RLS_CONTEXT_SIGNING_KEY_FILE'] = str(new_path)
+                os.environ['RLS_CONTEXT_SIGNING_KEY_SHA256'] = hashlib.sha256(
+                    new_path.read_bytes(),
+                ).hexdigest()
+                self.assertEqual(_tenant_context_secret(), 'n' * 32)
+                os.environ['RLS_CONTEXT_SIGNING_KEY_SHA256'] = '0' * 64
+                with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
+                    _tenant_context_secret()
+
     def test_auth_session_revocation_and_subject_version_are_durable(self):
         with tempfile.TemporaryDirectory(prefix='bio_auth_sessions_') as raw:
             url = f"sqlite+aiosqlite:///{(Path(raw) / 'auth.sqlite3').as_posix()}"
