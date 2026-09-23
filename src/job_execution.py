@@ -115,17 +115,6 @@ def _nonnegative_duration(value):
     return duration if math.isfinite(duration) and duration >= 0 else None
 
 
-def _execution_spec(tool):
-    try:
-        from .domain_registry import active_tool_specs
-    except ImportError:
-        from domain_registry import active_tool_specs
-    return next(
-        (spec for spec in active_tool_specs() if spec['name'] == tool),
-        None,
-    )
-
-
 def _env_int(name, default, minimum=0):
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -152,12 +141,17 @@ def _env_float(name, default, minimum=0.01):
     return value
 
 
-def _sandbox_environment(tool, temporary_root, spec=None):
+def _sandbox_environment(tool, temporary_root):
     try:
+        from .domain_registry import active_tool_specs
         from .plugin_security import sandbox_environment
     except ImportError:
+        from domain_registry import active_tool_specs
         from plugin_security import sandbox_environment
-    spec = spec if spec is not None else _execution_spec(tool)
+    spec = next(
+        (item for item in active_tool_specs() if item['name'] == tool),
+        None,
+    )
     if spec is None:
         return None
     environment = sandbox_environment(
@@ -358,9 +352,7 @@ class ProcessToolExecutor:
             request_path = root / 'request.json'
             response_path = root / 'response.json'
             error_path = root / 'stderr.log'
-            execution_spec = _execution_spec(tool)
-            child_environment = _sandbox_environment(tool, root, execution_spec)
-            execution_domain = execution_spec['domain'] if execution_spec else None
+            child_environment = _sandbox_environment(tool, root)
             resolved_arguments = materialize_storage_references(
                 arguments,
                 root / 'inputs',
@@ -370,7 +362,6 @@ class ProcessToolExecutor:
                 json.dumps(
                     {
                         'tool': tool,
-                        'domain': execution_domain,
                         'arguments': resolved_arguments,
                         'limits': self.limits.as_dict(),
                         'observability': current_context(),

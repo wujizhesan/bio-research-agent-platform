@@ -45,9 +45,6 @@ def main(argv=None):
     try:
         request = json.loads(request_path.read_text(encoding='utf-8'))
         _apply_posix_limits(request.get('limits', {}))
-        execution_domain = str(request.get('domain') or '')
-        if execution_domain:
-            os.environ['BIO_AGENT_EXECUTION_DOMAIN'] = execution_domain
         registry_started = perf_counter()
         try:
             from .domain_registry import run_tool

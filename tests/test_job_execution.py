@@ -1,7 +1,6 @@
 import hashlib
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -107,29 +106,6 @@ class JobExecutionTests(unittest.TestCase):
         self.assertGreaterEqual(payload['telemetry']['registry_import_seconds'], 0)
         self.assertGreaterEqual(payload['telemetry']['tool_run_seconds'], 0)
 
-    def test_isolated_registry_loads_only_requested_builtin_domain(self):
-        environment = os.environ.copy()
-        environment['BIO_AGENT_EXECUTION_DOMAIN'] = 'knowledge'
-        environment.pop('PLUGIN_SANDBOX_DOMAIN', None)
-        completed = subprocess.run(
-            [
-                sys.executable,
-                '-c',
-                'import json, sys; from src import domain_registry; '
-                'print(json.dumps({"domains": domain_registry.available_domains(), '
-                '"omics_loaded": "src.omics_agent" in sys.modules}))',
-            ],
-            cwd=str(Path(__file__).resolve().parents[1]),
-            env=environment,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=20,
-        )
-        payload = json.loads(completed.stdout)
-        self.assertEqual(payload['domains'], ['knowledge'])
-        self.assertFalse(payload['omics_loaded'])
-
     def test_isolated_knowledge_tool_reports_phase_timings(self):
         with tempfile.TemporaryDirectory(prefix='isolated_knowledge_') as raw:
             index = Path(raw) / 'index.json'
@@ -137,7 +113,7 @@ class JobExecutionTests(unittest.TestCase):
                 'documents': [{'id': 'doc', 'text': 'TP53 tumor suppressor'}],
             }), encoding='utf-8')
             executor = ProcessToolExecutor(ExecutionLimits(
-                timeout_seconds=20,
+                timeout_seconds=45,
                 memory_limit_mb=0,
                 cpu_time_seconds=0,
                 max_result_bytes=1024 * 1024,

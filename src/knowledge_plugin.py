@@ -1,5 +1,7 @@
 """Local TF-IDF knowledge retrieval adapter for evidence-grounded Agent answers."""
 import json
+from collections import Counter
+from math import log, sqrt
 import re
 from pathlib import Path
 
@@ -93,6 +95,42 @@ def _snippet(text, query):
     return snippet + ('...' if start + 320 < len(text) else '')
 
 
+def _tfidf_terms(text):
+    words = re.findall(r'(?u)\b\w+\b', text.lower())
+    return Counter(words + [f'{left} {right}' for left, right in zip(words, words[1:])])
+
+
+def _small_corpus_scores(texts, query):
+    rows = [_tfidf_terms(text) for text in [*texts, query]]
+    document_frequency = Counter()
+    for row in rows:
+        document_frequency.update(row.keys())
+    count = len(rows)
+    weights = {
+        term: log((1 + count) / (1 + frequency)) + 1
+        for term, frequency in document_frequency.items()
+    }
+    query_row = rows[-1]
+    query_norm = sqrt(sum(
+        (frequency * weights[term]) ** 2
+        for term, frequency in query_row.items()
+    ))
+    if not query_norm:
+        return [0.0] * len(texts)
+    scores = []
+    for row in rows[:-1]:
+        document_norm = sqrt(sum(
+            (frequency * weights[term]) ** 2
+            for term, frequency in row.items()
+        ))
+        dot = sum(
+            frequency * query_row.get(term, 0) * weights[term] ** 2
+            for term, frequency in row.items()
+        )
+        scores.append(dot / (document_norm * query_norm) if document_norm else 0.0)
+    return scores
+
+
 def knowledge_search(query, index_path, top_k=5):
     if not isinstance(query, str) or not query.strip():
         raise ValueError('query must be a non-empty string')
@@ -108,16 +146,19 @@ def knowledge_search(query, index_path, top_k=5):
             'matches': [],
             'n_matches': 0,
         })
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
     texts = [str(item.get('text', '')) for item in documents]
-    vectorizer = TfidfVectorizer(
-        lowercase=True,
-        ngram_range=(1, 2),
-        token_pattern=r'(?u)\b\w+\b',
-    )
-    matrix = vectorizer.fit_transform(texts + [query])
-    scores = cosine_similarity(matrix[-1], matrix[:-1]).ravel()
+    if len(texts) <= 32:
+        scores = _small_corpus_scores(texts, query)
+    else:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+        vectorizer = TfidfVectorizer(
+            lowercase=True,
+            ngram_range=(1, 2),
+            token_pattern=r'(?u)\b\w+\b',
+        )
+        matrix = vectorizer.fit_transform(texts + [query])
+        scores = cosine_similarity(matrix[-1], matrix[:-1]).ravel()
     ranked = sorted(enumerate(scores), key=lambda item: (-item[1], item[0]))
     matches = []
     for index, score in ranked[:max(1, int(top_k))]:

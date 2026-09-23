@@ -3,7 +3,6 @@
 import argparse
 import json
 import os
-from importlib import import_module
 from importlib.metadata import entry_points
 from time import perf_counter
 from types import SimpleNamespace
@@ -11,6 +10,13 @@ from types import SimpleNamespace
 from jsonschema import ValidationError, validate
 
 try:
+    from . import agent as CADD_PLUGIN
+    from . import imaging_plugin as IMAGING_PLUGIN
+    from . import knowledge_plugin as KNOWLEDGE_PLUGIN
+    from . import literature_plugin as LITERATURE_PLUGIN
+    from . import omics_agent as OMICS_PLUGIN
+    from . import research_agent as RESEARCH_PLUGIN
+    from . import sequence_plugin as SEQUENCE_PLUGIN
     from .plugin_registry import DomainRegistry, validate_tool_map
     from .plugin_manifest import build_manifest, validate_install_candidate
     from .external_service_policy import ServiceRetryDeferredError
@@ -33,6 +39,13 @@ try:
         derive_run_context,
     )
 except ImportError:
+    import agent as CADD_PLUGIN
+    import imaging_plugin as IMAGING_PLUGIN
+    import knowledge_plugin as KNOWLEDGE_PLUGIN
+    import literature_plugin as LITERATURE_PLUGIN
+    import omics_agent as OMICS_PLUGIN
+    import research_agent as RESEARCH_PLUGIN
+    import sequence_plugin as SEQUENCE_PLUGIN
     from plugin_registry import DomainRegistry, validate_tool_map
     from plugin_manifest import build_manifest, validate_install_candidate
     from external_service_policy import ServiceRetryDeferredError
@@ -62,27 +75,20 @@ ENTRY_POINT_GROUP = "cadd_agent.domains"
 class PluginDependencyError(ValueError):
     pass
 
-_TARGET_DOMAIN = os.environ.get('BIO_AGENT_EXECUTION_DOMAIN') or None
-
-
-def _load_builtin(module):
-    return import_module(f'{__package__}.{module}' if __package__ else module)
-
-
-_BUILTIN_DEFINITIONS = (
+BUILTIN_DOMAINS = (
     (
         "cadd",
-        "agent",
+        CADD_PLUGIN,
         {"name": "CADD", "kind": "builtin", "version": "builtin"},
     ),
     (
         "omics",
-        "omics_agent",
+        OMICS_PLUGIN,
         {"name": "Omics", "kind": "builtin", "version": "builtin"},
     ),
     (
         "research",
-        "research_agent",
+        RESEARCH_PLUGIN,
         {
             "name": "Bioinformatics Research Agent",
             "kind": "application",
@@ -91,7 +97,7 @@ _BUILTIN_DEFINITIONS = (
     ),
     (
         "literature",
-        "literature_plugin",
+        LITERATURE_PLUGIN,
         {
             "name": "Literature and evidence",
             "kind": "builtin_adapter",
@@ -100,7 +106,7 @@ _BUILTIN_DEFINITIONS = (
     ),
     (
         "knowledge",
-        "knowledge_plugin",
+        KNOWLEDGE_PLUGIN,
         {
             "name": "Local scientific knowledge retrieval",
             "kind": "builtin_adapter",
@@ -109,7 +115,7 @@ _BUILTIN_DEFINITIONS = (
     ),
     (
         "imaging",
-        "imaging_plugin",
+        IMAGING_PLUGIN,
         {
             "name": "Microscopy and image QC",
             "kind": "builtin_adapter",
@@ -119,17 +125,7 @@ _BUILTIN_DEFINITIONS = (
 )
 
 BUILTIN_DOMAIN_NAMES = frozenset(
-    [key for key, _, _ in _BUILTIN_DEFINITIONS] + ["sequence"]
-)
-BUILTIN_DOMAINS = tuple(
-    (domain, _load_builtin(module), metadata)
-    for domain, module, metadata in _BUILTIN_DEFINITIONS
-    if _TARGET_DOMAIN is None or _TARGET_DOMAIN == domain
-)
-SEQUENCE_PLUGIN = (
-    _load_builtin('sequence_plugin')
-    if _TARGET_DOMAIN is None or _TARGET_DOMAIN == 'sequence'
-    else None
+    [key for key, _, _ in BUILTIN_DOMAINS] + ["sequence"]
 )
 
 
@@ -138,7 +134,7 @@ def _discover_external_domains(group=ENTRY_POINT_GROUP, reserved_domains=None):
     discovered = {}
     sources = {}
     errors = {}
-    sandbox_domain = os.environ.get('PLUGIN_SANDBOX_DOMAIN') or _TARGET_DOMAIN
+    sandbox_domain = os.environ.get('PLUGIN_SANDBOX_DOMAIN')
     for entry_point in entry_points(group=group):
         name = entry_point.name
         if sandbox_domain and name != sandbox_domain:
@@ -189,33 +185,27 @@ def _build_registry():
             metadata=metadata,
         )
 
-    sequence_status = {}
-    sequence_tools = {}
-    if SEQUENCE_PLUGIN is not None:
-        sequence_status = SEQUENCE_PLUGIN.plugin_status()
-        sequence_tools = SEQUENCE_PLUGIN.load_tools()
-        sequence_available = bool(sequence_tools)
-        registry.register(
-            "sequence",
-            SEQUENCE_PLUGIN,
-            sequence_tools or {},
-            kind="external",
-            status="available" if sequence_available else "unavailable",
-            health=sequence_status,
-            metadata={
-                "name": SEQUENCE_PLUGIN.PLUGIN_NAME,
-                "kind": "external",
-                "version": SEQUENCE_PLUGIN.PLUGIN_VERSION,
-                **sequence_status,
-            },
-        )
+    sequence_status = SEQUENCE_PLUGIN.plugin_status()
+    sequence_tools = SEQUENCE_PLUGIN.load_tools()
+    sequence_available = bool(sequence_tools)
+    registry.register(
+        "sequence",
+        SEQUENCE_PLUGIN,
+        sequence_tools or {},
+        kind="external",
+        status="available" if sequence_available else "unavailable",
+        health=sequence_status,
+        metadata={
+            "name": SEQUENCE_PLUGIN.PLUGIN_NAME,
+            "kind": "external",
+            "version": SEQUENCE_PLUGIN.PLUGIN_VERSION,
+            **sequence_status,
+        },
+    )
 
-    if _TARGET_DOMAIN in BUILTIN_DOMAIN_NAMES:
-        discovered, sources, errors = {}, {}, {}
-    else:
-        discovered, sources, errors = _discover_external_domains(
-            reserved_domains=set(BUILTIN_DOMAIN_NAMES) | set(registry.domains)
-        )
+    discovered, sources, errors = _discover_external_domains(
+        reserved_domains=registry.domains
+    )
     for domain, tools in discovered.items():
         registry.register(
             domain,
@@ -257,8 +247,8 @@ def _build_registry():
     EXTERNAL_DOMAIN_ERRORS,
 ) = _build_registry()
 
-SEQUENCE_PLUGIN_NAME = SEQUENCE_PLUGIN.PLUGIN_NAME if SEQUENCE_PLUGIN else None
-SEQUENCE_PLUGIN_VERSION = SEQUENCE_PLUGIN.PLUGIN_VERSION if SEQUENCE_PLUGIN else None
+SEQUENCE_PLUGIN_NAME = SEQUENCE_PLUGIN.PLUGIN_NAME
+SEQUENCE_PLUGIN_VERSION = SEQUENCE_PLUGIN.PLUGIN_VERSION
 DOMAIN_TOOLS = REGISTRY.tool_maps
 DOMAIN_SOURCES = REGISTRY.sources
 DOMAIN_METADATA = REGISTRY.metadata
