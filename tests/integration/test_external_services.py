@@ -1,5 +1,6 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 import json
 import os
 from pathlib import Path
@@ -1729,8 +1730,13 @@ class ExternalServiceTests(unittest.TestCase):
         recovered = None
         owner = Database(os.environ['DATABASE_URL'])
         api = Database(os.environ['API_DATABASE_URL'])
+        db_runner = asyncio.Runner()
+
+        def run_db(awaitable):
+            return db_runner.run(awaitable, context=copy_context())
+
         try:
-            asyncio.run(owner.create_project(
+            run_db(owner.create_project(
                 project_id,
                 'Deferred retry integration',
                 None,
@@ -1742,7 +1748,7 @@ class ExternalServiceTests(unittest.TestCase):
                 'research_catalog', {}, project_id=project_id
             )
             job_id = prepared['job_id']
-            asyncio.run(api.stage_job(prepared, project_id=project_id))
+            run_db(api.stage_job(prepared, project_id=project_id))
             set_database_principal()
 
             first = next(
@@ -1760,7 +1766,7 @@ class ExternalServiceTests(unittest.TestCase):
             )
             self.assertEqual(len(attempts), 1)
             waiting_event = next(
-                item for item in asyncio.run(owner.list_job_events(job_id))
+                item for item in run_db(owner.list_job_events(job_id))
                 if (item['job'].get('scheduling') or {}).get('status')
                 == 'waiting_for_external_service'
             )
@@ -1773,12 +1779,12 @@ class ExternalServiceTests(unittest.TestCase):
                 job_id,
                 {item['job_id'] for item in dispatcher.claim_dispatchable(limit=1000)},
             )
-            first_attempt = asyncio.run(owner.get_execution_result(
+            first_attempt = run_db(owner.get_execution_result(
                 prepared['_execution_key']
             ))
             self.assertEqual(first_attempt['status'], 'deferred')
             with self.assertRaisesRegex(RuntimeError, 'deferred'):
-                asyncio.run(owner.store_execution_result(
+                run_db(owner.store_execution_result(
                     prepared['_execution_key'],
                     job_id,
                     {'status': 'ok', 'stale': True},
@@ -1812,7 +1818,7 @@ class ExternalServiceTests(unittest.TestCase):
                         "::double precision))::json WHERE job_id = :job_id"
                     ), {'job_id': job_id})
 
-            asyncio.run(make_due())
+            run_db(make_due())
             second = next(
                 item for item in dispatcher.claim_dispatchable(limit=1000)
                 if item['job_id'] == job_id
@@ -1825,12 +1831,12 @@ class ExternalServiceTests(unittest.TestCase):
             writer.flush()
             self.assertEqual(recovered.get(job_id)['status'], 'completed')
             self.assertEqual(len(attempts), 2)
-            self.assertEqual(asyncio.run(owner.get_job(job_id))['status'], 'completed')
-            replayed = asyncio.run(owner.list_job_events(
+            self.assertEqual(run_db(owner.get_job(job_id))['status'], 'completed')
+            replayed = run_db(owner.list_job_events(
                 job_id, after_event_id=waiting_event['event_id']
             ))
             self.assertTrue(any(item['status'] == 'completed' for item in replayed))
-            canonical_replay = asyncio.run(owner.list_job_events(
+            canonical_replay = run_db(owner.list_job_events(
                 job_id, after_event_id=f"r-{waiting_event['revision']}"
             ))
             self.assertTrue(any(
@@ -1854,9 +1860,10 @@ class ExternalServiceTests(unittest.TestCase):
                             {'project_id': project_id},
                         )
 
-                asyncio.run(cleanup())
-            asyncio.run(api.close())
-            asyncio.run(owner.close())
+                run_db(cleanup())
+            run_db(api.close())
+            run_db(owner.close())
+            db_runner.close()
 
     def test_postgres_execution_result_prevents_reexecution_after_redis_loss(self):
         import redis

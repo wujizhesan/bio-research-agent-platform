@@ -69,6 +69,15 @@ async def _verify(url_name, expected_role, forbidden_roles):
             raise DatabaseRoleError(
                 f'{url_name} user must not own application tables'
             )
+        if expected_role == 'bioagent_worker':
+            can_update_artifacts = await connection.fetchval(
+                "SELECT has_column_privilege(current_user, "
+                "'public.job_records', 'artifacts', 'UPDATE')"
+            )
+            if not can_update_artifacts:
+                raise DatabaseRoleError(
+                    'WORKER_DATABASE_URL user must update job artifact manifests'
+                )
         return row['username']
     finally:
         await connection.close()
