@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Lock
-from time import monotonic, sleep
+from time import monotonic, monotonic_ns
 
 try:
     from .external_service_policy import (
@@ -383,6 +383,7 @@ class ProcessToolExecutor:
                 encoding='utf-8',
             )
             started = monotonic()
+            spawn_started_ns = monotonic_ns()
             windows_job = None
             with error_path.open('wb') as error_stream:
                 process = self.popen_factory(
@@ -416,7 +417,16 @@ class ProcessToolExecutor:
                             )
                         if heartbeat:
                             heartbeat()
-                        sleep(self.limits.poll_interval_seconds)
+                        wait_seconds = self.limits.poll_interval_seconds
+                        if self.limits.timeout_seconds:
+                            wait_seconds = min(
+                                wait_seconds,
+                                max(self.limits.timeout_seconds - (now - started), 0.001),
+                            )
+                        try:
+                            process.wait(timeout=wait_seconds)
+                        except subprocess.TimeoutExpired:
+                            pass
                     if self._shutdown.is_set():
                         raise JobExecutionCancelled('tool executor is shutting down')
                 except Exception:
@@ -427,7 +437,10 @@ class ProcessToolExecutor:
                         self._active_processes.discard(process)
                     if windows_job is not None:
                         windows_job.close()
-            process_elapsed_seconds = monotonic() - started
+            process_end_ns = monotonic_ns()
+            process_elapsed_seconds = (
+                process_end_ns - spawn_started_ns
+            ) / 1_000_000_000
             if not response_path.exists():
                 detail = error_path.read_text(encoding='utf-8', errors='replace')[-2000:].strip()
                 suffix = f': {detail}' if detail else ''
@@ -463,6 +476,30 @@ class ProcessToolExecutor:
                     phases['process_boundary'] = max(
                         process_elapsed_seconds - duration, 0
                     )
+                boundary_seconds = {}
+                process_clock = telemetry.get('process_clock_ns')
+                if isinstance(process_clock, dict):
+                    entry_ns = process_clock.get('module_entry')
+                    child_start_ns = process_clock.get('execution_start')
+                    child_end_ns = process_clock.get('execution_finished')
+                    if (
+                        all(isinstance(value, int) for value in (
+                            entry_ns, child_start_ns, child_end_ns
+                        ))
+                        and spawn_started_ns <= entry_ns <= child_start_ns
+                        <= child_end_ns <= process_end_ns
+                    ):
+                        boundary_seconds = {
+                            'launch_to_entry': (
+                                entry_ns - spawn_started_ns
+                            ) / 1_000_000_000,
+                            'module_import': (
+                                child_start_ns - entry_ns
+                            ) / 1_000_000_000,
+                            'result_handoff': (
+                                process_end_ns - child_end_ns
+                            ) / 1_000_000_000,
+                        }
                 phases = {
                     phase: seconds for phase, seconds in phases.items()
                     if seconds is not None
@@ -476,6 +513,7 @@ class ProcessToolExecutor:
                     status=outcome,
                     duration_seconds=duration,
                     phase_seconds=phases,
+                    boundary_seconds=boundary_seconds,
                     execution_mode='process',
                 )
             if not payload.get('ok'):

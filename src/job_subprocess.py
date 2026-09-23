@@ -1,11 +1,14 @@
 """Subprocess entry point for a single isolated research job."""
 
+from time import monotonic_ns, perf_counter
+
+_MODULE_ENTRY_NS = monotonic_ns()
+
 import json
 import math
 import os
 from pathlib import Path
 import sys
-from time import perf_counter
 import traceback
 
 try:
@@ -39,7 +42,7 @@ def main(argv=None):
         raise SystemExit('usage: job_subprocess.py REQUEST_PATH RESPONSE_PATH')
     request_path, response_path = map(Path, args)
     request = {}
-    started = perf_counter()
+    started_ns = monotonic_ns()
     registry_import_seconds = None
     tool_run_seconds = None
     try:
@@ -82,6 +85,7 @@ def main(argv=None):
         payload.get('result', {}).get('status')
         if isinstance(payload.get('result'), dict) else None
     )
+    finished_ns = monotonic_ns()
     payload['telemetry'] = {
         'domain': tool.split('_', 1)[0] if '_' in tool else 'unknown',
         'tool': tool,
@@ -90,9 +94,14 @@ def main(argv=None):
             if not payload.get('ok') or result_status in {'error', 'failed', 'missing', 'not_found'}
             else 'success'
         ),
-        'duration_seconds': perf_counter() - started,
+        'duration_seconds': (finished_ns - started_ns) / 1_000_000_000,
         'registry_import_seconds': registry_import_seconds,
         'tool_run_seconds': tool_run_seconds,
+        'process_clock_ns': {
+            'module_entry': _MODULE_ENTRY_NS,
+            'execution_start': started_ns,
+            'execution_finished': finished_ns,
+        },
     }
     encoded = json.dumps(payload, ensure_ascii=False, default=str)
     max_result_bytes = int(request.get('limits', {}).get('max_result_bytes') or 0)

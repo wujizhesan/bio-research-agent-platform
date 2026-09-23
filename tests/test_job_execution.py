@@ -106,6 +106,10 @@ class JobExecutionTests(unittest.TestCase):
         self.assertEqual(payload['retry_after_seconds'], 120)
         self.assertGreaterEqual(payload['telemetry']['registry_import_seconds'], 0)
         self.assertGreaterEqual(payload['telemetry']['tool_run_seconds'], 0)
+        self.assertLessEqual(
+            payload['telemetry']['process_clock_ns']['module_entry'],
+            payload['telemetry']['process_clock_ns']['execution_start'],
+        )
 
     def test_isolated_knowledge_tool_reports_phase_timings(self):
         with tempfile.TemporaryDirectory(prefix='isolated_knowledge_') as raw:
@@ -136,6 +140,16 @@ class JobExecutionTests(unittest.TestCase):
         self.assertGreaterEqual(phases['registry_import'], 0)
         self.assertGreaterEqual(phases['tool_run'], 0)
         self.assertGreaterEqual(phases['process_boundary'], 0)
+        boundary = completed.kwargs['boundary_seconds']
+        self.assertEqual(
+            set(boundary),
+            {'launch_to_entry', 'module_import', 'result_handoff'},
+        )
+        self.assertAlmostEqual(
+            sum(boundary.values()),
+            phases['process_boundary'],
+            places=3,
+        )
 
     def test_isolated_knowledge_registry_skips_unrelated_domains(self):
         environment = os.environ.copy()
