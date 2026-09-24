@@ -441,20 +441,20 @@ jobs:
             docker compose -f docker-compose.yml -f docker-compose.secure.yml "$@"
           }
           restore_worker() {
-            export WORKER_LIGHT_RESERVED_SLOTS=3
+            export SECURE_WORKER_LIGHT_RESERVED_SLOTS=4
             compose up -d --no-deps --force-recreate --wait worker
           }
           trap restore_worker EXIT
           light_before=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox python -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8081/health'))['admitted'])")
           heavy_before=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox-heavy python -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8081/health'))['admitted'])")
-          export WORKER_LIGHT_RESERVED_SLOTS=0
+          export SECURE_WORKER_LIGHT_RESERVED_SLOTS=0
           compose up -d --no-deps --force-recreate --wait worker
           python -m scripts.verify_secure_mixed_resources \
             --base-url http://127.0.0.1:18080 \
             --artifact-prefix reservation-off \
             --heavy-running-target 3 \
             > output/heavy-light-isolation-baseline.json
-          export WORKER_LIGHT_RESERVED_SLOTS=3
+          export SECURE_WORKER_LIGHT_RESERVED_SLOTS=4
           compose up -d --no-deps --force-recreate --wait worker
           python -m scripts.verify_secure_mixed_resources \
             --base-url http://127.0.0.1:18080 \
@@ -468,6 +468,7 @@ jobs:
           baseline = json.loads(Path('output/heavy-light-isolation-baseline.json').read_text())
           optimized = json.loads(Path('output/heavy-light-isolation.json').read_text())
           assert optimized['light_overlap_count'] == 8
+          assert optimized['max_light_running_while_heavy'] >= 4
           assert optimized['light_queue_p95_seconds'] < baseline['light_queue_p95_seconds']
           print(json.dumps({
               'baseline_light_queue_p95': baseline['light_queue_p95_seconds'],

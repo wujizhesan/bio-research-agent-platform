@@ -25,22 +25,22 @@ def worker_env(name):
     total, reserved, client, cpu_capacity = CONFIGURATIONS[name]
     env = os.environ.copy()
     env.update({
-        'WORKER_MAX_CONCURRENCY': str(total),
-        'WORKER_LIGHT_RESERVED_SLOTS': str(reserved),
-        'PLUGIN_SANDBOX_CLIENT_CONCURRENCY': str(client),
-        'JOB_TOTAL_CPU_CORES': str(cpu_capacity),
+        'SECURE_WORKER_MAX_CONCURRENCY': str(total),
+        'SECURE_WORKER_LIGHT_RESERVED_SLOTS': str(reserved),
+        'SECURE_PLUGIN_SANDBOX_CLIENT_CONCURRENCY': str(client),
+        'SECURE_WORKER_TOTAL_CPU_CORES': str(cpu_capacity),
     })
     return env
 
 
-def restart_worker(name):
+def restart_worker(name=None):
     result = run(
         (*COMPOSE, 'up', '-d', '--no-deps', '--force-recreate', '--wait', 'worker'),
-        env=worker_env(name),
+        env=worker_env(name) if name else os.environ.copy(),
         timeout=240,
     )
     if result.returncode:
-        raise RuntimeError(f'{name} worker restart failed: {result.stdout[-3000:]}')
+        raise RuntimeError(f'{name or "deployment"} worker restart failed: {result.stdout[-3000:]}')
 
 
 def pool_snapshot(env):
@@ -87,12 +87,14 @@ def summarize_rows(rows):
         if not selected:
             continue
         light = [value for row in selected for value in row['result']['light_queue_seconds']]
+        light_server = [value for row in selected for value in row['result']['light_server_seconds']]
         heavy = [value for row in selected for value in row['result']['heavy_server_seconds']]
         summary[name] = {
             'rounds': len(selected),
             'light_jobs': len(light),
             'heavy_jobs': len(heavy),
             'light_queue_p95_seconds': round(percentile(light, 95), 3),
+            'light_server_p95_seconds': round(percentile(light_server, 95), 3),
             'heavy_server_p95_seconds': round(percentile(heavy, 95), 3),
             'light_round_p95_median_seconds': round(median(
                 row['result']['light_queue_p95_seconds'] for row in selected
@@ -102,6 +104,9 @@ def summarize_rows(rows):
             ), 3),
             'light_execution_round_p95_median_seconds': round(median(
                 row['result']['light_execution_p95_seconds'] for row in selected
+            ), 3),
+            'light_server_round_p95_median_seconds': round(median(
+                row['result']['light_server_p95_seconds'] for row in selected
             ), 3),
             'light_overlap_count': sum(row['result']['light_overlap_count'] for row in selected),
             'max_light_running_while_heavy': max(
@@ -139,6 +144,9 @@ def summarize_rows(rows):
             'heavy_server_change_percent': round(
                 100 * (candidate['heavy_server_p95_seconds'] / baseline['heavy_server_p95_seconds'] - 1), 1
             ),
+            'light_server_improvement_percent': round(
+                100 * (1 - candidate['light_server_p95_seconds'] / baseline['light_server_p95_seconds']), 1
+            ),
             'light_round_wins': paired_wins,
             'paired_rounds': len(paired_rounds),
             'required_light_round_wins': required_wins,
@@ -147,6 +155,7 @@ def summarize_rows(rows):
                 and baseline['rounds'] >= 2
                 and paired_wins >= required_wins
                 and candidate['light_queue_p95_seconds'] <= baseline['light_queue_p95_seconds'] * 0.9
+                and candidate['light_server_p95_seconds'] <= baseline['light_server_p95_seconds']
                 and candidate['heavy_server_p95_seconds'] <= baseline['heavy_server_p95_seconds'] * 1.1
                 and candidate['max_light_running_while_heavy'] >= 4
                 and candidate['capacity_rejections'] <= baseline['capacity_rejections']
@@ -202,7 +211,7 @@ def benchmark(args):
         error = f'{type(exc).__name__}: {exc}'
     finally:
         try:
-            restart_worker('baseline')
+            restart_worker()
         except Exception as exc:
             restore_error = f'{type(exc).__name__}: {exc}'
         report = {

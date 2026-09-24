@@ -22,8 +22,10 @@ class WorkerSlotBenchmarkTests(unittest.TestCase):
                     'configuration': name,
                     'result': {
                         'light_queue_seconds': [light] * 8,
+                        'light_server_seconds': [light + 1] * 8,
                         'heavy_server_seconds': [heavy] * 4,
                         'light_queue_p95_seconds': light,
+                        'light_server_p95_seconds': light + 1,
                         'heavy_server_p95_seconds': heavy,
                         'light_execution_p95_seconds': 1.0,
                         'light_overlap_count': 8,
@@ -47,9 +49,17 @@ class WorkerSlotBenchmarkTests(unittest.TestCase):
                 row['result']['heavy_server_p95_seconds'] = 12.0
         self.assertFalse(summarize_rows(rows)['comparison']['promote_candidate'])
 
+        for row in rows:
+            if row['configuration'] == 'candidate':
+                row['result']['heavy_server_seconds'] = [10.5] * 4
+                row['result']['heavy_server_p95_seconds'] = 10.5
+                row['result']['light_server_seconds'] = [5.0] * 8
+                row['result']['light_server_p95_seconds'] = 5.0
+        self.assertFalse(summarize_rows(rows)['comparison']['promote_candidate'])
+
     def test_candidate_includes_the_extra_logical_cpu(self):
-        self.assertEqual(worker_env('baseline')['JOB_TOTAL_CPU_CORES'], '4')
-        self.assertEqual(worker_env('candidate')['JOB_TOTAL_CPU_CORES'], '5')
+        self.assertEqual(worker_env('baseline')['SECURE_WORKER_TOTAL_CPU_CORES'], '4')
+        self.assertEqual(worker_env('candidate')['SECURE_WORKER_TOTAL_CPU_CORES'], '5')
 
     def test_capacity_rejections_are_read_from_prometheus_samples(self):
         metrics = (

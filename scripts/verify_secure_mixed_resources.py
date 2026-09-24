@@ -159,6 +159,8 @@ def verify(base_url, host_root, container_root, username, password,
         'light_queue_p95_seconds': summarize(light_timings, 'queue_seconds')['p95'],
         'light_queue_seconds': [timing['queue_seconds'] for timing in light_timings],
         'light_execution_p95_seconds': summarize(light_timings, 'execution_seconds')['p95'],
+        'light_server_p95_seconds': summarize(light_timings, 'server_total_seconds')['p95'],
+        'light_server_seconds': [timing['server_total_seconds'] for timing in light_timings],
         'max_light_running_while_heavy': peak_light_running_while_heavy(
             heavy_intervals, light_intervals
         ),

@@ -593,8 +593,10 @@ class PluginContainerTests(unittest.TestCase):
             services['worker']['environment']['JOB_INPUT_WORKSPACE_ROOT'],
             '/run/bioagent/plugin-exchange',
         )
-        self.assertIn(':-4}', services['worker']['environment']['WORKER_MAX_CONCURRENCY'])
-        self.assertIn(':-4}', services['worker']['environment']['PLUGIN_SANDBOX_CLIENT_CONCURRENCY'])
+        self.assertIn('SECURE_WORKER_MAX_CONCURRENCY:-5}', services['worker']['environment']['WORKER_MAX_CONCURRENCY'])
+        self.assertIn('SECURE_WORKER_LIGHT_RESERVED_SLOTS:-4}', services['worker']['environment']['WORKER_LIGHT_RESERVED_SLOTS'])
+        self.assertIn('SECURE_WORKER_TOTAL_CPU_CORES:-5}', services['worker']['environment']['JOB_TOTAL_CPU_CORES'])
+        self.assertIn('SECURE_PLUGIN_SANDBOX_CLIENT_CONCURRENCY:-5}', services['worker']['environment']['PLUGIN_SANDBOX_CLIENT_CONCURRENCY'])
         self.assertEqual(
             services['worker']['environment']['PLUGIN_SANDBOX_HEAVY_URL'],
             'http://plugin-sandbox-heavy:8081',
