@@ -498,6 +498,12 @@ jobs:
           )
           print(json.dumps({name: data['memory_peak'] for name, data in report.items()}))
           PY
+      - name: Compare Worker slot reservations over three mixed-load rounds
+        run: |
+          python -m scripts.benchmark_worker_slots \
+            --base-url http://127.0.0.1:18080 \
+            --rounds 3 \
+            --output output/worker-slot-benchmark.json
       - name: Verify sandbox mounts and cleanup
         run: |
           mkdir -p output
@@ -566,6 +572,7 @@ jobs:
             output/heavy-light-isolation.json
             output/heavy-light-isolation-baseline.json
             output/heavy-light-resources.json
+            output/worker-slot-benchmark.json
             output/secure-fullstack-e2e
             output/monitoring-smoke
           if-no-files-found: ignore

@@ -143,7 +143,9 @@ def verify(base_url, host_root, container_root, username, password,
         'light_job_ids': light_ids,
         'heavy_execution_p95_seconds': summarize(heavy_timings, 'execution_seconds')['p95'],
         'heavy_server_p95_seconds': summarize(heavy_timings, 'server_total_seconds')['p95'],
+        'heavy_server_seconds': [timing['server_total_seconds'] for timing in heavy_timings],
         'light_queue_p95_seconds': summarize(light_timings, 'queue_seconds')['p95'],
+        'light_queue_seconds': [timing['queue_seconds'] for timing in light_timings],
         'light_queue_phase_p95_seconds': {
             phase: summarize(light_timings, f'{phase}_seconds')['p95']
             for phase in ('submission', 'outbox_wait', 'dispatch', 'worker_wait')
