@@ -2,10 +2,9 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 from statistics import median
 from urllib.request import urlopen
-
-from prometheus_client.parser import text_string_to_metric_families
 
 from scripts.benchmark_sandbox_capacity import COMPOSE, cgroup_snapshot, parse_cgroup, run
 from scripts.benchmark_secure_jobs import percentile
@@ -17,6 +16,9 @@ CONFIGURATIONS = {
     'candidate': (5, 4, 5, 5),
 }
 POOLS = ('plugin-sandbox', 'plugin-sandbox-heavy')
+CAPACITY_REJECTION_SAMPLE = re.compile(
+    r'^bio_agent_redis_worker_capacity_rejections_total(?:\{[^}]*\})?\s+([\d.eE+-]+)(?:\s|$)'
+)
 
 
 def worker_env(name):
@@ -67,10 +69,9 @@ def pool_delta(before, after):
 
 def parse_capacity_rejections(metrics_text):
     return sum(
-        sample.value
-        for family in text_string_to_metric_families(metrics_text)
-        for sample in family.samples
-        if sample.name == 'bio_agent_redis_worker_capacity_rejections_total'
+        float(match.group(1))
+        for line in metrics_text.splitlines()
+        if (match := CAPACITY_REJECTION_SAMPLE.match(line))
     )
 
 

@@ -25,16 +25,16 @@ services:
       timeout: 3s
       retries: 30
 
-  minio:
-    image: quay.io/minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
-    command: ["server", "/data", "--console-address", ":9001"]
+  s3:
+    image: ghcr.io/chrislusf/seaweedfs:4.38@sha256:e1ee85a3089d96c4f3df699a0944468557813f5df306819c9d368c4039070ddf
+    command: ["mini", "-dir=/data"]
     environment:
-      MINIO_ROOT_USER: recovery-access-key
-      MINIO_ROOT_PASSWORD: recovery-secret-key
+      AWS_ACCESS_KEY_ID: recovery-access-key
+      AWS_SECRET_ACCESS_KEY: recovery-secret-key
     ports:
-      - "${RECOVERY_S3_PORT:-19000}:9000"
+      - "${RECOVERY_S3_PORT:-19000}:8333"
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://127.0.0.1:9000/minio/health/live"]
+      test: ["CMD", "curl", "--silent", "--output", "/dev/null", "--max-time", "2", "http://127.0.0.1:8333/"]
       interval: 2s
       timeout: 3s
       retries: 30
