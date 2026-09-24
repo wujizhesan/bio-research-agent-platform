@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -86,6 +87,57 @@ def parse_capacity_rejections(metrics_text):
 def capacity_rejections(url):
     with urlopen(url, timeout=10) as response:
         return parse_capacity_rejections(response.read().decode('utf-8'))
+
+
+def parse_tool_phase_events(log_text, tool):
+    samples = []
+    for line in log_text.splitlines():
+        start = line.find('{')
+        if start < 0:
+            continue
+        try:
+            event = json.loads(line[start:])
+        except json.JSONDecodeError:
+            continue
+        if event.get('event') != 'tool.execution.completed' or event.get('tool') != tool:
+            continue
+        if event.get('status') != 'success':
+            raise RuntimeError(f'{tool} phase trace contains a failed execution')
+        values = {'duration': event.get('duration_seconds')}
+        values.update(event.get('phase_seconds') or {})
+        values.update(event.get('boundary_seconds') or {})
+        samples.append({
+            key: float(value) for key, value in values.items()
+            if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0
+        })
+    return samples
+
+
+def collect_tool_phases(env, service, tool, expected_count):
+    container = run((*COMPOSE, 'ps', '-q', service), env=env)
+    container_id = container.stdout.strip()
+    if container.returncode or not container_id:
+        raise RuntimeError(f'{service} container ID is unavailable')
+    logs = run(('docker', 'logs', container_id), env=env, timeout=60)
+    if logs.returncode:
+        raise RuntimeError(f'{service} logs are unavailable: {logs.stdout[-1000:]}')
+    samples = parse_tool_phase_events(logs.stdout, tool)
+    if len(samples) != expected_count:
+        raise RuntimeError(
+            f'{service} emitted {len(samples)} {tool} phase traces, expected {expected_count}'
+        )
+    seconds = {
+        phase: [sample[phase] for sample in samples if phase in sample]
+        for phase in sorted({phase for sample in samples for phase in sample})
+    }
+    return {
+        'count': len(samples),
+        'p95_seconds': {
+            phase: round(percentile(values, 95), 3)
+            for phase, values in seconds.items()
+        },
+        'seconds': seconds,
+    }
 
 
 def compare_configurations(rows, summary, baseline_name, candidate_name):
@@ -179,6 +231,16 @@ def summarize_rows(rows):
                 row['pools']['plugin-sandbox']['cpu_throttled_usec'] for row in selected
             ),
         }
+        for pool in ('light', 'heavy'):
+            phase_samples = {}
+            for row in selected:
+                for phase, values in (row.get('tool_phases') or {}).get(pool, {}).get('seconds', {}).items():
+                    phase_samples.setdefault(phase, []).extend(values)
+            if phase_samples:
+                summary[name][f'{pool}_phase_p95_seconds'] = {
+                    phase: round(percentile(values, 95), 3)
+                    for phase, values in sorted(phase_samples.items())
+                }
     if 'baseline' in summary and 'candidate' in summary:
         summary['comparison'] = compare_configurations(rows, summary, 'baseline', 'candidate')
     if 'baseline' in summary and 'balanced' in summary:
@@ -229,6 +291,14 @@ def benchmark(args):
                     heavy_count=args.heavy_count,
                     artifact_prefix=f'worker-slots-{name}-{index}',
                 )
+                tool_phases = {
+                    'light': collect_tool_phases(
+                        env, 'plugin-sandbox', 'omics_inspect_toolchain', args.light_count
+                    ),
+                    'heavy': collect_tool_phases(
+                        env, 'plugin-sandbox-heavy', 'omics_run_analysis', args.heavy_count
+                    ),
+                }
                 after = pool_snapshot(env)
                 rejected_after = capacity_rejections(args.worker_metrics_url)
                 if rejected_after < rejected_before:
@@ -237,6 +307,7 @@ def benchmark(args):
                     'round': index,
                     'configuration': name,
                     'result': result,
+                    'tool_phases': tool_phases,
                     'pools': pool_delta(before, after),
                     'capacity_rejections': int(rejected_after - rejected_before),
                 }

@@ -6,6 +6,7 @@ from unittest.mock import patch
 from scripts.benchmark_worker_slots import (
     configuration_env,
     parse_capacity_rejections,
+    parse_tool_phase_events,
     restart_configuration,
     summarize_rows,
 )
@@ -98,6 +99,20 @@ class WorkerSlotBenchmarkTests(unittest.TestCase):
             'bio_agent_redis_worker_capacity_rejections_total{tool="b"} 3\n'
         )
         self.assertEqual(parse_capacity_rejections(metrics), 5)
+
+    def test_tool_phase_events_are_selected_from_container_logs(self):
+        logs = (
+            '2026-09-25T01:00:00Z {"event":"plugin.sandbox.started"}\n'
+            '2026-09-25T01:00:01Z {"event":"tool.execution.completed",'
+            '"tool":"omics_inspect_toolchain","status":"success",'
+            '"duration_seconds":1.5,"phase_seconds":{"tool_run":0.2},'
+            '"boundary_seconds":{"module_import":0.4}}\n'
+        )
+        self.assertEqual(parse_tool_phase_events(logs, 'omics_inspect_toolchain'), [{
+            'duration': 1.5,
+            'tool_run': 0.2,
+            'module_import': 0.4,
+        }])
 
     def test_peak_light_parallelism_requires_overlapping_heavy_job(self):
         start = datetime(2026, 9, 24, tzinfo=timezone.utc)
