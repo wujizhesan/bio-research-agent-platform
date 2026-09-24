@@ -816,6 +816,65 @@ class FastApiAppTests(unittest.TestCase):
             finally:
                 self._close_app(app)
 
+    def test_redis_sse_retries_durable_event_after_wakeup(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_durable_wake_') as raw:
+            manager = RedisReplayJobManager()
+            database = Database(
+                f"sqlite+aiosqlite:///{(Path(raw) / 'api.sqlite3').as_posix()}"
+            )
+            asyncio.run(database.init_schema())
+            asyncio.run(database.upsert_job({
+                'job_id': 'durable-wake-job',
+                'tool': 'research_catalog',
+                'status': 'running',
+                'created_at': '2026-09-24T00:00:00+00:00',
+                '_revision': 1,
+                '_event_id': '1000-0',
+            }))
+            running = {
+                'event_id': '1000-0',
+                'revision': 1,
+                'terminal': False,
+                'job': {
+                    'job_id': 'durable-wake-job',
+                    'tool': 'research_catalog',
+                    'status': 'running',
+                },
+            }
+            completed = {
+                'event_id': '1001-0',
+                'revision': 2,
+                'terminal': True,
+                'job': {
+                    'job_id': 'durable-wake-job',
+                    'tool': 'research_catalog',
+                    'status': 'completed',
+                },
+            }
+            database.list_job_events = AsyncMock(side_effect=[
+                [running], [], [], [completed],
+            ])
+            app = create_app(
+                job_manager=manager,
+                plugin_manager=PluginManager(state_path=Path(raw) / 'plugins.json'),
+                database=database,
+                audit_log=AuditLogger(Path(raw) / 'audit.jsonl'),
+            )
+            try:
+                with TestClient(app) as client:
+                    with client.stream(
+                        'GET',
+                        '/api/v1/jobs/durable-wake-job/events?interval_seconds=0.05',
+                    ) as events:
+                        body = ''.join(events.iter_text())
+                    self.assertEqual(events.status_code, 200)
+                    self.assertIn('id: r-2', body)
+                    self.assertIn('"status": "completed"', body)
+                    self.assertEqual(manager.cursors, ['1000-0'])
+                    self.assertEqual(database.list_job_events.await_count, 4)
+            finally:
+                self._close_app(app)
+
     def test_redis_sse_replays_running_job_after_stream_loss(self):
         class RedisDisconnectedJobManager(RedisLostEventJobManager):
             def read_job_events(self, *_args, **_kwargs):

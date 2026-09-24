@@ -584,7 +584,12 @@ def _register_job_event_routes(
             event_cursor = last_event_id or query_last_event_id or '0-0'
             if not durable_mode and event_cursor.startswith('r-'):
                 event_cursor = '0-0'
-            redis_wake_cursor = '$'
+            redis_wake_cursor = (
+                event_cursor if not event_cursor.startswith('r-') else '0-0'
+            )
+            pending_durable_until = 0.0
+            pending_durable_revision = 0
+            durable_revision = 0
             redis_wake_error_reported = False
             durable_replay_error_reported = False
             deadline = monotonic() + timeout_seconds
@@ -633,9 +638,20 @@ def _register_job_event_routes(
                                 )
                             durable_replay_error_reported = True
                         for durable_event in durable_events:
-                            durable_event_id = f"r-{durable_event['revision']}"
+                            revision = int(durable_event['revision'])
+                            durable_revision = max(durable_revision, revision)
+                            durable_event_id = f'r-{revision}'
                             durable_record = durable_event['job']
                             event_cursor = durable_event_id
+                            wake_event_id = str(durable_event.get('event_id') or '')
+                            wake_parts = wake_event_id.split('-')
+                            if len(wake_parts) == 2 and all(
+                                part.isdigit() for part in wake_parts
+                            ):
+                                if tuple(map(int, wake_parts)) > tuple(
+                                    map(int, redis_wake_cursor.split('-'))
+                                ):
+                                    redis_wake_cursor = wake_event_id
                             signature = json.dumps(
                                 durable_record,
                                 ensure_ascii=False,
@@ -665,6 +681,8 @@ def _register_job_event_routes(
                             if durable_event.get('terminal'):
                                 return
                         if durable_events:
+                            if durable_revision >= pending_durable_revision:
+                                pending_durable_until = 0.0
                             continue
                         if durable_failed or last_signature is None or monotonic() >= deadline:
                             try:
@@ -727,6 +745,12 @@ def _register_job_event_routes(
                                 return
                         else:
                             yield ': keep-alive\n\n'
+                        if pending_durable_until > monotonic():
+                            await asyncio.sleep(min(
+                                max(interval_seconds, 0.2),
+                                pending_durable_until - monotonic(),
+                            ))
+                            continue
                         started_wait = monotonic()
                         woke = False
                         if event_reader is not None:
@@ -741,6 +765,13 @@ def _register_job_event_routes(
                                 if wake_events:
                                     redis_wake_cursor = wake_events[-1][0]
                                     woke = True
+                                    wake_revision = max(
+                                        int(event.get('revision') or 0)
+                                        for _, event in wake_events
+                                    )
+                                    if wake_revision > durable_revision or not wake_revision:
+                                        pending_durable_revision = wake_revision
+                                        pending_durable_until = monotonic() + 1.0
                                 redis_wake_error_reported = False
                             except Exception as exc:
                                 if not redis_wake_error_reported:
