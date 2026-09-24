@@ -4,13 +4,12 @@ import gzip
 import json
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-
-
 def run_single_cell_qc(matrix_csv, output_dir, cell_id_column='cell_id',
                        min_genes=0, max_genes=None, min_counts=0,
                        max_mito_percent=100, mitochondrial_prefix='MT-'):
+    import numpy as np
+    import pandas as pd
+
     matrix_csv = Path(matrix_csv)
     if not matrix_csv.is_file():
         raise ValueError(f'single-cell matrix does not exist: {matrix_csv}')
@@ -101,6 +100,8 @@ def _read_10x_table(path):
 def run_single_cell_10x_qc(matrix_mtx, barcodes_tsv, features_tsv, output_dir,
                            min_genes=0, max_genes=None, min_counts=0,
                            max_mito_percent=100, mitochondrial_prefix='MT-'):
+    import numpy as np
+    import pandas as pd
     from scipy.io import mmread, mmwrite
     from scipy.sparse import csr_matrix
 
@@ -206,6 +207,9 @@ def run_single_cell_10x_qc(matrix_mtx, barcodes_tsv, features_tsv, output_dir,
 
 def run_metagenomics_qc(abundance_csv, output_dir, taxon_id_column='taxon_id',
                         min_total_counts=0, min_prevalence=0):
+    import numpy as np
+    import pandas as pd
+
     abundance_csv = Path(abundance_csv)
     if not abundance_csv.is_file():
         raise ValueError(f'metagenomics abundance table does not exist: {abundance_csv}')

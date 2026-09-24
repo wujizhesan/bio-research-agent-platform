@@ -192,7 +192,9 @@ class JobExecutionTests(unittest.TestCase):
                         'import json, sys; from src import domain_registry; '
                         'print(json.dumps({"domains": domain_registry.available_domains(), '
                         f'"unrelated_loaded": "{unrelated}" in sys.modules, '
-                        '"scipy_stats_loaded": "scipy.stats" in sys.modules}))',
+                        '"scipy_stats_loaded": "scipy.stats" in sys.modules, '
+                        '"pandas_loaded": "pandas" in sys.modules, '
+                        '"numpy_loaded": "numpy" in sys.modules}))',
                     ],
                     cwd=str(Path(__file__).resolve().parents[1]),
                     env=environment,
@@ -206,6 +208,8 @@ class JobExecutionTests(unittest.TestCase):
                 self.assertFalse(payload['unrelated_loaded'])
                 if domain == 'omics':
                     self.assertFalse(payload['scipy_stats_loaded'])
+                    self.assertFalse(payload['pandas_loaded'])
+                    self.assertFalse(payload['numpy_loaded'])
 
     def test_isolated_literature_and_omics_tools_execute(self):
         executor = ProcessToolExecutor(ExecutionLimits(

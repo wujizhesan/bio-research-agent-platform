@@ -7,9 +7,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-
 try:
     from .omics_results import (
         build_omics_manifest,
@@ -117,6 +114,8 @@ TOOLCHAIN_EXECUTABLES = {
 DESEQ2_RUNNER = Path(__file__).resolve().parents[1] / 'tools' / 'deseq2_runner.R'
 
 def _bh_adjust(values):
+    import numpy as np
+
     values = np.asarray(values, dtype=float)
     if values.size == 0:
         return values
@@ -171,6 +170,8 @@ def _resolve_statistics_backend(requested):
 
 
 def _run_deseq2_backend(expression_csv, metadata_csv, output_csv, condition_a, condition_b):
+    import pandas as pd
+
     status = _deseq2_runtime()
     if not status['available']:
         raise RuntimeError(status['reason'])
@@ -205,6 +206,9 @@ def _run_deseq2_backend(expression_csv, metadata_csv, output_csv, condition_a, c
 def run_differential_expression(expression_csv, metadata_csv, output_csv,
                                 condition_a=None, condition_b=None,
                                 statistics_backend='scipy'):
+    import numpy as np
+    import pandas as pd
+
     expression, metadata = load_expression_matrix(expression_csv, metadata_csv)
     condition_a, condition_b, samples_a, samples_b = _condition_pair(metadata, condition_a, condition_b)
     backend = _resolve_statistics_backend(statistics_backend)
@@ -259,6 +263,8 @@ def run_differential_expression(expression_csv, metadata_csv, output_csv,
 
 
 def _load_gene_sets(gene_sets_csv):
+    import pandas as pd
+
     gene_sets = pd.read_csv(gene_sets_csv)
     _require_columns(gene_sets, {'pathway_id', 'pathway_name', 'gene_id'}, 'gene set table')
     gene_sets = gene_sets.dropna(subset=['pathway_id', 'gene_id']).copy()
@@ -273,6 +279,7 @@ def _load_gene_sets(gene_sets_csv):
 
 def run_pathway_enrichment(de_csv, gene_sets_csv, output_csv,
                            padj_cutoff=0.05, abs_log2_fc_cutoff=1.0):
+    import pandas as pd
     from scipy.stats import hypergeom
 
     de = pd.read_csv(de_csv)
@@ -554,6 +561,8 @@ def search_gene_evidence(gene_ids, evidence_csv=None, provider='local',
     ).search(gene_ids)
 
 def generate_omics_report(de_csv, pathway_csv, output_md, evidence=None):
+    import pandas as pd
+
     de = pd.read_csv(de_csv)
     pathways = pd.read_csv(pathway_csv)
     return write_omics_report(
@@ -571,6 +580,8 @@ def run_omics_analysis(expression_csv, metadata_csv, gene_sets_csv, output_dir,
                        evidence_provider='local', evidence_cache_dir=None,
                        evidence_timeout=15, statistics_backend='auto',
                        genome='hg38', gencode_gtf=None):
+    import pandas as pd
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     de_csv = output_dir / 'differential_expression.csv'
