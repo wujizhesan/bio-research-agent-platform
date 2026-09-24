@@ -3,7 +3,6 @@
 from importlib import import_module
 
 try:
-    from .external_service_policy import ServiceRetryDeferredError
     from .observability import bind_context, log_event
     from .plugin_manager import is_domain_enabled
     from .plugin_security import PluginSecurityError, enforce_plugin_boundary
@@ -14,7 +13,6 @@ try:
         derive_run_context,
     )
 except ImportError:
-    from external_service_policy import ServiceRetryDeferredError
     from observability import bind_context, log_event
     from plugin_manager import is_domain_enabled
     from plugin_security import PluginSecurityError, enforce_plugin_boundary
@@ -31,6 +29,14 @@ _BUILTIN_MODULES = {
     'literature': 'literature_plugin',
     'omics': 'omics_agent',
 }
+
+
+def _retry_deferred_error(exc):
+    try:
+        from .external_service_policy import ServiceRetryDeferredError
+    except ImportError:
+        from external_service_policy import ServiceRetryDeferredError
+    return isinstance(exc, ServiceRetryDeferredError)
 
 
 def resolve_scoped_tool(name, descriptor):
@@ -93,9 +99,9 @@ def run_scoped_tool(name, arguments, descriptor, resolved=None):
                 'error_type': 'plugin_security',
                 'error': str(exc),
             }
-        except ServiceRetryDeferredError:
-            raise
         except Exception as exc:
+            if _retry_deferred_error(exc):
+                raise
             return {
                 'status': 'error',
                 'domain': domain,

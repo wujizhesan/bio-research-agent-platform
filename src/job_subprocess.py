@@ -12,13 +12,19 @@ import sys
 import traceback
 
 try:
-    from .external_service_policy import ServiceRetryDeferredError
     from .observability import bind_context
     from .run_context import bind_run_context
 except ImportError:
-    from external_service_policy import ServiceRetryDeferredError
     from observability import bind_context
     from run_context import bind_run_context
+
+
+def _retry_deferred_error(exc):
+    try:
+        from .external_service_policy import ServiceRetryDeferredError
+    except ImportError:
+        from external_service_policy import ServiceRetryDeferredError
+    return isinstance(exc, ServiceRetryDeferredError)
 
 
 def _apply_posix_limits(limits):
@@ -96,7 +102,7 @@ def main(argv=None):
             'type': exc.__class__.__name__,
             'traceback': traceback.format_exc(limit=20),
         }
-        if isinstance(exc, ServiceRetryDeferredError):
+        if _retry_deferred_error(exc):
             payload.update(exc.as_payload())
             payload['error'] = 'external service requested retry later'
         exit_code = 1

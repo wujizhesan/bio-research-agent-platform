@@ -17,6 +17,7 @@ from src.external_service_policy import (
     retry_deferred_from_payload,
     reset_service_policies,
 )
+from src.scoped_tool_runtime import run_scoped_tool
 
 
 class Response:
@@ -111,6 +112,25 @@ class ExternalServicePolicyTests(unittest.TestCase):
         ):
             with self.assertRaises(ServiceRetryDeferredError):
                 domain_registry.run_tool('literature_search', {'gene_ids': ['TP53']})
+
+    def test_scoped_tool_preserves_deferred_retry(self):
+        spec = next(
+            item for item in domain_registry.active_tool_specs()
+            if item['name'] == 'literature_search'
+        )
+        domain = spec['domain']
+        local_name = 'search'
+
+        def deferred(**_arguments):
+            raise ServiceRetryDeferredError('uniprot', 120, 429)
+
+        with self.assertRaises(ServiceRetryDeferredError):
+            run_scoped_tool(
+                'literature_search',
+                {'gene_ids': ['TP53']},
+                {'domain': domain, 'spec': spec},
+                resolved=(domain, local_name, {'function': deferred}, spec),
+            )
 
     def test_retry_after_from_exception_response_is_respected(self):
         policy = ExternalServicePolicy(
