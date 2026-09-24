@@ -375,7 +375,9 @@ class ProcessToolExecutor:
                     {
                         'tool': tool,
                         'execution_domain': (
-                            'knowledge' if spec and spec['domain'] == 'knowledge' else None
+                            spec['domain']
+                            if spec and spec['domain'] in {'knowledge', 'literature', 'omics'}
+                            else None
                         ),
                         'arguments': resolved_arguments,
                         'limits': self.limits.as_dict(),

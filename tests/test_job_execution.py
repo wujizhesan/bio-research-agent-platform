@@ -176,6 +176,54 @@ class JobExecutionTests(unittest.TestCase):
         self.assertFalse(payload['omics_loaded'])
         self.assertFalse(payload['prometheus_loaded'])
 
+    def test_isolated_literature_and_omics_registries_skip_unrelated_domains(self):
+        for domain, unrelated in (
+            ('literature', 'src.omics_agent'),
+            ('omics', 'src.literature_plugin'),
+        ):
+            with self.subTest(domain=domain):
+                environment = os.environ.copy()
+                environment['BIO_AGENT_EXECUTION_DOMAIN'] = domain
+                environment['BIO_AGENT_ISOLATED_TOOL_CHILD'] = '1'
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        '-c',
+                        'import json, sys; from src import domain_registry; '
+                        'print(json.dumps({"domains": domain_registry.available_domains(), '
+                        f'"unrelated_loaded": "{unrelated}" in sys.modules, '
+                        '"scipy_stats_loaded": "scipy.stats" in sys.modules}))',
+                    ],
+                    cwd=str(Path(__file__).resolve().parents[1]),
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=20,
+                )
+                payload = json.loads(completed.stdout)
+                self.assertEqual(payload['domains'], [domain])
+                self.assertFalse(payload['unrelated_loaded'])
+                if domain == 'omics':
+                    self.assertFalse(payload['scipy_stats_loaded'])
+
+    def test_isolated_literature_and_omics_tools_execute(self):
+        executor = ProcessToolExecutor(ExecutionLimits(
+            timeout_seconds=45,
+            memory_limit_mb=0,
+            cpu_time_seconds=0,
+            max_result_bytes=1024 * 1024,
+            poll_interval_seconds=0.01,
+            terminate_grace_seconds=1,
+        ))
+        literature = executor.execute('literature_summarize', {
+            'evidence': {'matches': [{'source': 'fixture'}]},
+        })
+        omics = executor.execute('omics_inspect_toolchain', {})
+        self.assertEqual(literature['status'], 'ok')
+        self.assertEqual(literature['result']['n_matches'], 1)
+        self.assertIn('fastqc', omics)
+
     def test_isolated_research_plan_keeps_cross_domain_catalog(self):
         executor = ProcessToolExecutor(ExecutionLimits(
             timeout_seconds=45,

@@ -9,11 +9,19 @@ from types import SimpleNamespace
 
 from jsonschema import ValidationError, validate
 
-_KNOWLEDGE_ONLY = os.environ.get('BIO_AGENT_EXECUTION_DOMAIN') == 'knowledge'
+_EXECUTION_DOMAIN = os.environ.get('BIO_AGENT_EXECUTION_DOMAIN')
+_SCOPED_DOMAIN = (
+    _EXECUTION_DOMAIN
+    if _EXECUTION_DOMAIN in {'knowledge', 'literature', 'omics'} else None
+)
 
 try:
-    if _KNOWLEDGE_ONLY:
+    if _SCOPED_DOMAIN == 'knowledge':
         from . import knowledge_plugin as KNOWLEDGE_PLUGIN
+    elif _SCOPED_DOMAIN == 'literature':
+        from . import literature_plugin as LITERATURE_PLUGIN
+    elif _SCOPED_DOMAIN == 'omics':
+        from . import omics_agent as OMICS_PLUGIN
     else:
         from . import agent as CADD_PLUGIN
         from . import imaging_plugin as IMAGING_PLUGIN
@@ -44,8 +52,12 @@ try:
         derive_run_context,
     )
 except ImportError:
-    if _KNOWLEDGE_ONLY:
+    if _SCOPED_DOMAIN == 'knowledge':
         import knowledge_plugin as KNOWLEDGE_PLUGIN
+    elif _SCOPED_DOMAIN == 'literature':
+        import literature_plugin as LITERATURE_PLUGIN
+    elif _SCOPED_DOMAIN == 'omics':
+        import omics_agent as OMICS_PLUGIN
     else:
         import agent as CADD_PLUGIN
         import imaging_plugin as IMAGING_PLUGIN
@@ -83,57 +95,55 @@ ENTRY_POINT_GROUP = "cadd_agent.domains"
 class PluginDependencyError(ValueError):
     pass
 
-_KNOWLEDGE_DOMAIN = (
-    "knowledge",
-    KNOWLEDGE_PLUGIN,
-    {
-        "name": "Local scientific knowledge retrieval",
-        "kind": "builtin_adapter",
-        "version": "0.1.0",
+_BUILTIN_METADATA = {
+    'cadd': {'name': 'CADD', 'kind': 'builtin', 'version': 'builtin'},
+    'omics': {'name': 'Omics', 'kind': 'builtin', 'version': 'builtin'},
+    'research': {
+        'name': 'Bioinformatics Research Agent',
+        'kind': 'application',
+        'version': '0.1.0',
     },
-)
+    'literature': {
+        'name': 'Literature and evidence',
+        'kind': 'builtin_adapter',
+        'version': '0.1.0',
+    },
+    'knowledge': {
+        'name': 'Local scientific knowledge retrieval',
+        'kind': 'builtin_adapter',
+        'version': '0.1.0',
+    },
+    'imaging': {
+        'name': 'Microscopy and image QC',
+        'kind': 'builtin_adapter',
+        'version': '0.1.0',
+    },
+}
 
-_ALL_BUILTIN_DOMAINS = (
-    (
-        "cadd",
-        CADD_PLUGIN,
-        {"name": "CADD", "kind": "builtin", "version": "builtin"},
-    ),
-    (
-        "omics",
-        OMICS_PLUGIN,
-        {"name": "Omics", "kind": "builtin", "version": "builtin"},
-    ),
-    (
-        "research",
-        RESEARCH_PLUGIN,
-        {
-            "name": "Bioinformatics Research Agent",
-            "kind": "application",
-            "version": "0.1.0",
-        },
-    ),
-    (
-        "literature",
-        LITERATURE_PLUGIN,
-        {
-            "name": "Literature and evidence",
-            "kind": "builtin_adapter",
-            "version": "0.1.0",
-        },
-    ),
-    _KNOWLEDGE_DOMAIN,
-    (
-        "imaging",
-        IMAGING_PLUGIN,
-        {
-            "name": "Microscopy and image QC",
-            "kind": "builtin_adapter",
-            "version": "0.1.0",
-        },
-    ),
-) if not _KNOWLEDGE_ONLY else ()
-BUILTIN_DOMAINS = (_KNOWLEDGE_DOMAIN,) if _KNOWLEDGE_ONLY else _ALL_BUILTIN_DOMAINS
+if _SCOPED_DOMAIN:
+    if _SCOPED_DOMAIN == 'knowledge':
+        _source = KNOWLEDGE_PLUGIN
+    elif _SCOPED_DOMAIN == 'literature':
+        _source = LITERATURE_PLUGIN
+    else:
+        _source = OMICS_PLUGIN
+    BUILTIN_DOMAINS = ((
+        _SCOPED_DOMAIN,
+        _source,
+        _BUILTIN_METADATA[_SCOPED_DOMAIN],
+    ),)
+else:
+    BUILTIN_DOMAINS = tuple(
+        (domain, source, _BUILTIN_METADATA[domain])
+        for domain, source in (
+            ('cadd', CADD_PLUGIN),
+            ('omics', OMICS_PLUGIN),
+            ('research', RESEARCH_PLUGIN),
+            ('literature', LITERATURE_PLUGIN),
+            ('knowledge', KNOWLEDGE_PLUGIN),
+            ('imaging', IMAGING_PLUGIN),
+        )
+    )
 
 BUILTIN_DOMAIN_NAMES = frozenset(
     ("cadd", "omics", "research", "literature", "knowledge", "imaging", "sequence")
@@ -198,7 +208,7 @@ def _build_registry():
 
     sequence_status = {}
     sequence_tools = {}
-    if not _KNOWLEDGE_ONLY:
+    if not _SCOPED_DOMAIN:
         sequence_status = SEQUENCE_PLUGIN.plugin_status()
         sequence_tools = SEQUENCE_PLUGIN.load_tools()
         sequence_available = bool(sequence_tools)
@@ -217,7 +227,7 @@ def _build_registry():
             },
         )
 
-    if _KNOWLEDGE_ONLY:
+    if _SCOPED_DOMAIN:
         discovered, sources, errors = {}, {}, {}
     else:
         discovered, sources, errors = _discover_external_domains(
@@ -264,8 +274,8 @@ def _build_registry():
     EXTERNAL_DOMAIN_ERRORS,
 ) = _build_registry()
 
-SEQUENCE_PLUGIN_NAME = None if _KNOWLEDGE_ONLY else SEQUENCE_PLUGIN.PLUGIN_NAME
-SEQUENCE_PLUGIN_VERSION = None if _KNOWLEDGE_ONLY else SEQUENCE_PLUGIN.PLUGIN_VERSION
+SEQUENCE_PLUGIN_NAME = None if _SCOPED_DOMAIN else SEQUENCE_PLUGIN.PLUGIN_NAME
+SEQUENCE_PLUGIN_VERSION = None if _SCOPED_DOMAIN else SEQUENCE_PLUGIN.PLUGIN_VERSION
 DOMAIN_TOOLS = REGISTRY.tool_maps
 DOMAIN_SOURCES = REGISTRY.sources
 DOMAIN_METADATA = REGISTRY.metadata

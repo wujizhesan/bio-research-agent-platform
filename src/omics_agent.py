@@ -9,7 +9,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import hypergeom, ttest_ind
 
 try:
     from .omics_results import (
@@ -22,9 +21,7 @@ try:
     from .omics_validation import (
         GENOMICS_QC_TYPES,
         condition_pair as _condition_pair,
-        infer_qc_type as _infer_qc_type,
         load_expression_matrix,
-        normalize_alignment_paths as _normalize_alignment_paths,
         require_columns as _require_columns,
     )
     from .omics_protocol import build_omics_tools
@@ -59,9 +56,7 @@ except ImportError:
     from omics_validation import (
         GENOMICS_QC_TYPES,
         condition_pair as _condition_pair,
-        infer_qc_type as _infer_qc_type,
         load_expression_matrix,
-        normalize_alignment_paths as _normalize_alignment_paths,
         require_columns as _require_columns,
     )
     from omics_protocol import build_omics_tools
@@ -236,6 +231,8 @@ def run_differential_expression(expression_csv, metadata_csv, output_csv,
     values_b = expression[samples_b].to_numpy(dtype=float)
     means_a = values_a.mean(axis=1)
     means_b = values_b.mean(axis=1)
+    from scipy.stats import ttest_ind
+
     test = ttest_ind(values_a, values_b, axis=1, equal_var=False, nan_policy='raise')
     result = pd.DataFrame({
         'gene_id': expression['gene_id'].astype(str),
@@ -276,6 +273,8 @@ def _load_gene_sets(gene_sets_csv):
 
 def run_pathway_enrichment(de_csv, gene_sets_csv, output_csv,
                            padj_cutoff=0.05, abs_log2_fc_cutoff=1.0):
+    from scipy.stats import hypergeom
+
     de = pd.read_csv(de_csv)
     _require_columns(de, {'gene_id', 'padj', 'log2_fc'}, 'differential expression result')
     de['gene_id'] = de['gene_id'].astype(str)
