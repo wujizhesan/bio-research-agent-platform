@@ -188,7 +188,7 @@ verify_legacy_release_state() {
 verify_live_release() {
   local service expected_image expected_hash hash_line container_ids container_id actual_image actual_hash
   local started_at started_seconds secret_name secret_path secret_modified
-  for service in api worker dispatcher artifact-maintenance plugin-sandbox web; do
+  for service in api worker dispatcher artifact-maintenance plugin-sandbox plugin-sandbox-heavy web; do
     expected_image=$(environment_value release-images.env BACKEND_IMAGE)
     if test "$service" = web; then
       expected_image=$(environment_value release-images.env FRONTEND_IMAGE)
@@ -494,7 +494,7 @@ fi
 
 "${next_compose[@]}" config --quiet
 "${next_compose[@]}" pull \
-  api dispatcher worker artifact-maintenance web plugin-sandbox migration recovery-check recovery-evidence-publisher \
+  api dispatcher worker artifact-maintenance web plugin-sandbox plugin-sandbox-heavy migration recovery-check recovery-evidence-publisher \
   storage-check pitr-checkpoint prometheus alertmanager
 "${next_compose[@]}" run --rm --no-deps api \
   python -c 'from src.auth import AuthService; AuthService.from_env()'

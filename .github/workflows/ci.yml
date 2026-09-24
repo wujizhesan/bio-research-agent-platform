@@ -357,7 +357,7 @@ jobs:
         run: |
           for attempt in 1 2 3; do
             if docker compose -f docker-compose.yml -f docker-compose.secure.yml \
-              build api migration dispatcher worker plugin-sandbox; then
+              build api migration dispatcher worker plugin-sandbox plugin-sandbox-heavy; then
               exit 0
             fi
             if [ "$attempt" -eq 3 ]; then
@@ -389,23 +389,26 @@ jobs:
           docker compose -f docker-compose.yml -f docker-compose.secure.yml --profile operations run --rm migration
           docker compose -f docker-compose.yml -f docker-compose.secure.yml --profile operations run --rm --no-deps migration python scripts/configure_tenant_context.py --enable
           docker compose -f docker-compose.yml -f docker-compose.secure.yml --profile operations run --rm --no-deps migration python scripts/verify_database_roles.py
-          docker compose -f docker-compose.yml -f docker-compose.secure.yml up -d api dispatcher worker plugin-sandbox
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml up -d api dispatcher worker plugin-sandbox plugin-sandbox-heavy
           for attempt in {1..180}; do
             plugin_id=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml ps -q plugin-sandbox)
+            heavy_plugin_id=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml ps -q plugin-sandbox-heavy)
             worker_id=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml ps -q worker)
             dispatcher_id=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml ps -q dispatcher)
             plugin_status=$(docker inspect --format='{{.State.Health.Status}}' "$plugin_id" 2>/dev/null || true)
+            heavy_plugin_status=$(docker inspect --format='{{.State.Health.Status}}' "$heavy_plugin_id" 2>/dev/null || true)
             worker_status=$(docker inspect --format='{{.State.Health.Status}}' "$worker_id" 2>/dev/null || true)
             dispatcher_status=$(docker inspect --format='{{.State.Health.Status}}' "$dispatcher_id" 2>/dev/null || true)
             if curl --fail --silent http://127.0.0.1:18080/health > output/ci-secure-fullstack-health.json \
               && [ "$plugin_status" = healthy ] \
+              && [ "$heavy_plugin_status" = healthy ] \
               && [ "$worker_status" = healthy ] \
               && [ "$dispatcher_status" = healthy ]; then
               exit 0
             fi
             sleep 2
           done
-          docker compose -f docker-compose.yml -f docker-compose.secure.yml logs api dispatcher worker plugin-sandbox clamav db redis
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml logs api dispatcher worker plugin-sandbox plugin-sandbox-heavy clamav db redis
           exit 1
       - name: Run API to sandbox artifact round trip
         run: python scripts/verify_secure_fullstack_e2e.py --base-url http://127.0.0.1:18080
@@ -433,22 +436,47 @@ jobs:
             --load-concurrency 8 \
             --output output/sandbox-capacity.json
       - name: Verify heavy and lightweight jobs in the secure sandbox
-        run: python -m scripts.verify_secure_mixed_resources --base-url http://127.0.0.1:18080
+        run: |
+          light_before=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox python -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8081/health'))['admitted'])")
+          heavy_before=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox-heavy python -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8081/health'))['admitted'])")
+          python -m scripts.verify_secure_mixed_resources --base-url http://127.0.0.1:18080 > output/heavy-light-isolation.json
+          cat output/heavy-light-isolation.json
+          light_after=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox python -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8081/health'))['admitted'])")
+          heavy_after=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox-heavy python -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8081/health'))['admitted'])")
+          test "$light_after" -gt "$light_before"
+          test "$heavy_after" -gt "$heavy_before"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from scripts.benchmark_sandbox_capacity import cgroup_snapshot, parse_cgroup
+
+          report = {
+              service: parse_cgroup(cgroup_snapshot(os.environ.copy(), service))
+              for service in ('plugin-sandbox', 'plugin-sandbox-heavy')
+          }
+          assert all(not pool['memory_events'].get('oom_kill', 0) for pool in report.values())
+          Path('output/heavy-light-resources.json').write_text(
+              json.dumps(report, indent=2, sort_keys=True), encoding='utf-8'
+          )
+          print(json.dumps({name: data['memory_peak'] for name, data in report.items()}))
+          PY
       - name: Verify sandbox mounts and cleanup
         run: |
           mkdir -p output
           container_id=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml ps -q plugin-sandbox)
           docker inspect "$container_id" > output/ci-plugin-sandbox-inspect.json
+          heavy_container_id=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml ps -q plugin-sandbox-heavy)
+          docker inspect "$heavy_container_id" > output/ci-plugin-sandbox-heavy-inspect.json
           python - <<'PY'
           import json
           from pathlib import Path
 
-          inspection = json.loads(
-              Path('output/ci-plugin-sandbox-inspect.json').read_text(encoding='utf-8')
-          )[0]
-          destinations = {item['Destination'] for item in inspection['Mounts']}
-          assert '/app/output' not in destinations
-          assert '/run/bioagent/plugin-exchange' in destinations
+          for name in ('ci-plugin-sandbox-inspect.json', 'ci-plugin-sandbox-heavy-inspect.json'):
+              inspection = json.loads(Path('output', name).read_text(encoding='utf-8'))[0]
+              destinations = {item['Destination'] for item in inspection['Mounts']}
+              assert '/app/output' not in destinations
+              assert '/run/bioagent/plugin-exchange' in destinations
           PY
           if docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox touch /app/output/.boundary-probe 2>/dev/null; then
             docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox rm -f /app/output/.boundary-probe
@@ -481,7 +509,7 @@ jobs:
             -f docker-compose.monitoring-test.yml \
             --profile monitoring \
             logs --no-color --timestamps \
-            api dispatcher worker plugin-sandbox clamav db redis \
+            api dispatcher worker plugin-sandbox plugin-sandbox-heavy clamav db redis \
             prometheus alertmanager alert-webhook-sink \
             > output/ci-secure-fullstack.log 2>&1 || true
       - name: Upload secure full-stack diagnostics
@@ -494,9 +522,12 @@ jobs:
             output/ci-secure-fullstack.log
             output/ci-secure-fullstack-health.json
             output/ci-plugin-sandbox-inspect.json
+            output/ci-plugin-sandbox-heavy-inspect.json
             output/performance-baseline.json
             output/performance-matrix.json
             output/sandbox-capacity*.json
+            output/heavy-light-isolation.json
+            output/heavy-light-resources.json
             output/secure-fullstack-e2e
             output/monitoring-smoke
           if-no-files-found: ignore

@@ -201,6 +201,10 @@ class SupplyChainConfigurationTests(unittest.TestCase):
             compose["services"]["plugin-sandbox"]["image"],
             "${BACKEND_IMAGE:?required}",
         )
+        self.assertEqual(
+            compose["services"]["plugin-sandbox-heavy"]["image"],
+            "${BACKEND_IMAGE:?required}",
+        )
         self.assertEqual(compose["services"]["web"]["image"], "${FRONTEND_IMAGE:?required}")
         self.assertEqual(compose["services"]["api"]["ports"], [])
         self.assertEqual(compose["services"]["worker"]["ports"], [])

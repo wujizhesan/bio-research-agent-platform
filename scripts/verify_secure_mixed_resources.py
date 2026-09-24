@@ -2,6 +2,7 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -9,9 +10,10 @@ import shutil
 import time
 
 from scripts.verify_secure_fullstack_e2e import request_json
+from scripts.benchmark_secure_jobs import percentile
 
 
-def verify(base_url, host_root, container_root, username, password, timeout_seconds=120):
+def verify(base_url, host_root, container_root, username, password, timeout_seconds=120, light_count=8):
     host_root = Path(host_root).resolve()
     source = Path(__file__).resolve().parent.parent / 'examples' / 'rnaseq'
     input_dir = host_root / 'input'
@@ -83,30 +85,46 @@ def verify(base_url, host_root, container_root, username, password, timeout_seco
             time.sleep(0.25)
         raise TimeoutError(f'secure mixed-resource job {job_id} timed out')
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        submissions = {
-            name: pool.submit(submit, profile)
-            for name, profile in profiles.items()
-        }
-        job_ids = {name: future.result() for name, future in submissions.items()}
+    with ThreadPoolExecutor(max_workers=light_count + 1) as pool:
+        heavy_id = submit(profiles['heavy'])
+        light_submissions = [
+            pool.submit(submit, profiles['light']) for _ in range(light_count)
+        ]
+        light_ids = [future.result() for future in light_submissions]
         observations = {
-            name: pool.submit(wait_for_terminal, job_id)
-            for name, job_id in job_ids.items()
+            job_id: pool.submit(wait_for_terminal, job_id)
+            for job_id in (heavy_id, *light_ids)
         }
-        jobs = {name: future.result() for name, future in observations.items()}
-    for name, job in jobs.items():
+        jobs = {job_id: future.result() for job_id, future in observations.items()}
+    for job_id, job in jobs.items():
         if job.get('status') != 'completed':
             raise RuntimeError(
-                f"secure mixed-resource {name} job failed with "
+                f"secure mixed-resource {job_id} job failed with "
                 f"{job.get('error_code') or job.get('status')}"
             )
+    heavy_job = jobs[heavy_id]
+    heavy_started = datetime.fromisoformat(heavy_job['started_at'])
+    heavy_finished = datetime.fromisoformat(heavy_job['finished_at'])
+    light_jobs = [jobs[job_id] for job_id in light_ids]
+    light_queue_seconds = [
+        (datetime.fromisoformat(job['started_at']) - datetime.fromisoformat(job['created_at'])).total_seconds()
+        for job in light_jobs
+    ]
+    overlap_count = sum(
+        datetime.fromisoformat(job['started_at']) < heavy_finished
+        and datetime.fromisoformat(job['finished_at']) > heavy_started
+        for job in light_jobs
+    )
     report = host_root / 'artifacts' / 'omics' / 'omics_report.md'
     if not report.is_file():
         raise RuntimeError('secure mixed-resource omics report is missing')
     return {
         'status': 'ok',
-        'heavy_job_id': job_ids['heavy'],
-        'light_job_id': job_ids['light'],
+        'heavy_job_id': heavy_id,
+        'light_job_ids': light_ids,
+        'heavy_execution_seconds': round((heavy_finished - heavy_started).total_seconds(), 3),
+        'light_queue_p95_seconds': round(percentile(light_queue_seconds, 95), 3),
+        'light_overlap_count': overlap_count,
         'artifact': str(report),
     }
 
@@ -121,9 +139,12 @@ def main(argv=None):
     parser.add_argument('--username', default=os.environ.get('SECURE_E2E_USERNAME', ''))
     parser.add_argument('--password', default=os.environ.get('SECURE_E2E_PASSWORD', ''))
     parser.add_argument('--timeout-seconds', type=float, default=120)
+    parser.add_argument('--light-count', type=int, default=8)
     args = parser.parse_args(argv)
     if not args.username or not args.password:
         raise SystemExit('secure E2E credentials are required')
+    if args.light_count < 1:
+        parser.error('light count must be positive')
     print(json.dumps(verify(
         args.base_url,
         args.host_root,
@@ -131,6 +152,7 @@ def main(argv=None):
         args.username,
         args.password,
         args.timeout_seconds,
+        args.light_count,
     ), sort_keys=True))
     return 0
 

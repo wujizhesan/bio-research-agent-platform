@@ -139,6 +139,13 @@ services:
       - source: plugin_sandbox_token_production
         target: plugin_sandbox_token
 
+  plugin-sandbox-heavy:
+    image: ${BACKEND_IMAGE:?required}
+    pull_policy: always
+    secrets: !override
+      - source: plugin_sandbox_token_production
+        target: plugin_sandbox_token
+
   prometheus:
     ports: !reset []
     secrets:

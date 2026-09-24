@@ -23,6 +23,7 @@ try:
     from .observability import current_context, log_event
     from .run_context import current_run_context
     from .storage_workspace import materialize_storage_references
+    from .sandbox_workload import is_lightweight_tool
 except ImportError:
     from external_service_policy import retry_deferred_from_payload
     from job_execution import (
@@ -34,6 +35,7 @@ except ImportError:
     from observability import current_context, log_event
     from run_context import current_run_context
     from storage_workspace import materialize_storage_references
+    from sandbox_workload import is_lightweight_tool
 
 
 _SAFE_SEGMENT = re.compile(r'[^A-Za-z0-9._-]+')
@@ -155,15 +157,26 @@ class ContainerToolExecutor:
         artifact_root=None,
         input_roots=None,
         workspace_max_bytes=None,
+        heavy_base_url=None,
+        heavy_transport=None,
     ):
         if not base_url or not str(base_url).strip():
             raise ValueError('PLUGIN_SANDBOX_URL is required')
         if not token or len(str(token)) < 32:
             raise ValueError('PLUGIN_SANDBOX_TOKEN must contain at least 32 characters')
         self.base_url = str(base_url).rstrip('/')
+        self.heavy_base_url = str(heavy_base_url).rstrip('/') if heavy_base_url else None
         self.token = str(token)
         self.limits = limits or ExecutionLimits.from_env()
         self.transport = transport or self._http_transport
+        if self.heavy_base_url:
+            self.heavy_transport = heavy_transport or (
+                transport if transport else lambda path, payload, timeout: self._http_transport(
+                    path, payload, timeout, base_url=self.heavy_base_url
+                )
+            )
+        else:
+            self.heavy_transport = self.transport
         self.input_workspace_root = Path(
             input_workspace_root
             or os.environ.get('JOB_INPUT_WORKSPACE_ROOT', 'output/.job-inputs')
@@ -191,15 +204,15 @@ class ContainerToolExecutor:
         ), 1)
         self._pool = ThreadPoolExecutor(max_workers=max(int(max_concurrency), 1))
         self._shutdown = Event()
-        self._active = set()
+        self._active = {}
         self._active_lock = Lock()
 
-    def _http_transport(self, path, payload, timeout_seconds):
+    def _http_transport(self, path, payload, timeout_seconds, base_url=None):
         encoded = json.dumps(
             payload, ensure_ascii=False, default=str
         ).encode('utf-8')
         request = Request(
-            f'{self.base_url}{path}',
+            f'{base_url or self.base_url}{path}',
             data=encoded,
             headers={
                 'Authorization': f'Bearer {self.token}',
@@ -237,8 +250,12 @@ class ContainerToolExecutor:
             raise JobExecutionError('plugin sandbox returned invalid JSON') from exc
 
     def _cancel(self, request_id):
+        with self._active_lock:
+            transport = self._active.get(request_id)
+        if transport is None:
+            return
         try:
-            self.transport(
+            transport(
                 f'/v1/cancel/{request_id}',
                 {},
                 min(self.limits.terminate_grace_seconds, 3.0),
@@ -393,14 +410,18 @@ class ContainerToolExecutor:
         if workspace is not None:
             payload['workspace'] = {'root': str(workspace)}
         timeout = self.limits.timeout_seconds or 24 * 60 * 60
+        transport = (
+            self.transport if is_lightweight_tool(tool, arguments)
+            else self.heavy_transport
+        )
         future = self._pool.submit(
-            self.transport,
+            transport,
             '/v1/execute',
             payload,
             timeout + self.limits.terminate_grace_seconds + 5,
         )
         with self._active_lock:
-            self._active.add(request_id)
+            self._active[request_id] = transport
         started = monotonic()
         try:
             while not future.done():
@@ -424,7 +445,7 @@ class ContainerToolExecutor:
             response = future.result()
         finally:
             with self._active_lock:
-                self._active.discard(request_id)
+                self._active.pop(request_id, None)
         if not isinstance(response, dict):
             raise JobExecutionError('plugin sandbox returned an invalid response')
         if not response.get('ok'):
@@ -467,4 +488,5 @@ def container_tool_executor_from_env():
         max_concurrency=int(os.environ.get('PLUGIN_SANDBOX_CLIENT_CONCURRENCY', '8')),
         input_workspace_root=os.environ.get('JOB_INPUT_WORKSPACE_ROOT') or None,
         artifact_root=os.environ.get('PLUGIN_ARTIFACT_ROOT') or None,
+        heavy_base_url=os.environ.get('PLUGIN_SANDBOX_HEAVY_URL') or None,
     )

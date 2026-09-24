@@ -16,16 +16,16 @@ try:
     from .job_execution import ExecutionLimits, ProcessToolExecutor
     from .observability import bind_context, configure_logging, log_event
     from .run_context import bind_run_context
+    from .sandbox_workload import is_lightweight_tool
 except ImportError:
     from external_service_policy import ServiceRetryDeferredError
     from job_execution import ExecutionLimits, ProcessToolExecutor
     from observability import bind_context, configure_logging, log_event
     from run_context import bind_run_context
+    from sandbox_workload import is_lightweight_tool
 
 
 REQUEST_ID_PATTERN = re.compile(r'^[a-f0-9]{32}$')
-LIGHTWEIGHT_ARGUMENT_LIMIT = 1024 * 1024
-LIGHTWEIGHT_INDEX_LIMIT = 8 * 1024 * 1024
 
 
 class SandboxRequestError(ValueError):
@@ -47,8 +47,12 @@ class SandboxRuntime:
         executor_factory=None,
         max_concurrency=2,
         workspace_root=None,
+        pool=None,
     ):
         self.executor_factory = executor_factory
+        self.pool = pool or os.environ.get('PLUGIN_SANDBOX_POOL', 'mixed')
+        if self.pool not in {'mixed', 'light', 'heavy'}:
+            raise ValueError('PLUGIN_SANDBOX_POOL must be mixed, light, or heavy')
         memory_budget_mb = max(int(os.environ.get(
             'PLUGIN_SANDBOX_MEMORY_BUDGET_MB', '4096'
         )), 1)
@@ -62,6 +66,7 @@ class SandboxRuntime:
         self._active = {}
         self._capacity = Condition()
         self._running = 0
+        self._admitted = 0
         self._exclusive = False
         self._waiting_exclusive = 0
         self.workspace_root = Path(
@@ -115,19 +120,7 @@ class SandboxRuntime:
 
     @staticmethod
     def _lightweight(tool, arguments):
-        if tool == 'omics_inspect_toolchain':
-            return not arguments
-        if tool == 'literature_summarize':
-            return len(json.dumps(arguments, default=str).encode('utf-8')) <= LIGHTWEIGHT_ARGUMENT_LIMIT
-        if tool == 'knowledge_search':
-            index_path = arguments.get('index_path')
-            if not isinstance(index_path, str):
-                return False
-            try:
-                return Path(index_path).stat().st_size <= LIGHTWEIGHT_INDEX_LIMIT
-            except OSError:
-                return False
-        return False
+        return is_lightweight_tool(tool, arguments)
 
     def execute(self, payload):
         if not isinstance(payload, dict):
@@ -144,6 +137,10 @@ class SandboxRuntime:
         self._validate_workspace(request_id, payload)
         cancellation = Event()
         lightweight = self._lightweight(tool, arguments)
+        if self.pool == 'light' and not lightweight:
+            raise SandboxRequestError('heavy tool is not allowed in light sandbox')
+        if self.pool == 'heavy' and lightweight:
+            raise SandboxRequestError('light tool is not allowed in heavy sandbox')
         with self._capacity:
             if request_id in self._active:
                 raise SandboxRequestError('duplicate sandbox request_id')
@@ -164,6 +161,7 @@ class SandboxRuntime:
                         admitted = self._running == 0
                     if admitted:
                         self._running += 1
+                        self._admitted += 1
                         self._exclusive = not lightweight
                         break
                     self._capacity.wait()
@@ -229,6 +227,11 @@ class SandboxRuntime:
         with self._capacity:
             return self._running
 
+    @property
+    def admitted_count(self):
+        with self._capacity:
+            return self._admitted
+
 
 class SandboxHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -277,7 +280,9 @@ class SandboxHandler(BaseHTTPRequestHandler):
             return
         self._write(200, {
             'status': 'ok',
+            'pool': self.server.runtime.pool,
             'active': self.server.runtime.active_count,
+            'admitted': self.server.runtime.admitted_count,
         })
 
     def do_POST(self):

@@ -51,14 +51,14 @@ def restart_services(env):
             raise RuntimeError(f'{service} restart failed: {result.stdout[-3000:]}')
 
 
-def cgroup_snapshot(env):
+def cgroup_snapshot(env, service='plugin-sandbox'):
     command = (
         'import json; from pathlib import Path; '
         f'names={CGROUP_FILES!r}; '
         'print(json.dumps({name: (Path("/sys/fs/cgroup") / name).read_text().strip() '
         'if (Path("/sys/fs/cgroup") / name).exists() else None for name in names}))'
     )
-    result = run((*COMPOSE, 'exec', '-T', 'plugin-sandbox', 'python', '-c', command), env=env)
+    result = run((*COMPOSE, 'exec', '-T', service, 'python', '-c', command), env=env)
     if result.returncode:
         return {'error': result.stdout[-1000:]}
     try:
