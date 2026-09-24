@@ -240,8 +240,8 @@ class PluginContainerTests(unittest.TestCase):
         executor.execute.assert_called_once()
         executor.shutdown.assert_called_once()
 
-    def test_sandbox_runs_two_lightweight_requests_together(self):
-        started = [Event(), Event()]
+    def test_sandbox_runs_four_lightweight_requests_together(self):
+        started = [Event() for _ in range(4)]
         release = Event()
         start_lock = Lock()
         next_start = [0]
@@ -260,26 +260,25 @@ class PluginContainerTests(unittest.TestCase):
             executor.execute.side_effect = execute
             return executor
 
-        runtime = SandboxRuntime(executor_factory=make_executor, max_concurrency=2)
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            first = pool.submit(runtime.execute, {
-                'request_id': 'a' * 32,
+        with patch.dict(os.environ, {
+            'PLUGIN_SANDBOX_LIGHT_MEMORY_LIMIT_MB': '1024',
+            'PLUGIN_SANDBOX_MEMORY_BUDGET_MB': '4096',
+        }):
+            runtime = SandboxRuntime(executor_factory=make_executor, max_concurrency=4)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(runtime.execute, {
+                'request_id': chr(ord('a') + index) * 32,
                 'tool': 'omics_inspect_toolchain',
                 'arguments': {},
-            })
-            second = pool.submit(runtime.execute, {
-                'request_id': 'b' * 32,
-                'tool': 'omics_inspect_toolchain',
-                'arguments': {},
-            })
+            }) for index in range(4)]
             try:
-                self.assertTrue(started[0].wait(2))
-                self.assertTrue(started[1].wait(2))
-                self.assertEqual(runtime.active_count, 2)
+                for event in started:
+                    self.assertTrue(event.wait(2))
+                self.assertEqual(runtime.active_count, 4)
             finally:
                 release.set()
-            self.assertTrue(first.result(timeout=2)['ok'])
-            self.assertTrue(second.result(timeout=2)['ok'])
+            for future in futures:
+                self.assertTrue(future.result(timeout=2)['ok'])
         self.assertEqual(runtime.active_count, 0)
 
     def test_sandbox_reserves_capacity_for_waiting_heavy_request(self):
@@ -522,9 +521,10 @@ class PluginContainerTests(unittest.TestCase):
             services['worker']['environment']['JOB_INPUT_WORKSPACE_ROOT'],
             '/run/bioagent/plugin-exchange',
         )
-        self.assertIn(':-2}', services['worker']['environment']['PLUGIN_SANDBOX_CLIENT_CONCURRENCY'])
-        self.assertIn(':-2}', sandbox['environment']['PLUGIN_SANDBOX_MAX_CONCURRENCY'])
-        self.assertIn(':-2048}', sandbox['environment']['PLUGIN_SANDBOX_LIGHT_MEMORY_LIMIT_MB'])
+        self.assertIn(':-4}', services['worker']['environment']['WORKER_MAX_CONCURRENCY'])
+        self.assertIn(':-4}', services['worker']['environment']['PLUGIN_SANDBOX_CLIENT_CONCURRENCY'])
+        self.assertIn(':-4}', sandbox['environment']['PLUGIN_SANDBOX_MAX_CONCURRENCY'])
+        self.assertIn(':-1024}', sandbox['environment']['PLUGIN_SANDBOX_LIGHT_MEMORY_LIMIT_MB'])
         self.assertIn(':-4096}', sandbox['environment']['PLUGIN_SANDBOX_MEMORY_BUDGET_MB'])
         self.assertNotIn('./output:/app/output:rw', sandbox['volumes'])
         self.assertIn(

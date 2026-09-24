@@ -424,6 +424,14 @@ jobs:
             --samples 8 \
             --concurrency 1,2,8 \
             --output output/performance-matrix.json
+      - name: Compare secure sandbox capacity at concurrency 2, 3, and 4
+        run: |
+          python -m scripts.benchmark_sandbox_capacity \
+            --base-url http://127.0.0.1:18080 \
+            --index-path /app/output/secure-fullstack-e2e/artifacts/knowledge-index.json \
+            --samples 24 \
+            --load-concurrency 8 \
+            --output output/sandbox-capacity.json
       - name: Verify heavy and lightweight jobs in the secure sandbox
         run: python -m scripts.verify_secure_mixed_resources --base-url http://127.0.0.1:18080
       - name: Verify sandbox mounts and cleanup
@@ -448,14 +456,6 @@ jobs:
           fi
           leftovers=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox find /run/bioagent/plugin-exchange -mindepth 1 -maxdepth 1 -print -quit)
           test -z "$leftovers"
-      - name: Compare secure sandbox capacity at concurrency 2, 3, and 4
-        run: |
-          python -m scripts.benchmark_sandbox_capacity \
-            --base-url http://127.0.0.1:18080 \
-            --index-path /app/output/secure-fullstack-e2e/artifacts/knowledge-index.json \
-            --samples 24 \
-            --load-concurrency 8 \
-            --output output/sandbox-capacity.json
       - name: Start and verify production monitoring path
         run: |
           mkdir -p output/monitoring-smoke

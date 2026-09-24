@@ -12,6 +12,7 @@ CONFIGURATIONS = (
     (3, 1536, 4608),
     (4, 1024, 4096),
 )
+DEFAULT_CONFIGURATION = CONFIGURATIONS[-1]
 CGROUP_FILES = ('memory.current', 'memory.peak', 'memory.events', 'cpu.stat', 'pids.peak')
 
 
@@ -170,13 +171,18 @@ def main(argv=None):
             print(json.dumps(row, sort_keys=True), flush=True)
     finally:
         try:
-            restart_services(configuration_env(*CONFIGURATIONS[0]))
+            restart_services(configuration_env(*DEFAULT_CONFIGURATION))
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
             restore_error = str(exc)
         report = {'version': 1, 'rows': rows, 'restore_error': restore_error}
         args.output.write_text(json.dumps(report, indent=2, sort_keys=True), encoding='utf-8')
-    baseline = rows[0].get('benchmark') or {}
-    return int(bool(restore_error or baseline.get('exit_code') != 0))
+    default = next(row for row in rows if row['concurrency'] == DEFAULT_CONFIGURATION[0])
+    benchmark_result = default.get('benchmark') or {}
+    oom_count = (default.get('sandbox_cgroup') or {}).get('memory_events', {}).get('oom_kill', 0)
+    return int(bool(
+        restore_error or default.get('error') or benchmark_result.get('exit_code') != 0
+        or oom_count or default.get('sandbox_oom_killed')
+    ))
 
 
 if __name__ == '__main__':
