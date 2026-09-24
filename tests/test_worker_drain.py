@@ -1,5 +1,5 @@
-import threading
 import time
+import threading
 import unittest
 
 from src.redis_job_worker import RedisJobWorkerRuntime
@@ -86,6 +86,53 @@ class WakeRedis:
 
 
 class WorkerDrainTests(unittest.TestCase):
+    def test_heavy_job_uses_one_slot_while_light_jobs_keep_running(self):
+        manager = DrainManager()
+        manager.max_concurrency = 4
+        manager.max_heavy_concurrency = 1
+        manager.workload_class_routing = True
+        jobs = {
+            'heavy': ['heavy-1', 'heavy-2'],
+            'light': ['light-1', 'light-2', 'light-3'],
+        }
+        started = {job: threading.Event() for lane in jobs.values() for job in lane}
+        release_heavy = threading.Event()
+        release_light = threading.Event()
+        lock = threading.Lock()
+        runtime = RedisJobWorkerRuntime(manager)
+
+        def next_job(lane=None):
+            with lock:
+                queue = jobs[lane]
+                return queue.pop(0) if queue else None
+
+        def complete(job_id, _poll_timeout):
+            started[job_id].set()
+            release_heavy.wait(3) if job_id.startswith('heavy') else release_light.wait(3)
+
+        runtime.next_job = next_job
+        runtime.complete_queued_item = complete
+        stop_event = threading.Event()
+        thread = threading.Thread(target=lambda: runtime.run_forever(
+            poll_timeout=0.01,
+            stop_event=stop_event,
+            drain_timeout_seconds=3,
+        ))
+        thread.start()
+        try:
+            self.assertTrue(started['heavy-1'].wait(1))
+            for job_id in ('light-1', 'light-2', 'light-3'):
+                self.assertTrue(started[job_id].wait(1))
+            self.assertFalse(started['heavy-2'].is_set())
+            release_heavy.set()
+            self.assertTrue(started['heavy-2'].wait(1))
+        finally:
+            stop_event.set()
+            release_heavy.set()
+            release_light.set()
+            thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+
     def test_queue_notification_wakes_idle_worker(self):
         redis = WakeRedis()
         store = RedisQueueStore(redis, 'test')

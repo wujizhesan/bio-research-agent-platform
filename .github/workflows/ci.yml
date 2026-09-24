@@ -437,9 +437,46 @@ jobs:
             --output output/sandbox-capacity.json
       - name: Verify heavy and lightweight jobs in the secure sandbox
         run: |
+          compose() {
+            docker compose -f docker-compose.yml -f docker-compose.secure.yml "$@"
+          }
+          restore_worker() {
+            export WORKER_LIGHT_RESERVED_SLOTS=3
+            compose up -d --no-deps --force-recreate --wait worker
+          }
+          trap restore_worker EXIT
           light_before=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox python -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8081/health'))['admitted'])")
           heavy_before=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox-heavy python -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8081/health'))['admitted'])")
-          python -m scripts.verify_secure_mixed_resources --base-url http://127.0.0.1:18080 > output/heavy-light-isolation.json
+          export WORKER_LIGHT_RESERVED_SLOTS=0
+          compose up -d --no-deps --force-recreate --wait worker
+          python -m scripts.verify_secure_mixed_resources \
+            --base-url http://127.0.0.1:18080 \
+            --artifact-prefix reservation-off \
+            --heavy-running-target 3 \
+            > output/heavy-light-isolation-baseline.json
+          export WORKER_LIGHT_RESERVED_SLOTS=3
+          compose up -d --no-deps --force-recreate --wait worker
+          python -m scripts.verify_secure_mixed_resources \
+            --base-url http://127.0.0.1:18080 \
+            --artifact-prefix reservation-on \
+            --heavy-running-target 1 \
+            > output/heavy-light-isolation.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          baseline = json.loads(Path('output/heavy-light-isolation-baseline.json').read_text())
+          optimized = json.loads(Path('output/heavy-light-isolation.json').read_text())
+          assert optimized['light_overlap_count'] == 8
+          assert optimized['light_queue_p95_seconds'] < baseline['light_queue_p95_seconds']
+          print(json.dumps({
+              'baseline_light_queue_p95': baseline['light_queue_p95_seconds'],
+              'reserved_light_queue_p95': optimized['light_queue_p95_seconds'],
+              'baseline_heavy_server_p95': baseline['heavy_server_p95_seconds'],
+              'reserved_heavy_server_p95': optimized['heavy_server_p95_seconds'],
+          }, sort_keys=True))
+          PY
+          trap - EXIT
           cat output/heavy-light-isolation.json
           light_after=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox python -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8081/health'))['admitted'])")
           heavy_after=$(docker compose -f docker-compose.yml -f docker-compose.secure.yml exec -T plugin-sandbox-heavy python -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8081/health'))['admitted'])")
@@ -527,6 +564,7 @@ jobs:
             output/performance-matrix.json
             output/sandbox-capacity*.json
             output/heavy-light-isolation.json
+            output/heavy-light-isolation-baseline.json
             output/heavy-light-resources.json
             output/secure-fullstack-e2e
             output/monitoring-smoke

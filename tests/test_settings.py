@@ -12,6 +12,7 @@ class PlatformSettingsTests(unittest.TestCase):
             'REDIS_URL': 'redis://user:secret@redis:6379/3',
             'DATABASE_URL': 'postgresql://user:secret@db:5432/bioagent',
             'WORKER_MAX_CONCURRENCY': '7',
+            'WORKER_LIGHT_RESERVED_SLOTS': '3',
             'WORKER_CAPABILITY_ROUTING': 'true',
             'RESEARCH_PLANNER_API_KEY': 'first-secret',
         }
@@ -21,6 +22,7 @@ class PlatformSettingsTests(unittest.TestCase):
             'RESEARCH_PLANNER_API_KEY': 'second-secret',
         })
         self.assertEqual(first.worker_max_concurrency, 7)
+        self.assertEqual(first.worker_light_reserved_slots, 3)
         self.assertTrue(first.worker_capability_routing)
         sanitized = str(first.sanitized_configuration())
         self.assertNotIn('user:secret', sanitized)
@@ -31,6 +33,14 @@ class PlatformSettingsTests(unittest.TestCase):
     def test_invalid_typed_value_fails_at_startup(self):
         with self.assertRaisesRegex(SettingsError, 'WORKER_MAX_CONCURRENCY'):
             PlatformSettings.from_env({'WORKER_MAX_CONCURRENCY': 'many'})
+        with self.assertRaisesRegex(SettingsError, 'WORKER_LIGHT_RESERVED_SLOTS'):
+            PlatformSettings.from_env({'WORKER_LIGHT_RESERVED_SLOTS': 'many'})
+        self.assertEqual(
+            PlatformSettings.from_env({'WORKER_LIGHT_RESERVED_SLOTS': '-1'}).worker_light_reserved_slots,
+            0,
+        )
+        with self.assertRaisesRegex(SettingsError, 'WORKER_CAPABILITY_ROUTING'):
+            PlatformSettings.from_env({'WORKER_LIGHT_RESERVED_SLOTS': '1'}).validate()
 
     def test_metrics_scrape_token_loads_only_from_secret_file(self):
         with tempfile.TemporaryDirectory(prefix='metrics_secret_') as raw:

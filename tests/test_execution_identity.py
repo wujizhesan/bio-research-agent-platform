@@ -50,6 +50,14 @@ class ExecutionIdentityTests(unittest.TestCase):
         self.assertEqual(route['resource_class'], 'gpu')
         self.assertEqual(route['required_labels'], ['cuda12'])
         self.assertEqual(len(route['route_id']), 32)
+        light_route = routing_descriptor(
+            'omics_run_variant_calling',
+            {'gpu_count': 1, 'gpu_memory_mb': 4096, 'labels': ['cuda12']},
+            {'plugin_domain': 'omics', 'plugin_version': '0.7.0', 'fingerprint': 'all'},
+            workload_class='light',
+        )
+        self.assertEqual(light_route['workload_class'], 'light')
+        self.assertNotEqual(light_route['route_id'], route['route_id'])
 
     def test_production_rejects_mutable_or_unknown_deployment_identity(self):
         spec = next(item for item in tool_specs() if item['name'] == 'research_catalog')

@@ -32,6 +32,7 @@ try:
     from .redis_job_worker import RedisJobWorkerRuntime
     from .redis_worker_registry import RedisWorkerRegistry
     from .run_context import build_run_context
+    from .sandbox_workload import is_lightweight_tool
     from .settings import PlatformSettings
 except ImportError:
     from domain_registry import active_tool_specs, run_tool, tool_specs
@@ -59,6 +60,7 @@ except ImportError:
     from redis_job_worker import RedisJobWorkerRuntime
     from redis_worker_registry import RedisWorkerRegistry
     from run_context import build_run_context
+    from sandbox_workload import is_lightweight_tool
     from settings import PlatformSettings
 
 
@@ -149,6 +151,16 @@ class RedisJobManager:
             ), 1)
         except (TypeError, ValueError):
             self.max_concurrency = 2
+        self.light_reserved_slots = min(
+            self.settings.worker_light_reserved_slots,
+            max(self.max_concurrency - 1, 0),
+        )
+        self.workload_class_routing = bool(
+            self.settings.worker_light_reserved_slots and self.capability_routing
+        )
+        self.max_heavy_concurrency = max(
+            self.max_concurrency - self.light_reserved_slots, 1
+        )
         self._lock = RLock()
         self._store = RedisQueueStore(
             self.redis,
@@ -304,12 +316,16 @@ class RedisJobManager:
             now=self._store.server_time(),
         )
 
-    def compatible_route_ids(self):
+    def compatible_route_ids(self, workload_class=None):
         compatible = []
         catalog = self.execution_catalog()
         for route_id in self._store.registered_route_ids():
             route = self._store.load_route(route_id)
             if not route:
+                continue
+            if workload_class == 'light' and route.get('workload_class') != 'light':
+                continue
+            if workload_class == 'heavy' and route.get('workload_class') == 'light':
                 continue
             identity = catalog.get(route.get('tool')) or {}
             request = ResourceRequest.from_mapping(route.get('resources'))
@@ -387,7 +403,14 @@ class RedisJobManager:
             ),
             'execution_fingerprint': identity.get('fingerprint'),
         })
-        routing = routing_descriptor(tool, resources.as_dict(), identity)
+        workload_class = None
+        if self.workload_class_routing:
+            workload_class = (
+                'light' if is_lightweight_tool(tool, arguments) else 'heavy'
+            )
+        routing = routing_descriptor(
+            tool, resources.as_dict(), identity, workload_class=workload_class
+        )
         record = {
             'job_id': job_id,
             'tool': tool,
@@ -1128,6 +1151,8 @@ class RedisJobManager:
             'capacity': self.resource_capacity.as_dict(),
             'enforced': self.enforce_capacity,
             'max_concurrency': self.max_concurrency,
+            'light_reserved_slots': self.light_reserved_slots,
+            'max_heavy_concurrency': self.max_heavy_concurrency,
             'max_attempts': self.max_attempts,
             'resources': self.resource_pool.snapshot(),
             'queues': self._store.priority_depths(),

@@ -129,7 +129,7 @@ def identity_mismatches(expected, actual):
     ]
 
 
-def routing_descriptor(tool, resources, identity):
+def routing_descriptor(tool, resources, identity, workload_class=None):
     request = ResourceRequest.from_mapping(resources)
     high_memory_threshold = max(int(
         os.environ.get('WORKER_HIGH_MEMORY_THRESHOLD_MB', '16384')
@@ -149,5 +149,9 @@ def routing_descriptor(tool, resources, identity):
         'plugin_version': identity.get('plugin_version'),
         'execution_fingerprint': identity.get('fingerprint'),
     }
+    if workload_class is not None:
+        if workload_class not in {'light', 'heavy'}:
+            raise ValueError('workload class must be light or heavy')
+        descriptor['workload_class'] = workload_class
     descriptor['route_id'] = _digest(descriptor)[:32]
     return descriptor

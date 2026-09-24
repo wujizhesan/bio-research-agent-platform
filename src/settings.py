@@ -121,6 +121,7 @@ class PlatformSettings:
     job_result_ttl_seconds: int
     job_max_attempts: int
     worker_max_concurrency: int
+    worker_light_reserved_slots: int
     worker_drain_timeout_seconds: float
     worker_registry_ttl_seconds: int
     worker_metrics_host: str
@@ -235,6 +236,7 @@ class PlatformSettings:
             job_result_ttl_seconds=_integer(source, 'JOB_RESULT_TTL_SECONDS', 86400, 60),
             job_max_attempts=_integer(source, 'JOB_MAX_ATTEMPTS', 3, 1),
             worker_max_concurrency=_integer(source, 'WORKER_MAX_CONCURRENCY', 2, 1),
+            worker_light_reserved_slots=_integer(source, 'WORKER_LIGHT_RESERVED_SLOTS', 0, 0),
             worker_drain_timeout_seconds=_number(source, 'WORKER_DRAIN_TIMEOUT_SECONDS', 120, 0),
             worker_registry_ttl_seconds=_integer(source, 'WORKER_REGISTRY_TTL_SECONDS', 30, 5),
             worker_metrics_host=_text(source, 'WORKER_METRICS_HOST', '0.0.0.0'),
@@ -290,6 +292,8 @@ class PlatformSettings:
             errors.append('JOB_BACKEND must be local or redis')
         if self.storage_backend not in {'local', 's3'}:
             errors.append('STORAGE_BACKEND must be local or s3')
+        if self.worker_light_reserved_slots and not self.worker_capability_routing:
+            errors.append('WORKER_LIGHT_RESERVED_SLOTS requires WORKER_CAPABILITY_ROUTING')
         if self.state_writer_resume_threshold >= self.state_writer_pause_threshold:
             errors.append('STATE_WRITER_RESUME_THRESHOLD must be lower than STATE_WRITER_PAUSE_THRESHOLD')
         if self.database_role not in {
@@ -397,6 +401,7 @@ class PlatformSettings:
             'git_sha': self.git_sha,
             'image_reference': self.image_reference,
             'job_backend': self.job_backend,
+            'worker_light_reserved_slots': self.worker_light_reserved_slots,
             'redis_url': _safe_url(self.redis_url),
             'database_url': _safe_url(self.database_url),
             'database_role': self.database_role,
@@ -457,6 +462,7 @@ class PlatformSettings:
             'AWS_SESSION_TOKEN', 'AWS_SESSION_TOKEN_FILE',
             'READINESS_TIMEOUT_SECONDS', 'JOB_LEASE_SECONDS', 'JOB_RESULT_TTL_SECONDS',
             'JOB_MAX_ATTEMPTS', 'WORKER_MAX_CONCURRENCY', 'WORKER_DRAIN_TIMEOUT_SECONDS',
+            'WORKER_LIGHT_RESERVED_SLOTS',
             'WORKER_REGISTRY_TTL_SECONDS', 'WORKER_METRICS_HOST', 'WORKER_METRICS_PORT',
             'WORKER_MIN_FREE_DISK_BYTES', 'WORKER_CAPABILITY_ROUTING',
             'WORKER_REQUIRE_EXECUTION_FINGERPRINT', 'STATE_WRITER_BATCH_SIZE',

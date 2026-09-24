@@ -69,6 +69,8 @@ def main(argv=None):
             namespace=args.namespace,
             metrics_port=args.metrics_port,
             max_concurrency=manager.max_concurrency,
+            light_reserved_slots=manager.light_reserved_slots,
+            max_heavy_concurrency=manager.max_heavy_concurrency,
             max_attempts=manager.max_attempts,
         )
         drained = manager.run_forever(

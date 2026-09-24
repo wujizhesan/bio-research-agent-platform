@@ -329,12 +329,12 @@ class RedisJobWorkerRuntime:
             fencing_token=fencing_token,
         )
 
-    def next_job(self):
+    def next_job(self, workload_class=None):
         manager = self.manager
         if getattr(manager, 'capability_routing', False):
             return manager._store.next_job(
-                route_ids=manager.compatible_route_ids(),
-                include_legacy=False,
+                route_ids=manager.compatible_route_ids(workload_class),
+                include_legacy=workload_class == 'heavy',
             )
         return manager._store.next_job()
 
@@ -411,7 +411,7 @@ class RedisJobWorkerRuntime:
         manager.recover_stale_jobs()
         next_reconcile = monotonic() + reconcile_seconds
         next_heartbeat = monotonic() + heartbeat_seconds
-        futures = set()
+        futures = {}
         drain_deadline = None
         draining = False
         executor = ThreadPoolExecutor(
@@ -457,7 +457,7 @@ class RedisJobWorkerRuntime:
                     next_reconcile = monotonic() + reconcile_seconds
                 finished = {future for future in futures if future.done()}
                 for future in finished:
-                    futures.remove(future)
+                    futures.pop(future)
                     try:
                         future.result()
                     except Exception as exc:
@@ -493,15 +493,29 @@ class RedisJobWorkerRuntime:
                         len(futures) < manager.max_concurrency
                         and self.accepting_new_work()
                     ):
-                        item = self.next_job()
+                        workload_class = None
+                        item = None
+                        if getattr(manager, 'workload_class_routing', False):
+                            active_heavy = sum(
+                                lane == 'heavy' for lane in futures.values()
+                            )
+                            if active_heavy < manager.max_heavy_concurrency:
+                                item = self.next_job('heavy')
+                                workload_class = 'heavy' if item else None
+                            if not item:
+                                item = self.next_job('light')
+                                workload_class = 'light' if item else None
+                        else:
+                            item = self.next_job()
                         if not item:
                             break
                         job_id = item.decode('utf-8') if isinstance(item, bytes) else str(item)
-                        futures.add(executor.submit(
+                        future = executor.submit(
                             self.complete_queued_item,
                             job_id,
                             poll_timeout,
-                        ))
+                        )
+                        futures[future] = workload_class
                 if not futures:
                     manager.recover_stale_jobs()
                 if (

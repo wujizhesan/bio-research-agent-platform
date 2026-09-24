@@ -986,6 +986,32 @@ class RedisJobManagerTests(unittest.TestCase):
         finally:
             manager.shutdown()
 
+    def test_workload_routes_keep_light_and_heavy_jobs_separate(self):
+        redis = InMemoryRedis()
+        with patch.dict('os.environ', {
+            'WORKER_LIGHT_RESERVED_SLOTS': '3',
+            'WORKER_CAPABILITY_ROUTING': 'true',
+        }):
+            manager = RedisJobManager(
+                redis_client=redis,
+                namespace='test',
+                capability_routing=True,
+                max_concurrency=4,
+            )
+        try:
+            light = manager.submit('omics_inspect_toolchain', {})
+            heavy = manager.submit('research_catalog', {})
+            self.assertEqual(manager._load(light['job_id'])['routing']['workload_class'], 'light')
+            self.assertEqual(manager._load(heavy['job_id'])['routing']['workload_class'], 'heavy')
+            self.assertEqual(manager.max_heavy_concurrency, 1)
+            self.assertEqual(len(manager.compatible_route_ids('light')), 1)
+            self.assertEqual(len(manager.compatible_route_ids('heavy')), 1)
+            self.assertEqual(manager._worker_runtime.next_job('heavy'), heavy['job_id'])
+            manager._ack(heavy['job_id'])
+            self.assertEqual(manager._worker_runtime.next_job('light'), light['job_id'])
+        finally:
+            manager.shutdown()
+
     def test_worker_defers_job_requiring_incompatible_resources(self):
         redis = InMemoryRedis()
         manager = RedisJobManager(

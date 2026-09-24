@@ -10,10 +10,12 @@ import shutil
 import time
 
 from scripts.verify_secure_fullstack_e2e import request_json
-from scripts.benchmark_secure_jobs import percentile
+from scripts.benchmark_secure_jobs import job_timings, summarize
 
 
-def verify(base_url, host_root, container_root, username, password, timeout_seconds=120, light_count=8):
+def verify(base_url, host_root, container_root, username, password,
+           timeout_seconds=120, light_count=8, heavy_count=4,
+           artifact_prefix='omics-heavy', heavy_running_target=1):
     host_root = Path(host_root).resolve()
     source = Path(__file__).resolve().parent.parent / 'examples' / 'rnaseq'
     input_dir = host_root / 'input'
@@ -40,22 +42,20 @@ def verify(base_url, host_root, container_root, username, password, timeout_seco
     if not project_id:
         raise RuntimeError('secure mixed-resource project creation failed')
     container_root = PurePosixPath(container_root)
-    profiles = {
-        'heavy': {
+    heavy_profiles = [
+        {
             'tool': 'omics_run_analysis',
             'arguments': {
                 'expression_csv': str(container_root / 'input' / 'expression.csv'),
                 'metadata_csv': str(container_root / 'input' / 'metadata.csv'),
                 'gene_sets_csv': str(container_root / 'input' / 'gene_sets.csv'),
-                'output_dir': str(container_root / 'artifacts' / 'omics'),
+                'output_dir': str(container_root / 'artifacts' / f'{artifact_prefix}-{index}'),
                 'statistics_backend': 'scipy',
             },
-        },
-        'light': {
-            'tool': 'omics_inspect_toolchain',
-            'arguments': {},
-        },
-    }
+        }
+        for index in range(heavy_count)
+    ]
+    light_profile = {'tool': 'omics_inspect_toolchain', 'arguments': {}}
 
     def submit(profile):
         submitted = request_json(
@@ -85,15 +85,27 @@ def verify(base_url, host_root, container_root, username, password, timeout_seco
             time.sleep(0.25)
         raise TimeoutError(f'secure mixed-resource job {job_id} timed out')
 
-    with ThreadPoolExecutor(max_workers=light_count + 1) as pool:
-        heavy_id = submit(profiles['heavy'])
+    with ThreadPoolExecutor(max_workers=light_count + heavy_count) as pool:
+        heavy_submissions = [pool.submit(submit, profile) for profile in heavy_profiles]
+        heavy_ids = [future.result() for future in heavy_submissions]
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            running_at_submission = sum(
+                (request_json(base_url, f'/api/v1/jobs/{job_id}', token=token).get('job') or {}).get('status') == 'running'
+                for job_id in heavy_ids
+            )
+            if running_at_submission >= heavy_running_target:
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError('heavy jobs did not reach the expected running capacity')
         light_submissions = [
-            pool.submit(submit, profiles['light']) for _ in range(light_count)
+            pool.submit(submit, light_profile) for _ in range(light_count)
         ]
         light_ids = [future.result() for future in light_submissions]
         observations = {
             job_id: pool.submit(wait_for_terminal, job_id)
-            for job_id in (heavy_id, *light_ids)
+            for job_id in (*heavy_ids, *light_ids)
         }
         jobs = {job_id: future.result() for job_id, future in observations.items()}
     for job_id, job in jobs.items():
@@ -102,30 +114,42 @@ def verify(base_url, host_root, container_root, username, password, timeout_seco
                 f"secure mixed-resource {job_id} job failed with "
                 f"{job.get('error_code') or job.get('status')}"
             )
-    heavy_job = jobs[heavy_id]
-    heavy_started = datetime.fromisoformat(heavy_job['started_at'])
-    heavy_finished = datetime.fromisoformat(heavy_job['finished_at'])
-    light_jobs = [jobs[job_id] for job_id in light_ids]
-    light_queue_seconds = [
-        (datetime.fromisoformat(job['started_at']) - datetime.fromisoformat(job['created_at'])).total_seconds()
-        for job in light_jobs
+    heavy_jobs = [jobs[job_id] for job_id in heavy_ids]
+    heavy_timings = [job_timings(job, 0) for job in heavy_jobs]
+    heavy_intervals = [
+        (datetime.fromisoformat(job['started_at']), datetime.fromisoformat(job['finished_at']))
+        for job in heavy_jobs
     ]
+    light_jobs = [jobs[job_id] for job_id in light_ids]
+    light_timings = [job_timings(job, 0) for job in light_jobs]
     overlap_count = sum(
-        datetime.fromisoformat(job['started_at']) < heavy_finished
-        and datetime.fromisoformat(job['finished_at']) > heavy_started
+        any(
+            datetime.fromisoformat(job['started_at']) < finished
+            and datetime.fromisoformat(job['finished_at']) > started
+            for started, finished in heavy_intervals
+        )
         for job in light_jobs
     )
-    report = host_root / 'artifacts' / 'omics' / 'omics_report.md'
-    if not report.is_file():
+    reports = [
+        host_root / 'artifacts' / f'{artifact_prefix}-{index}' / 'omics_report.md'
+        for index in range(heavy_count)
+    ]
+    if any(not report.is_file() for report in reports):
         raise RuntimeError('secure mixed-resource omics report is missing')
     return {
         'status': 'ok',
-        'heavy_job_id': heavy_id,
+        'heavy_job_ids': heavy_ids,
+        'heavy_running_at_light_submission': running_at_submission,
         'light_job_ids': light_ids,
-        'heavy_execution_seconds': round((heavy_finished - heavy_started).total_seconds(), 3),
-        'light_queue_p95_seconds': round(percentile(light_queue_seconds, 95), 3),
+        'heavy_execution_p95_seconds': summarize(heavy_timings, 'execution_seconds')['p95'],
+        'heavy_server_p95_seconds': summarize(heavy_timings, 'server_total_seconds')['p95'],
+        'light_queue_p95_seconds': summarize(light_timings, 'queue_seconds')['p95'],
+        'light_queue_phase_p95_seconds': {
+            phase: summarize(light_timings, f'{phase}_seconds')['p95']
+            for phase in ('submission', 'outbox_wait', 'dispatch', 'worker_wait')
+        },
         'light_overlap_count': overlap_count,
-        'artifact': str(report),
+        'artifacts': [str(report) for report in reports],
     }
 
 
@@ -140,11 +164,18 @@ def main(argv=None):
     parser.add_argument('--password', default=os.environ.get('SECURE_E2E_PASSWORD', ''))
     parser.add_argument('--timeout-seconds', type=float, default=120)
     parser.add_argument('--light-count', type=int, default=8)
+    parser.add_argument('--heavy-count', type=int, default=4)
+    parser.add_argument('--artifact-prefix', default='omics-heavy')
+    parser.add_argument('--heavy-running-target', type=int, default=1)
     args = parser.parse_args(argv)
     if not args.username or not args.password:
         raise SystemExit('secure E2E credentials are required')
-    if args.light_count < 1:
-        parser.error('light count must be positive')
+    if args.light_count < 1 or args.heavy_count < 1:
+        parser.error('light and heavy counts must be positive')
+    if not 1 <= args.heavy_running_target <= args.heavy_count:
+        parser.error('heavy running target must be between one and heavy count')
+    if not args.artifact_prefix.replace('-', '').replace('_', '').isalnum():
+        parser.error('artifact prefix must contain only letters, digits, hyphens, and underscores')
     print(json.dumps(verify(
         args.base_url,
         args.host_root,
@@ -153,6 +184,9 @@ def main(argv=None):
         args.password,
         args.timeout_seconds,
         args.light_count,
+        args.heavy_count,
+        args.artifact_prefix,
+        args.heavy_running_target,
     ), sort_keys=True))
     return 0
 
