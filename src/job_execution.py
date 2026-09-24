@@ -126,6 +126,45 @@ def _tool_spec(tool):
     )
 
 
+def _scoped_builtin_descriptor(spec):
+    if (
+        spec is None
+        or spec.get('domain') not in {'knowledge', 'literature', 'omics'}
+        or not str(spec.get('name') or '').startswith(f"{spec.get('domain')}_")
+        or (spec.get('plugin_security') or {}).get('trust') != 'trusted'
+    ):
+        return None
+    return {
+        'domain': spec['domain'],
+        'spec': {key: value for key, value in spec.items() if key != 'function'},
+    }
+
+
+def _validate_scoped_result(tool, result, spec):
+    from jsonschema import ValidationError, validate
+
+    try:
+        validate(instance=result, schema=spec.get('returns') or {})
+    except ValidationError as exc:
+        reason = f'output contract violation for {tool}: {exc.message}'
+        try:
+            from .plugin_manager import PluginManager
+        except ImportError:
+            from plugin_manager import PluginManager
+        try:
+            PluginManager().record_contract_failure(spec['domain'], reason)
+        except Exception:
+            pass
+        return {
+            'status': 'error',
+            'domain': spec['domain'],
+            'tool': tool[len(spec['domain']) + 1:],
+            'error_type': 'output_contract',
+            'error': reason,
+        }
+    return result
+
+
 def _env_int(name, default, minimum=0):
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -359,6 +398,12 @@ class ProcessToolExecutor:
             response_path = root / 'response.json'
             error_path = root / 'stderr.log'
             spec = _tool_spec(tool)
+            descriptor = (
+                _scoped_builtin_descriptor(spec)
+                if self.runner_path.resolve()
+                == Path(__file__).with_name('job_subprocess.py').resolve()
+                else None
+            )
             child_environment = _sandbox_environment(tool, root, spec)
             sandboxed = child_environment is not None
             child_environment = dict(
@@ -370,10 +415,35 @@ class ProcessToolExecutor:
                 root / 'inputs',
                 client=self.storage_client,
             )
+            if descriptor is not None:
+                from jsonschema import ValidationError, validate
+
+                resolved_arguments = json.loads(json.dumps(
+                    resolved_arguments, ensure_ascii=False, default=str
+                ))
+                if not isinstance(resolved_arguments, dict):
+                    return {
+                        'status': 'error',
+                        'error': 'tool arguments must be an object',
+                    }
+                try:
+                    validate(
+                        instance=resolved_arguments,
+                        schema=spec['parameters'],
+                    )
+                except ValidationError as exc:
+                    return {
+                        'status': 'error',
+                        'domain': spec['domain'],
+                        'tool': tool[len(spec['domain']) + 1:],
+                        'error_type': 'input_contract',
+                        'error': exc.message,
+                    }
             request_path.write_text(
                 json.dumps(
                     {
                         'tool': tool,
+                        'scoped_tool': descriptor,
                         'execution_domain': (
                             spec['domain']
                             if spec and spec['domain'] in {'knowledge', 'literature', 'omics'}
@@ -451,6 +521,16 @@ class ProcessToolExecutor:
                 payload = json.loads(response_path.read_text(encoding='utf-8'))
             except (OSError, json.JSONDecodeError) as exc:
                 raise JobExecutionError('isolated worker returned an invalid response') from exc
+            if descriptor is not None and payload.get('ok'):
+                payload['result'] = _validate_scoped_result(
+                    tool, payload.get('result'), spec
+                )
+                if (
+                    isinstance(payload.get('result'), dict)
+                    and payload['result'].get('error_type') == 'output_contract'
+                    and isinstance(payload.get('telemetry'), dict)
+                ):
+                    payload['telemetry']['status'] = 'error'
             telemetry = payload.get('telemetry')
             if isinstance(telemetry, dict):
                 domain = str(telemetry.get('domain') or 'unknown')[:128]

@@ -46,6 +46,24 @@ class PluginManagerTests(unittest.TestCase):
             self.assertFalse(reloaded.get('demo')['enabled'])
             self.assertTrue(reloaded.enable('demo')['enabled'])
 
+    def test_scoped_builtin_reads_enabled_and_quarantine_state(self):
+        with tempfile.TemporaryDirectory(prefix='plugin_state_') as raw:
+            state_path = Path(raw) / 'plugin_state.json'
+            self.assertTrue(is_domain_enabled('knowledge', state_path))
+            state_path.write_text(json.dumps({
+                'version': 1,
+                'plugins': {'knowledge': {'enabled': False}},
+            }), encoding='utf-8')
+            self.assertFalse(is_domain_enabled('knowledge', state_path))
+            state_path.write_text(json.dumps({
+                'version': 1,
+                'plugins': {'knowledge': {
+                    'enabled': True,
+                    'quarantined': True,
+                }},
+            }), encoding='utf-8')
+            self.assertFalse(is_domain_enabled('knowledge', state_path))
+
     def test_concurrent_state_updates_preserve_all_domains(self):
         from concurrent.futures import ThreadPoolExecutor
 

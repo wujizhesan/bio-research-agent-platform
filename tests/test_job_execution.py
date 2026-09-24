@@ -17,6 +17,7 @@ from src.job_execution import (
     JobExecutionError,
     JobExecutionTimedOut,
     ProcessToolExecutor,
+    _tool_spec,
     build_tool_executor_from_env,
     job_max_workers_from_env,
     public_execution_failure,
@@ -150,6 +151,69 @@ class JobExecutionTests(unittest.TestCase):
             phases['process_boundary'],
             places=3,
         )
+
+    def test_scoped_builtin_rejects_invalid_input_before_execution(self):
+        executor = ProcessToolExecutor(ExecutionLimits(
+            timeout_seconds=30,
+            memory_limit_mb=0,
+            cpu_time_seconds=0,
+            max_result_bytes=1024 * 1024,
+        ))
+        with patch.object(executor, 'popen_factory') as launch:
+            result = executor.execute('knowledge_search', {'top_k': 1})
+        self.assertEqual(result['error_type'], 'input_contract')
+        self.assertEqual(result['domain'], 'knowledge')
+        launch.assert_not_called()
+
+    def test_scoped_builtin_validates_output_after_child_execution(self):
+        spec = dict(_tool_spec('literature_summarize'))
+        spec['returns'] = {'type': 'integer'}
+        executor = ProcessToolExecutor(ExecutionLimits(
+            timeout_seconds=30,
+            memory_limit_mb=0,
+            cpu_time_seconds=0,
+            max_result_bytes=1024 * 1024,
+            poll_interval_seconds=0.01,
+        ))
+        with patch('src.job_execution._tool_spec', return_value=spec):
+            with patch('src.plugin_manager.PluginManager') as manager:
+                result = executor.execute('literature_summarize', {
+                    'evidence': {'matches': []},
+                })
+        self.assertEqual(result['error_type'], 'output_contract')
+        manager.return_value.record_contract_failure.assert_called_once()
+
+    def test_scoped_builtin_child_avoids_registry_dependencies(self):
+        environment = os.environ.copy()
+        environment['BIO_AGENT_ISOLATED_TOOL_CHILD'] = '1'
+        completed = subprocess.run(
+            [
+                sys.executable,
+                '-c',
+                'import json, sys; '
+                'from src.scoped_tool_runtime import run_scoped_tool; '
+                'spec={"name":"literature_summarize","domain":"literature",'
+                '"plugin_security":{"trust":"trusted"},"permissions":{}}; '
+                'result=run_scoped_tool("literature_summarize",'
+                '{"evidence":{"matches":[]}},'
+                '{"domain":"literature","spec":spec}); '
+                'print(json.dumps({"status":result["status"],'
+                '"registry":"src.domain_registry" in sys.modules,'
+                '"jsonschema":"jsonschema" in sys.modules}))',
+            ],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=20,
+        )
+        payload = json.loads(completed.stdout)
+        self.assertEqual(payload, {
+            'status': 'ok',
+            'registry': False,
+            'jsonschema': False,
+        })
 
     def test_isolated_knowledge_registry_skips_unrelated_domains(self):
         environment = os.environ.copy()

@@ -54,10 +54,19 @@ def main(argv=None):
         else:
             os.environ.pop('BIO_AGENT_EXECUTION_DOMAIN', None)
         registry_started = perf_counter()
-        try:
-            from .domain_registry import run_tool
-        except ImportError:
-            from domain_registry import run_tool
+        descriptor = request.get('scoped_tool')
+        scoped_tool = None
+        if descriptor is None:
+            try:
+                from .domain_registry import run_tool
+            except ImportError:
+                from domain_registry import run_tool
+        else:
+            try:
+                from .scoped_tool_runtime import resolve_scoped_tool, run_scoped_tool
+            except ImportError:
+                from scoped_tool_runtime import resolve_scoped_tool, run_scoped_tool
+            scoped_tool = resolve_scoped_tool(request['tool'], descriptor)
         registry_import_seconds = perf_counter() - registry_started
         context = (
             bind_run_context(request['run_context'])
@@ -67,7 +76,15 @@ def main(argv=None):
         with context:
             tool_started = perf_counter()
             try:
-                result = run_tool(request['tool'], request.get('arguments', {}))
+                if descriptor is None:
+                    result = run_tool(request['tool'], request.get('arguments', {}))
+                else:
+                    result = run_scoped_tool(
+                        request['tool'],
+                        request.get('arguments', {}),
+                        descriptor,
+                        resolved=scoped_tool,
+                    )
             finally:
                 tool_run_seconds = perf_counter() - tool_started
         payload = {'ok': True, 'result': result}
