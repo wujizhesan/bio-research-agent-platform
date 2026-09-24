@@ -424,6 +424,8 @@ jobs:
             --samples 8 \
             --concurrency 1,2,8 \
             --output output/performance-matrix.json
+      - name: Verify heavy and lightweight jobs in the secure sandbox
+        run: python -m scripts.verify_secure_mixed_resources --base-url http://127.0.0.1:18080
       - name: Verify sandbox mounts and cleanup
         run: |
           mkdir -p output
