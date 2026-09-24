@@ -12,8 +12,9 @@ from scripts.verify_secure_mixed_resources import verify
 
 
 CONFIGURATIONS = {
-    'baseline': (4, 3, 4, 4),
-    'candidate': (5, 4, 5, 5),
+    'baseline': (4, 3, 4, 4, 2.0, 2.0),
+    'candidate': (5, 4, 5, 5, 2.0, 2.0),
+    'balanced': (5, 4, 5, 5, 2.5, 1.5),
 }
 POOLS = ('plugin-sandbox', 'plugin-sandbox-heavy')
 CAPACITY_REJECTION_SAMPLE = re.compile(
@@ -21,26 +22,32 @@ CAPACITY_REJECTION_SAMPLE = re.compile(
 )
 
 
-def worker_env(name):
-    total, reserved, client, cpu_capacity = CONFIGURATIONS[name]
+def configuration_env(name):
+    total, reserved, client, cpu_capacity, light_cpus, heavy_cpus = CONFIGURATIONS[name]
     env = os.environ.copy()
     env.update({
         'SECURE_WORKER_MAX_CONCURRENCY': str(total),
         'SECURE_WORKER_LIGHT_RESERVED_SLOTS': str(reserved),
         'SECURE_PLUGIN_SANDBOX_CLIENT_CONCURRENCY': str(client),
         'SECURE_WORKER_TOTAL_CPU_CORES': str(cpu_capacity),
+        'PLUGIN_SANDBOX_CPUS': str(light_cpus),
+        'PLUGIN_SANDBOX_HEAVY_CPUS': str(heavy_cpus),
     })
     return env
 
 
-def restart_worker(name=None):
-    result = run(
-        (*COMPOSE, 'up', '-d', '--no-deps', '--force-recreate', '--wait', 'worker'),
-        env=worker_env(name) if name else os.environ.copy(),
-        timeout=240,
-    )
-    if result.returncode:
-        raise RuntimeError(f'{name or "deployment"} worker restart failed: {result.stdout[-3000:]}')
+def restart_configuration(name=None):
+    env = configuration_env(name) if name else os.environ.copy()
+    for service in (*POOLS, 'worker'):
+        result = run(
+            (*COMPOSE, 'up', '-d', '--no-deps', '--force-recreate', '--wait', service),
+            env=env,
+            timeout=240,
+        )
+        if result.returncode:
+            raise RuntimeError(
+                f'{name or "deployment"} {service} restart failed: {result.stdout[-3000:]}'
+            )
 
 
 def pool_snapshot(env):
@@ -54,6 +61,7 @@ def pool_snapshot(env):
 def pool_delta(before, after):
     return {
         name: {
+            'cpu_limit_cores': after[name]['cpu_limit_cores'],
             'oom_kill_delta': (
                 after[name]['memory_events'].get('oom_kill', 0)
                 - before[name]['memory_events'].get('oom_kill', 0)
@@ -78,6 +86,56 @@ def parse_capacity_rejections(metrics_text):
 def capacity_rejections(url):
     with urlopen(url, timeout=10) as response:
         return parse_capacity_rejections(response.read().decode('utf-8'))
+
+
+def compare_configurations(rows, summary, baseline_name, candidate_name):
+    baseline = summary[baseline_name]
+    candidate = summary[candidate_name]
+    baseline_rounds = {
+        row['round']: row for row in rows if row['configuration'] == baseline_name
+    }
+    candidate_rounds = {
+        row['round']: row for row in rows if row['configuration'] == candidate_name
+    }
+    paired_rounds = sorted(baseline_rounds.keys() & candidate_rounds.keys())
+    queue_wins = sum(
+        candidate_rounds[index]['result']['light_queue_p95_seconds']
+        < baseline_rounds[index]['result']['light_queue_p95_seconds']
+        for index in paired_rounds
+    )
+    server_wins = sum(
+        candidate_rounds[index]['result']['light_server_p95_seconds']
+        < baseline_rounds[index]['result']['light_server_p95_seconds']
+        for index in paired_rounds
+    )
+    required_wins = (max(baseline['rounds'], candidate['rounds']) * 2 + 2) // 3
+    return {
+        'light_queue_improvement_percent': round(
+            100 * (1 - candidate['light_queue_p95_seconds'] / baseline['light_queue_p95_seconds']), 1
+        ),
+        'heavy_server_change_percent': round(
+            100 * (candidate['heavy_server_p95_seconds'] / baseline['heavy_server_p95_seconds'] - 1), 1
+        ),
+        'light_server_improvement_percent': round(
+            100 * (1 - candidate['light_server_p95_seconds'] / baseline['light_server_p95_seconds']), 1
+        ),
+        'light_round_wins': queue_wins,
+        'light_server_round_wins': server_wins,
+        'paired_rounds': len(paired_rounds),
+        'required_light_round_wins': required_wins,
+        'promote_candidate': bool(
+            len(paired_rounds) == baseline['rounds'] == candidate['rounds']
+            and baseline['rounds'] >= 2
+            and queue_wins >= required_wins
+            and server_wins >= required_wins
+            and candidate['light_queue_p95_seconds'] <= baseline['light_queue_p95_seconds'] * 0.9
+            and candidate['light_server_p95_seconds'] <= baseline['light_server_p95_seconds'] * 0.95
+            and candidate['heavy_server_p95_seconds'] <= baseline['heavy_server_p95_seconds'] * 1.05
+            and candidate['max_light_running_while_heavy'] >= 4
+            and candidate['capacity_rejections'] <= baseline['capacity_rejections']
+            and candidate['oom_kill_delta'] == 0
+        ),
+    }
 
 
 def summarize_rows(rows):
@@ -121,47 +179,22 @@ def summarize_rows(rows):
                 row['pools']['plugin-sandbox']['cpu_throttled_usec'] for row in selected
             ),
         }
-    if len(summary) == len(CONFIGURATIONS):
-        baseline = summary['baseline']
-        candidate = summary['candidate']
-        baseline_rounds = {
-            row['round']: row for row in rows if row['configuration'] == 'baseline'
-        }
-        candidate_rounds = {
-            row['round']: row for row in rows if row['configuration'] == 'candidate'
-        }
-        paired_rounds = sorted(baseline_rounds.keys() & candidate_rounds.keys())
-        paired_wins = sum(
-            candidate_rounds[index]['result']['light_queue_p95_seconds']
-            < baseline_rounds[index]['result']['light_queue_p95_seconds']
-            for index in paired_rounds
+    if 'baseline' in summary and 'candidate' in summary:
+        summary['comparison'] = compare_configurations(rows, summary, 'baseline', 'candidate')
+    if 'baseline' in summary and 'balanced' in summary:
+        summary['balanced_comparison'] = compare_configurations(
+            rows, summary, 'baseline', 'balanced'
         )
-        required_wins = (max(baseline['rounds'], candidate['rounds']) * 2 + 2) // 3
-        summary['comparison'] = {
-            'light_queue_improvement_percent': round(
-                100 * (1 - candidate['light_queue_p95_seconds'] / baseline['light_queue_p95_seconds']), 1
-            ),
-            'heavy_server_change_percent': round(
-                100 * (candidate['heavy_server_p95_seconds'] / baseline['heavy_server_p95_seconds'] - 1), 1
-            ),
-            'light_server_improvement_percent': round(
-                100 * (1 - candidate['light_server_p95_seconds'] / baseline['light_server_p95_seconds']), 1
-            ),
-            'light_round_wins': paired_wins,
-            'paired_rounds': len(paired_rounds),
-            'required_light_round_wins': required_wins,
-            'promote_candidate': bool(
-                len(paired_rounds) == baseline['rounds'] == candidate['rounds']
-                and baseline['rounds'] >= 2
-                and paired_wins >= required_wins
-                and candidate['light_queue_p95_seconds'] <= baseline['light_queue_p95_seconds'] * 0.9
-                and candidate['light_server_p95_seconds'] <= baseline['light_server_p95_seconds']
-                and candidate['heavy_server_p95_seconds'] <= baseline['heavy_server_p95_seconds'] * 1.1
-                and candidate['max_light_running_while_heavy'] >= 4
-                and candidate['capacity_rejections'] <= baseline['capacity_rejections']
-                and candidate['oom_kill_delta'] == 0
-            ),
-        }
+    if 'candidate' in summary and 'balanced' in summary:
+        allocation = compare_configurations(rows, summary, 'candidate', 'balanced')
+        allocation['prefer_balanced'] = bool(
+            allocation['light_server_round_wins'] >= allocation['required_light_round_wins']
+            and allocation['light_server_improvement_percent'] >= 5
+            and allocation['heavy_server_change_percent'] <= 5
+            and summary['balanced']['capacity_rejections'] <= summary['candidate']['capacity_rejections']
+            and summary['balanced']['oom_kill_delta'] == 0
+        )
+        summary['allocation_comparison'] = allocation
     return summary
 
 
@@ -171,14 +204,19 @@ def benchmark(args):
     restore_error = None
     current = None
     try:
+        names = tuple(CONFIGURATIONS)
         for index in range(args.rounds):
-            order = ('baseline', 'candidate') if index % 2 == 0 else ('candidate', 'baseline')
+            order = names[index % len(names):] + names[:index % len(names)]
             for name in order:
                 if current != name:
-                    restart_worker(name)
+                    restart_configuration(name)
                     current = name
-                env = worker_env(name)
+                env = configuration_env(name)
                 before = pool_snapshot(env)
+                for service, expected in zip(POOLS, CONFIGURATIONS[name][4:]):
+                    actual = before[service]['cpu_limit_cores']
+                    if actual is not None and abs(actual - expected) > 0.01:
+                        raise RuntimeError(f'{name} {service} CPU limit is {actual}, expected {expected}')
                 rejected_before = capacity_rejections(args.worker_metrics_url)
                 result = verify(
                     args.base_url,
@@ -211,7 +249,7 @@ def benchmark(args):
         error = f'{type(exc).__name__}: {exc}'
     finally:
         try:
-            restart_worker()
+            restart_configuration()
         except Exception as exc:
             restore_error = f'{type(exc).__name__}: {exc}'
         report = {

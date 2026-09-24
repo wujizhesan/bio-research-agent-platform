@@ -13,7 +13,7 @@ CONFIGURATIONS = (
     (4, 1024, 4096),
 )
 REFERENCE_CONFIGURATION = CONFIGURATIONS[-1]
-CGROUP_FILES = ('memory.current', 'memory.peak', 'memory.events', 'cpu.stat', 'pids.peak')
+CGROUP_FILES = ('memory.current', 'memory.peak', 'memory.events', 'cpu.stat', 'cpu.max', 'pids.peak')
 
 
 def run(command, *, env=None, timeout=180):
@@ -78,6 +78,12 @@ def parse_cgroup(snapshot):
             for line in (snapshot.get(name) or '').splitlines()
             if len(line.split()) == 2 and line.split()[1].isdigit()
         }
+    cpu_max = (snapshot.get('cpu.max') or '').split()
+    values['cpu_limit_cores'] = (
+        float(cpu_max[0]) / float(cpu_max[1])
+        if len(cpu_max) == 2 and all(part.isdigit() for part in cpu_max)
+        and float(cpu_max[1]) > 0 else None
+    )
     if 'error' in snapshot:
         values['error'] = snapshot['error']
     return values

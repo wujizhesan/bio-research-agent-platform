@@ -499,7 +499,7 @@ jobs:
           )
           print(json.dumps({name: data['memory_peak'] for name, data in report.items()}))
           PY
-      - name: Compare Worker slot reservations over three mixed-load rounds
+      - name: Compare Worker slots and sandbox CPU shares over three mixed-load rounds
         if: github.event_name == 'workflow_dispatch'
         run: |
           python -m scripts.benchmark_worker_slots \
