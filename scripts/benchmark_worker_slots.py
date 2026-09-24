@@ -3,6 +3,9 @@ import json
 import os
 from pathlib import Path
 from statistics import median
+from urllib.request import urlopen
+
+from prometheus_client.parser import text_string_to_metric_families
 
 from scripts.benchmark_sandbox_capacity import COMPOSE, cgroup_snapshot, parse_cgroup, run
 from scripts.benchmark_secure_jobs import percentile
@@ -10,19 +13,20 @@ from scripts.verify_secure_mixed_resources import verify
 
 
 CONFIGURATIONS = {
-    'baseline': (4, 3, 4),
-    'candidate': (5, 4, 5),
+    'baseline': (4, 3, 4, 4),
+    'candidate': (5, 4, 5, 5),
 }
 POOLS = ('plugin-sandbox', 'plugin-sandbox-heavy')
 
 
 def worker_env(name):
-    total, reserved, client = CONFIGURATIONS[name]
+    total, reserved, client, cpu_capacity = CONFIGURATIONS[name]
     env = os.environ.copy()
     env.update({
         'WORKER_MAX_CONCURRENCY': str(total),
         'WORKER_LIGHT_RESERVED_SLOTS': str(reserved),
         'PLUGIN_SANDBOX_CLIENT_CONCURRENCY': str(client),
+        'JOB_TOTAL_CPU_CORES': str(cpu_capacity),
     })
     return env
 
@@ -61,6 +65,20 @@ def pool_delta(before, after):
     }
 
 
+def parse_capacity_rejections(metrics_text):
+    return sum(
+        sample.value
+        for family in text_string_to_metric_families(metrics_text)
+        for sample in family.samples
+        if sample.name == 'bio_agent_redis_worker_capacity_rejections_total'
+    )
+
+
+def capacity_rejections(url):
+    with urlopen(url, timeout=10) as response:
+        return parse_capacity_rejections(response.read().decode('utf-8'))
+
+
 def summarize_rows(rows):
     summary = {}
     for name in CONFIGURATIONS:
@@ -81,7 +99,14 @@ def summarize_rows(rows):
             'heavy_round_p95_median_seconds': round(median(
                 row['result']['heavy_server_p95_seconds'] for row in selected
             ), 3),
+            'light_execution_round_p95_median_seconds': round(median(
+                row['result']['light_execution_p95_seconds'] for row in selected
+            ), 3),
             'light_overlap_count': sum(row['result']['light_overlap_count'] for row in selected),
+            'max_light_running_while_heavy': max(
+                row['result']['max_light_running_while_heavy'] for row in selected
+            ),
+            'capacity_rejections': sum(row['capacity_rejections'] for row in selected),
             'oom_kill_delta': sum(
                 values['oom_kill_delta']
                 for row in selected for values in row['pools'].values()
@@ -122,6 +147,8 @@ def summarize_rows(rows):
                 and paired_wins >= required_wins
                 and candidate['light_queue_p95_seconds'] <= baseline['light_queue_p95_seconds'] * 0.9
                 and candidate['heavy_server_p95_seconds'] <= baseline['heavy_server_p95_seconds'] * 1.1
+                and candidate['max_light_running_while_heavy'] >= 4
+                and candidate['capacity_rejections'] <= baseline['capacity_rejections']
                 and candidate['oom_kill_delta'] == 0
             ),
         }
@@ -142,6 +169,7 @@ def benchmark(args):
                     current = name
                 env = worker_env(name)
                 before = pool_snapshot(env)
+                rejected_before = capacity_rejections(args.worker_metrics_url)
                 result = verify(
                     args.base_url,
                     args.host_root,
@@ -154,11 +182,15 @@ def benchmark(args):
                     artifact_prefix=f'worker-slots-{name}-{index}',
                 )
                 after = pool_snapshot(env)
+                rejected_after = capacity_rejections(args.worker_metrics_url)
+                if rejected_after < rejected_before:
+                    raise RuntimeError(f'{name} worker metrics counter reset during round {index}')
                 row = {
                     'round': index,
                     'configuration': name,
                     'result': result,
                     'pools': pool_delta(before, after),
+                    'capacity_rejections': int(rejected_after - rejected_before),
                 }
                 rows.append(row)
                 if result['light_overlap_count'] != args.light_count:
@@ -197,6 +229,7 @@ def main(argv=None):
     parser.add_argument('--light-count', type=int, default=8)
     parser.add_argument('--heavy-count', type=int, default=4)
     parser.add_argument('--timeout-seconds', type=float, default=120)
+    parser.add_argument('--worker-metrics-url', default='http://127.0.0.1:9000/metrics')
     parser.add_argument('--output', type=Path, default=Path('output/worker-slot-benchmark.json'))
     args = parser.parse_args(argv)
     if not args.username or not args.password:

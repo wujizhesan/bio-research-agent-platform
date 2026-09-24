@@ -18,7 +18,7 @@ from src.job_execution import InlineToolExecutor
 from src.job_state_store import DatabaseStateWriter
 from src.redis_job_coordinator import RedisExecutionCoordinator
 from src.redis_job_manager import RedisJobManager
-from src.redis_job_metrics import RedisJobMetrics
+from src.redis_job_metrics import RedisJobMetrics, REDIS_WORKER_CAPACITY_REJECTIONS
 from src.redis_job_recovery import RedisLeaseRecovery
 from src.redis_job_store import RedisQueueStore
 from src.redis_worker_registry import RedisWorkerRegistry
@@ -1149,6 +1149,9 @@ class RedisJobManagerTests(unittest.TestCase):
             max_concurrency=2,
         )
         try:
+            before_rejections = REDIS_WORKER_CAPACITY_REJECTIONS.labels(
+                'test', 'research_catalog'
+            )._value.get()
             first = manager.submit(
                 'research_catalog', {}, resources={'cpu_cores': 1}
             )
@@ -1163,6 +1166,12 @@ class RedisJobManagerTests(unittest.TestCase):
                 self.assertEqual(
                     deferred['scheduling']['status'],
                     'waiting_for_worker_capacity',
+                )
+                self.assertEqual(
+                    REDIS_WORKER_CAPACITY_REJECTIONS.labels(
+                        'test', 'research_catalog'
+                    )._value.get(),
+                    before_rejections + 1,
                 )
                 release.set()
                 self.assertEqual(future.result()['status'], 'completed')

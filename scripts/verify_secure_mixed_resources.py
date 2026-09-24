@@ -13,6 +13,15 @@ from scripts.verify_secure_fullstack_e2e import request_json
 from scripts.benchmark_secure_jobs import job_timings, summarize
 
 
+def peak_light_running_while_heavy(heavy_intervals, light_intervals):
+    checkpoints = [start for start, _ in (*heavy_intervals, *light_intervals)]
+    return max((
+        sum(start <= point < finished for start, finished in light_intervals)
+        for point in checkpoints
+        if any(start <= point < finished for start, finished in heavy_intervals)
+    ), default=0)
+
+
 def verify(base_url, host_root, container_root, username, password,
            timeout_seconds=120, light_count=8, heavy_count=4,
            artifact_prefix='omics-heavy', heavy_running_target=1):
@@ -122,13 +131,16 @@ def verify(base_url, host_root, container_root, username, password,
     ]
     light_jobs = [jobs[job_id] for job_id in light_ids]
     light_timings = [job_timings(job, 0) for job in light_jobs]
+    light_intervals = [
+        (datetime.fromisoformat(job['started_at']), datetime.fromisoformat(job['finished_at']))
+        for job in light_jobs
+    ]
     overlap_count = sum(
         any(
-            datetime.fromisoformat(job['started_at']) < finished
-            and datetime.fromisoformat(job['finished_at']) > started
+            light_started < finished and light_finished > started
             for started, finished in heavy_intervals
         )
-        for job in light_jobs
+        for light_started, light_finished in light_intervals
     )
     reports = [
         host_root / 'artifacts' / f'{artifact_prefix}-{index}' / 'omics_report.md'
@@ -146,6 +158,10 @@ def verify(base_url, host_root, container_root, username, password,
         'heavy_server_seconds': [timing['server_total_seconds'] for timing in heavy_timings],
         'light_queue_p95_seconds': summarize(light_timings, 'queue_seconds')['p95'],
         'light_queue_seconds': [timing['queue_seconds'] for timing in light_timings],
+        'light_execution_p95_seconds': summarize(light_timings, 'execution_seconds')['p95'],
+        'max_light_running_while_heavy': peak_light_running_while_heavy(
+            heavy_intervals, light_intervals
+        ),
         'light_queue_phase_p95_seconds': {
             phase: summarize(light_timings, f'{phase}_seconds')['p95']
             for phase in ('submission', 'outbox_wait', 'dispatch', 'worker_wait')

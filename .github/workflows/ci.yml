@@ -503,6 +503,7 @@ jobs:
         run: |
           python -m scripts.benchmark_worker_slots \
             --base-url http://127.0.0.1:18080 \
+            --worker-metrics-url http://127.0.0.1:19000/metrics \
             --rounds 3 \
             --output output/worker-slot-benchmark.json
       - name: Verify sandbox mounts and cleanup

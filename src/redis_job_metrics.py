@@ -63,6 +63,11 @@ REDIS_DEFERRED_RECONCILE_LAG = Histogram(
     'Seconds elapsed after a deferred retry became due before Redis reconciliation.',
     ['namespace', 'mode'],
 )
+REDIS_WORKER_CAPACITY_REJECTIONS = Counter(
+    'bio_agent_redis_worker_capacity_rejections_total',
+    'Jobs rejected by a worker because its advertised resources are occupied.',
+    ['namespace', 'tool'],
+)
 
 
 class RedisJobMetrics:
@@ -91,6 +96,11 @@ class RedisJobMetrics:
             tool=tool,
             priority=record.get('priority', 0),
         )
+
+    def capacity_rejected(self, record):
+        REDIS_WORKER_CAPACITY_REJECTIONS.labels(
+            self.namespace, record.get('tool') or 'unknown'
+        ).inc()
 
     def deferred_cache_sync_failed(self, job_id, error):
         REDIS_DEFERRED_CACHE_SYNC_FAILURES.labels(self.namespace).inc()

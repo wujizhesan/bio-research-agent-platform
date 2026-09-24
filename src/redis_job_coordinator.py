@@ -354,6 +354,9 @@ class RedisExecutionCoordinator:
             or self.resource_pool.try_acquire(resources)
         )
         if not acquired:
+            capacity_rejected = getattr(self.metrics, 'capacity_rejected', None)
+            if capacity_rejected is not None:
+                capacity_rejected(record)
             scheduling = {
                 'status': 'waiting_for_worker_capacity',
                 'worker_id': self.worker_id,
