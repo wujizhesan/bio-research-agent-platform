@@ -412,6 +412,11 @@ jobs:
           exit 1
       - name: Run API to sandbox artifact round trip
         run: python scripts/verify_secure_fullstack_e2e.py --base-url http://127.0.0.1:18080
+      - name: Compare isolated child import costs on the same sandbox host
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml \
+            exec -T plugin-sandbox python -m scripts.benchmark_isolated_imports \
+            --samples 16 > output/isolated-import-benchmark.json
       - name: Capture secure job latency baseline
         run: |
           python -m scripts.benchmark_secure_jobs \
@@ -576,6 +581,7 @@ jobs:
             output/heavy-light-isolation-baseline.json
             output/heavy-light-resources.json
             output/worker-slot-benchmark.json
+            output/isolated-import-benchmark.json
             output/secure-fullstack-e2e
             output/monitoring-smoke
           if-no-files-found: ignore
