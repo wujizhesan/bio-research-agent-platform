@@ -1,5 +1,7 @@
 import hashlib
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -15,9 +17,13 @@ from src.job_execution import (
     JobExecutionError,
     JobExecutionTimedOut,
     ProcessToolExecutor,
+    _tool_spec,
     build_tool_executor_from_env,
     job_max_workers_from_env,
+    public_execution_failure,
 )
+from src.external_service_policy import ServiceRetryDeferredError
+from src import job_subprocess
 from src.job_manager import JobManager
 from src.observability import bind_context
 from src.run_context import bind_run_context, build_run_context
@@ -43,8 +49,273 @@ result = {'path': str(path), 'content': path.read_text(encoding='utf-8')}
 Path(sys.argv[2]).write_text(json.dumps({'ok': True, 'result': result}), encoding='utf-8')
 """
 
+DEFERRED_HELPER = """import json
+from pathlib import Path
+import sys
+Path(sys.argv[2]).write_text(json.dumps({
+    'ok': False,
+    'error_code': 'external_retry_deferred',
+    'service': 'uniprot',
+    'retry_after_seconds': 120,
+    'status_code': 429,
+}), encoding='utf-8')
+"""
+
 
 class JobExecutionTests(unittest.TestCase):
+    def test_public_execution_failure_hides_internal_details(self):
+        failure = public_execution_failure(
+            RuntimeError('token=secret-value /srv/private/input.fastq')
+        )
+        self.assertEqual(failure, {
+            'status': 'error',
+            'error_code': 'execution_failed',
+            'error': 'job execution failed',
+        })
+        self.assertNotIn('secret-value', str(failure))
+        self.assertNotIn('/srv/private', str(failure))
+
+    def test_public_deferred_failure_exposes_only_retry_delay(self):
+        failure = public_execution_failure(
+            ServiceRetryDeferredError('private-service', 120, 429)
+        )
+        self.assertEqual(failure, {
+            'status': 'error',
+            'error_code': 'external_retry_deferred',
+            'error': 'external service requested retry later',
+            'retry_after_seconds': 120,
+        })
+
+    def test_job_subprocess_serializes_deferred_retry(self):
+        with tempfile.TemporaryDirectory(prefix='deferred_subprocess_') as raw:
+            request_path = Path(raw) / 'request.json'
+            response_path = Path(raw) / 'response.json'
+            request_path.write_text(json.dumps({
+                'tool': 'literature_search',
+                'arguments': {},
+                'limits': {},
+            }), encoding='utf-8')
+            with patch(
+                'src.domain_registry.run_tool',
+                side_effect=ServiceRetryDeferredError('uniprot', 120, 429),
+            ):
+                code = job_subprocess.main([str(request_path), str(response_path)])
+            payload = json.loads(response_path.read_text(encoding='utf-8'))
+        self.assertEqual(code, 1)
+        self.assertFalse(payload['ok'])
+        self.assertEqual(payload['error_code'], 'external_retry_deferred')
+        self.assertEqual(payload['retry_after_seconds'], 120)
+        self.assertGreaterEqual(payload['telemetry']['registry_import_seconds'], 0)
+        self.assertGreaterEqual(payload['telemetry']['tool_run_seconds'], 0)
+        self.assertLessEqual(
+            payload['telemetry']['process_clock_ns']['module_entry'],
+            payload['telemetry']['process_clock_ns']['execution_start'],
+        )
+
+    def test_isolated_knowledge_tool_reports_phase_timings(self):
+        with tempfile.TemporaryDirectory(prefix='isolated_knowledge_') as raw:
+            index = Path(raw) / 'index.json'
+            index.write_text(json.dumps({
+                'documents': [{'id': 'doc', 'text': 'TP53 tumor suppressor'}],
+            }), encoding='utf-8')
+            executor = ProcessToolExecutor(ExecutionLimits(
+                timeout_seconds=45,
+                memory_limit_mb=0,
+                cpu_time_seconds=0,
+                max_result_bytes=1024 * 1024,
+                poll_interval_seconds=0.01,
+                terminate_grace_seconds=1,
+            ))
+            with patch('src.job_execution.log_event') as logged:
+                result = executor.execute('knowledge_search', {
+                    'query': 'TP53',
+                    'index_path': str(index),
+                    'top_k': 1,
+                })
+        self.assertEqual(result['status'], 'ok')
+        completed = next(
+            call for call in logged.call_args_list
+            if call.args[0] == 'tool.execution.completed'
+        )
+        phases = completed.kwargs['phase_seconds']
+        self.assertGreaterEqual(phases['registry_import'], 0)
+        self.assertGreaterEqual(phases['tool_run'], 0)
+        self.assertGreaterEqual(phases['process_boundary'], 0)
+        boundary = completed.kwargs['boundary_seconds']
+        self.assertEqual(
+            set(boundary),
+            {'launch_to_entry', 'module_import', 'result_handoff'},
+        )
+        self.assertAlmostEqual(
+            sum(boundary.values()),
+            phases['process_boundary'],
+            places=3,
+        )
+
+    def test_scoped_builtin_rejects_invalid_input_before_execution(self):
+        executor = ProcessToolExecutor(ExecutionLimits(
+            timeout_seconds=30,
+            memory_limit_mb=0,
+            cpu_time_seconds=0,
+            max_result_bytes=1024 * 1024,
+        ))
+        with patch.object(executor, 'popen_factory') as launch:
+            result = executor.execute('knowledge_search', {'top_k': 1})
+        self.assertEqual(result['error_type'], 'input_contract')
+        self.assertEqual(result['domain'], 'knowledge')
+        launch.assert_not_called()
+
+    def test_scoped_builtin_validates_output_after_child_execution(self):
+        spec = dict(_tool_spec('literature_summarize'))
+        spec['returns'] = {'type': 'integer'}
+        executor = ProcessToolExecutor(ExecutionLimits(
+            timeout_seconds=30,
+            memory_limit_mb=0,
+            cpu_time_seconds=0,
+            max_result_bytes=1024 * 1024,
+            poll_interval_seconds=0.01,
+        ))
+        with patch('src.job_execution._tool_spec', return_value=spec):
+            with patch('src.plugin_manager.PluginManager') as manager:
+                result = executor.execute('literature_summarize', {
+                    'evidence': {'matches': []},
+                })
+        self.assertEqual(result['error_type'], 'output_contract')
+        manager.return_value.record_contract_failure.assert_called_once()
+
+    def test_scoped_builtin_child_avoids_registry_dependencies(self):
+        environment = os.environ.copy()
+        environment['BIO_AGENT_ISOLATED_TOOL_CHILD'] = '1'
+        completed = subprocess.run(
+            [
+                sys.executable,
+                '-c',
+                'import json, sys; '
+                'from src.scoped_tool_runtime import run_scoped_tool; '
+                'spec={"name":"literature_summarize","domain":"literature",'
+                '"plugin_security":{"trust":"trusted"},"permissions":{}}; '
+                'result=run_scoped_tool("literature_summarize",'
+                '{"evidence":{"matches":[]}},'
+                '{"domain":"literature","spec":spec}); '
+                'print(json.dumps({"status":result["status"],'
+                '"registry":"src.domain_registry" in sys.modules,'
+                '"jsonschema":"jsonschema" in sys.modules}))',
+            ],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=20,
+        )
+        payload = json.loads(completed.stdout)
+        self.assertEqual(payload, {
+            'status': 'ok',
+            'registry': False,
+            'jsonschema': False,
+        })
+
+    def test_isolated_knowledge_registry_skips_unrelated_domains(self):
+        environment = os.environ.copy()
+        environment['BIO_AGENT_EXECUTION_DOMAIN'] = 'knowledge'
+        environment['BIO_AGENT_ISOLATED_TOOL_CHILD'] = '1'
+        completed = subprocess.run(
+            [
+                sys.executable,
+                '-c',
+                'import json, sys; from src import domain_registry; '
+                'print(json.dumps({"domains": domain_registry.available_domains(), '
+                '"omics_loaded": "src.omics_agent" in sys.modules, '
+                '"prometheus_loaded": "prometheus_client" in sys.modules}))',
+            ],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=20,
+        )
+        payload = json.loads(completed.stdout)
+        self.assertEqual(payload['domains'], ['knowledge'])
+        self.assertFalse(payload['omics_loaded'])
+        self.assertFalse(payload['prometheus_loaded'])
+
+    def test_isolated_literature_and_omics_registries_skip_unrelated_domains(self):
+        for domain, unrelated in (
+            ('literature', 'src.omics_agent'),
+            ('omics', 'src.literature_plugin'),
+        ):
+            with self.subTest(domain=domain):
+                environment = os.environ.copy()
+                environment['BIO_AGENT_EXECUTION_DOMAIN'] = domain
+                environment['BIO_AGENT_ISOLATED_TOOL_CHILD'] = '1'
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        '-c',
+                        'import json, sys; from src import domain_registry; '
+                        'print(json.dumps({"domains": domain_registry.available_domains(), '
+                        f'"unrelated_loaded": "{unrelated}" in sys.modules, '
+                        '"scipy_stats_loaded": "scipy.stats" in sys.modules, '
+                        '"pandas_loaded": "pandas" in sys.modules, '
+                        '"numpy_loaded": "numpy" in sys.modules}))',
+                    ],
+                    cwd=str(Path(__file__).resolve().parents[1]),
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=20,
+                )
+                payload = json.loads(completed.stdout)
+                self.assertEqual(payload['domains'], [domain])
+                self.assertFalse(payload['unrelated_loaded'])
+                if domain == 'omics':
+                    self.assertFalse(payload['scipy_stats_loaded'])
+                    self.assertFalse(payload['pandas_loaded'])
+                    self.assertFalse(payload['numpy_loaded'])
+
+    def test_isolated_literature_and_omics_tools_execute(self):
+        executor = ProcessToolExecutor(ExecutionLimits(
+            timeout_seconds=45,
+            memory_limit_mb=0,
+            cpu_time_seconds=0,
+            max_result_bytes=1024 * 1024,
+            poll_interval_seconds=0.01,
+            terminate_grace_seconds=1,
+        ))
+        literature = executor.execute('literature_summarize', {
+            'evidence': {'matches': [{'source': 'fixture'}]},
+        })
+        omics = executor.execute('omics_inspect_toolchain', {})
+        self.assertEqual(literature['status'], 'ok')
+        self.assertEqual(literature['result']['n_matches'], 1)
+        self.assertIn('fastqc', omics)
+
+    def test_isolated_research_plan_keeps_cross_domain_catalog(self):
+        executor = ProcessToolExecutor(ExecutionLimits(
+            timeout_seconds=45,
+            memory_limit_mb=0,
+            cpu_time_seconds=0,
+            max_result_bytes=1024 * 1024,
+            poll_interval_seconds=0.01,
+            terminate_grace_seconds=1,
+        ))
+        result = executor.execute('research_plan', {
+            'task': '分析 RNA-seq 差异表达并设计 mRNA 序列',
+        })
+        self.assertEqual(result['status'], 'planned')
+        self.assertEqual(result['selected_domains'], ['omics', 'sequence'])
+
+    def test_process_executor_reconstructs_deferred_retry(self):
+        with tempfile.TemporaryDirectory(prefix='deferred_executor_') as raw:
+            executor = self._executor(raw)
+            executor.runner_path.write_text(DEFERRED_HELPER, encoding='utf-8')
+            with self.assertRaises(ServiceRetryDeferredError) as raised:
+                executor.execute('literature_search', {})
+        self.assertEqual(raised.exception.retry_after_seconds, 120)
+        self.assertEqual(raised.exception.status_code, 429)
+
     def _executor(self, root, **overrides):
         runner = Path(root) / 'helper.py'
         runner.write_text(HELPER, encoding='utf-8')

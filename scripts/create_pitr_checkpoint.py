@@ -32,6 +32,14 @@ def _checkpoint_label(release_tag, now):
 
 def _database_url():
     value = os.environ.get("PITR_DATABASE_URL", "").strip()
+    file_name = os.environ.get("PITR_DATABASE_URL_FILE", "").strip()
+    if value and file_name:
+        raise PitrError("configure only one PITR database URL source")
+    if file_name:
+        try:
+            value = Path(file_name).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise PitrError("unable to read PITR_DATABASE_URL_FILE") from exc
     if not value:
         raise PitrError("PITR_DATABASE_URL is required")
     return value.replace("postgresql+asyncpg://", "postgresql://", 1)

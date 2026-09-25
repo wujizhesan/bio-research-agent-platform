@@ -36,6 +36,7 @@ class FakeS3Client:
     def __init__(self):
         self.objects = {}
         self.uploads = []
+        self.deletions = []
         self.bucket_owners = []
 
     def upload_file(self, filename, bucket, key, ExtraArgs):
@@ -73,12 +74,43 @@ class FakeS3Client:
             raise KeyError(ExtraArgs['VersionId'])
         Path(filename).write_bytes(item['content'])
 
+    def delete_object(self, Bucket, Key, VersionId=None, ExpectedBucketOwner=None):
+        item = self.objects[(Bucket, Key)]
+        if VersionId is not None and VersionId != item['version_id']:
+            raise KeyError(VersionId)
+        self.deletions.append((Bucket, Key, VersionId, ExpectedBucketOwner))
+        del self.objects[(Bucket, Key)]
+        return {'DeleteMarker': True}
+
     def head_bucket(self, Bucket, ExpectedBucketOwner=None):
         self.bucket_owners.append(ExpectedBucketOwner)
         return {'Bucket': Bucket}
 
 
 class S3FileStorageTests(unittest.TestCase):
+    def test_discard_removes_exact_uploaded_version_and_local_metadata(self):
+        client = FakeS3Client()
+        fake_boto3 = types.ModuleType('boto3')
+        fake_boto3.client = lambda *_args, **_kwargs: client
+        with tempfile.TemporaryDirectory(prefix='s3_discard_') as raw:
+            with mock.patch.dict(sys.modules, {'boto3': fake_boto3}):
+                storage = S3FileStorage(
+                    Path(raw) / 'uploads',
+                    bucket='bio-test',
+                    prefix='research',
+                    expected_bucket_owner='123456789012',
+                )
+                stored = asyncio.run(storage.save(Upload(b'@read1\nACGT\n')))
+                asyncio.run(storage.discard(stored))
+                self.assertNotIn(('bio-test', stored.storage_key), client.objects)
+                self.assertEqual(client.deletions, [(
+                    'bio-test',
+                    stored.storage_key,
+                    'version-1',
+                    '123456789012',
+                )])
+                self.assertFalse((storage.root / stored.file_id).exists())
+
     def test_upload_and_cache_miss_download(self):
         client = FakeS3Client()
         fake_boto3 = types.ModuleType('boto3')

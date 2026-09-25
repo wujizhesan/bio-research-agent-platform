@@ -3,8 +3,6 @@
 import gzip
 from pathlib import Path
 
-import pandas as pd
-
 try:
     from .omics_results import variant_annotation_result
     from .omics_validation import require_columns
@@ -76,6 +74,8 @@ def _normalize_chrom(value):
 
 
 def _load_variant_annotations(annotation_csv):
+    import pandas as pd
+
     if not annotation_csv:
         return None
     annotation = pd.read_csv(annotation_csv)
@@ -121,6 +121,8 @@ def _parse_gtf_attributes(text):
 
 
 def _load_gencode_annotations(annotation_gtf):
+    import pandas as pd
+
     annotation_gtf = Path(annotation_gtf)
     if not annotation_gtf.is_file():
         raise ValueError(f'GTF annotation does not exist: {annotation_gtf}')
@@ -297,6 +299,8 @@ def execute_variant_annotation(
     *,
     toolchain,
 ):
+    import pandas as pd
+
     requested = str(annotation_backend or 'auto').lower()
     if requested not in VARIANT_ANNOTATION_BACKENDS:
         raise ValueError(f'unknown variant annotation backend: {requested}')

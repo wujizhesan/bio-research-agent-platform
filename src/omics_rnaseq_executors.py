@@ -2,8 +2,6 @@
 import json
 from pathlib import Path
 
-import pandas as pd
-
 try:
     from .omics_validation import normalize_alignment_paths, normalize_fastq_paths
 except ImportError:
@@ -30,6 +28,8 @@ def _feature_counts_sample_name(value):
 
 
 def _parse_feature_counts_output(counts_path, output_csv):
+    import pandas as pd
+
     frame = pd.read_csv(counts_path, sep='\t', comment='#')
     if frame.empty or 'Geneid' not in frame.columns:
         raise ValueError('featureCounts output is missing the Geneid column')

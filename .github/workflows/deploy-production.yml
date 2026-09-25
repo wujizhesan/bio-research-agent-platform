@@ -80,12 +80,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/release.yml
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
         run: |
           for image in "$BACKEND_IMAGE" "$FRONTEND_IMAGE"; do
             gh attestation verify "oci://${image}" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$SIGNER_WORKFLOW" \
               --source-ref "refs/tags/${RELEASE_TAG}" \
+              --source-digest "$SOURCE_COMMIT" \
               --deny-self-hosted-runners
           done
       - name: Verify release SBOM attestations
@@ -95,12 +97,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/release.yml
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
         run: |
           for image in "$BACKEND_IMAGE" "$FRONTEND_IMAGE"; do
             gh attestation verify "oci://${image}" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$SIGNER_WORKFLOW" \
               --source-ref "refs/tags/${RELEASE_TAG}" \
+              --source-digest "$SOURCE_COMMIT" \
               --predicate-type https://cyclonedx.org/bom \
               --deny-self-hosted-runners
           done
@@ -119,6 +123,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          ref: ${{ needs.verify.outputs.source_commit }}
       - name: Validate production connection settings
         env:
           DEPLOY_PATH: ${{ vars.PRODUCTION_DEPLOY_PATH }}
@@ -136,7 +141,7 @@ jobs:
           test -n "$SSH_KNOWN_HOSTS"
           [[ "$SSH_PORT" =~ ^[0-9]{1,5}$ ]]
           [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ ]]
-          [[ "$HEALTH_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]]
+          [[ "$HEALTH_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/health$ ]]
       - name: Configure SSH trust
         env:
           SSH_KNOWN_HOSTS: ${{ secrets.PRODUCTION_SSH_KNOWN_HOSTS }}
@@ -154,6 +159,7 @@ jobs:
           DEPLOY_PATH: ${{ vars.PRODUCTION_DEPLOY_PATH }}
           FRONTEND_IMAGE: ${{ needs.verify.outputs.frontend_image }}
           GIT_SHA: ${{ needs.verify.outputs.source_commit }}
+          HEALTH_URL: ${{ vars.PRODUCTION_API_HEALTH_URL }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           SSH_HOST: ${{ secrets.PRODUCTION_SSH_HOST }}
           SSH_PORT: ${{ vars.PRODUCTION_SSH_PORT }}
@@ -161,26 +167,67 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          printf 'BACKEND_IMAGE=%s\nFRONTEND_IMAGE=%s\nRELEASE_TAG=%s\nGIT_SHA=%s\n' \
-            "$BACKEND_IMAGE" "$FRONTEND_IMAGE" "$RELEASE_TAG" "$GIT_SHA" \
+          test "$(git rev-parse HEAD)" = "$GIT_SHA"
+          bundle_dir="release-bundles/${GIT_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          bundle_files=(
+            deploy_transaction.sh docker-compose.yml docker-compose.secure.yml docker-compose.deploy.yml
+            verify_public_deployment.py monitoring/prometheus.yml monitoring/alertmanager.yml
+            monitoring/storage-deletion-alerts.yml
+          )
+          bundle_digest=$(
+            for file in "${bundle_files[@]}"; do
+              source_file="$file"
+              if [[ "$file" == deploy_transaction.sh || "$file" == verify_public_deployment.py ]]; then
+                source_file="scripts/$file"
+              fi
+              printf '%s  %s\n' "$(sha256sum "$source_file" | cut -d ' ' -f 1)" "$file"
+            done | sha256sum | cut -d ' ' -f 1
+          )
+          script_digest=$(sha256sum scripts/deploy_transaction.sh | cut -d ' ' -f 1)
+          printf 'BACKEND_IMAGE=%s\nFRONTEND_IMAGE=%s\nRELEASE_TAG=%s\nGIT_SHA=%s\nRELEASE_BUNDLE_DIR=%s\nRELEASE_BUNDLE_SHA256=%s\n' \
+            "$BACKEND_IMAGE" "$FRONTEND_IMAGE" "$RELEASE_TAG" "$GIT_SHA" "$bundle_dir" "$bundle_digest" \
             > release-images.next.env
-          printf -v prepare_command 'mkdir -p %q' "$DEPLOY_PATH"
+          printf -v prepare_command 'mkdir -p %q %q' "$DEPLOY_PATH" "$DEPLOY_PATH/monitoring"
           ssh -i "$HOME/.ssh/id_deploy" -p "$SSH_PORT" \
             "$SSH_USER@$SSH_HOST" "$prepare_command"
+          printf -v stage_command 'mkdir -p %q && mkdir %q && mkdir %q' \
+            "$DEPLOY_PATH/release-bundles" "$DEPLOY_PATH/$bundle_dir" \
+            "$DEPLOY_PATH/$bundle_dir/monitoring"
+          ssh -i "$HOME/.ssh/id_deploy" -p "$SSH_PORT" \
+            "$SSH_USER@$SSH_HOST" "$stage_command"
           scp -i "$HOME/.ssh/id_deploy" -P "$SSH_PORT" \
             docker-compose.yml docker-compose.secure.yml docker-compose.deploy.yml \
-            scripts/deploy_transaction.sh release-images.next.env \
+            scripts/deploy_transaction.sh scripts/verify_public_deployment.py \
+            "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/$bundle_dir/"
+          scp -i "$HOME/.ssh/id_deploy" -P "$SSH_PORT" \
+            monitoring/prometheus.yml monitoring/alertmanager.yml \
+            monitoring/storage-deletion-alerts.yml \
+            "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/$bundle_dir/monitoring/"
+          script_path="$DEPLOY_PATH/$bundle_dir/deploy_transaction.sh"
+          printf -v bootstrap_command \
+            'cd %q && test %q = "$(sha256sum %q | cut -d " " -f 1)" && if test -f release-images.env && ! grep -Eq %q release-images.env; then bash %q %q %q --bootstrap-config; fi' \
+            "$DEPLOY_PATH" "$script_digest" "$script_path" \
+            '^RELEASE_CONFIG_VERSION=(2|3)$' "$script_path" "$DEPLOY_PATH" "$HEALTH_URL"
+          ssh -i "$HOME/.ssh/id_deploy" -p "$SSH_PORT" \
+            "$SSH_USER@$SSH_HOST" "$bootstrap_command"
+          scp -i "$HOME/.ssh/id_deploy" -P "$SSH_PORT" \
+            release-images.next.env \
             "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/"
       - name: Apply approved production deployment
         env:
           DEPLOY_PATH: ${{ vars.PRODUCTION_DEPLOY_PATH }}
+          GIT_SHA: ${{ needs.verify.outputs.source_commit }}
           HEALTH_URL: ${{ vars.PRODUCTION_API_HEALTH_URL }}
           SSH_HOST: ${{ secrets.PRODUCTION_SSH_HOST }}
           SSH_PORT: ${{ vars.PRODUCTION_SSH_PORT }}
           SSH_USER: ${{ secrets.PRODUCTION_SSH_USER }}
         run: |
           set -euo pipefail
-          printf -v remote_script '%q/deploy_transaction.sh' "$DEPLOY_PATH"
-          printf -v remote_command 'bash %s %q %q' "$remote_script" "$DEPLOY_PATH" "$HEALTH_URL"
+          bundle_dir="release-bundles/${GIT_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          script_path="$DEPLOY_PATH/$bundle_dir/deploy_transaction.sh"
+          script_digest=$(sha256sum scripts/deploy_transaction.sh | cut -d ' ' -f 1)
+          printf -v remote_command \
+            'test %q = "$(sha256sum %q | cut -d " " -f 1)" && bash %q %q %q' \
+            "$script_digest" "$script_path" "$script_path" "$DEPLOY_PATH" "$HEALTH_URL"
           ssh -i "$HOME/.ssh/id_deploy" -p "$SSH_PORT" \
             "$SSH_USER@$SSH_HOST" "$remote_command"

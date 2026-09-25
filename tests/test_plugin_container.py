@@ -1,13 +1,19 @@
 import hashlib
+import json
 import os
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock, Thread
+from time import monotonic, sleep
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import yaml
 
+from src.external_service_policy import ServiceRetryDeferredError
 from src.job_execution import (
     ExecutionLimits,
     JobExecutionCancelled,
@@ -82,6 +88,44 @@ class PluginContainerTests(unittest.TestCase):
             released.set()
             executor.shutdown()
 
+    def test_container_executor_routes_light_and_heavy_requests_and_cancellation(self):
+        light_calls = []
+        heavy_calls = []
+        executing = Event()
+        released = Event()
+
+        def light_transport(path, payload, _timeout):
+            light_calls.append((path, payload))
+            return {'ok': True, 'result': {'status': 'ok'}}
+
+        def heavy_transport(path, payload, _timeout):
+            heavy_calls.append((path, payload))
+            if path == '/v1/execute':
+                executing.set()
+                released.wait(2)
+                return {'ok': False, 'error': 'cancelled'}
+            released.set()
+            return {'ok': True}
+
+        executor = ContainerToolExecutor(
+            'http://plugin-sandbox:8081',
+            TOKEN,
+            limits=self.limits(),
+            transport=light_transport,
+            heavy_base_url='http://plugin-sandbox-heavy:8081',
+            heavy_transport=heavy_transport,
+        )
+        try:
+            executor.execute('omics_inspect_toolchain', {})
+            with self.assertRaises(JobExecutionCancelled):
+                executor.execute('demo_run', {}, cancelled=lambda: executing.is_set())
+        finally:
+            released.set()
+            executor.shutdown()
+        self.assertEqual([path for path, _ in light_calls], ['/v1/execute'])
+        self.assertEqual(heavy_calls[0][0], '/v1/execute')
+        self.assertTrue(heavy_calls[1][0].startswith('/v1/cancel/'))
+
     def test_container_executor_materializes_input_for_sandbox_and_cleans_workspace(self):
         content = b'gene,value\nTP53,12\n'
         digest = hashlib.sha256(content).hexdigest()
@@ -142,6 +186,64 @@ class PluginContainerTests(unittest.TestCase):
         finally:
             executor.shutdown()
 
+    def test_container_executor_transfers_only_contract_paths_and_publishes_output(self):
+        with tempfile.TemporaryDirectory(prefix='container_transfer_') as raw:
+            root = Path(raw)
+            inputs = root / 'inputs'
+            artifacts = root / 'artifacts'
+            exchange = root / 'exchange'
+            inputs.mkdir()
+            artifacts.mkdir()
+            source = inputs / 'sample.csv'
+            source.write_text('gene,value\nTP53,12\n', encoding='utf-8')
+            target = artifacts / 'result.csv'
+
+            def transport(_path, payload, _timeout):
+                staged_input = Path(payload['arguments']['input_path'])
+                staged_output = Path(payload['arguments']['output_path'])
+                self.assertTrue(staged_input.is_relative_to(exchange))
+                self.assertTrue(staged_output.is_relative_to(exchange))
+                self.assertNotIn(str(artifacts), str(payload['arguments']))
+                staged_output.write_text(
+                    staged_input.read_text(encoding='utf-8'),
+                    encoding='utf-8',
+                )
+                return {
+                    'ok': True,
+                    'result': {'output_path': str(staged_output)},
+                }
+
+            executor = ContainerToolExecutor(
+                'http://plugin-sandbox:8081',
+                TOKEN,
+                limits=self.limits(),
+                transport=transport,
+                input_workspace_root=exchange,
+                input_roots=(inputs,),
+                artifact_root=artifacts,
+            )
+            try:
+                with patch(
+                    'src.plugin_container._tool_filesystem_contract',
+                    return_value=(
+                        {'input_path'},
+                        {'output_path': 'file'},
+                        {'output_path'},
+                    ),
+                ):
+                    result = executor.execute('demo_run', {
+                        'input_path': str(source),
+                        'output_path': str(target),
+                    })
+            finally:
+                executor.shutdown()
+            self.assertEqual(result['output_path'], str(target.resolve()))
+            self.assertEqual(
+                target.read_text(encoding='utf-8'),
+                source.read_text(encoding='utf-8'),
+            )
+            self.assertEqual(list(exchange.iterdir()), [])
+
     def test_environment_reads_sandbox_token_from_secret_file(self):
         with tempfile.TemporaryDirectory() as raw:
             secret = Path(raw) / 'sandbox-token'
@@ -176,9 +278,296 @@ class PluginContainerTests(unittest.TestCase):
         executor.execute.assert_called_once()
         executor.shutdown.assert_called_once()
 
+    def test_sandbox_runs_four_lightweight_requests_together(self):
+        started = [Event() for _ in range(4)]
+        release = Event()
+        start_lock = Lock()
+        next_start = [0]
+
+        def make_executor():
+            executor = Mock()
+
+            def execute(_tool, _arguments, **_kwargs):
+                with start_lock:
+                    index = next_start[0]
+                    next_start[0] += 1
+                started[index].set()
+                self.assertTrue(release.wait(2))
+                return {'status': 'ok'}
+
+            executor.execute.side_effect = execute
+            return executor
+
+        with patch.dict(os.environ, {
+            'PLUGIN_SANDBOX_LIGHT_MEMORY_LIMIT_MB': '1024',
+            'PLUGIN_SANDBOX_MEMORY_BUDGET_MB': '4096',
+        }):
+            runtime = SandboxRuntime(executor_factory=make_executor, max_concurrency=4)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(runtime.execute, {
+                'request_id': chr(ord('a') + index) * 32,
+                'tool': 'omics_inspect_toolchain',
+                'arguments': {},
+            }) for index in range(4)]
+            try:
+                for event in started:
+                    self.assertTrue(event.wait(2))
+                self.assertEqual(runtime.active_count, 4)
+            finally:
+                release.set()
+            for future in futures:
+                self.assertTrue(future.result(timeout=2)['ok'])
+        self.assertEqual(runtime.active_count, 0)
+
+    def test_sandbox_pools_reject_wrong_workload(self):
+        executor = Mock()
+        executor.execute.return_value = {'status': 'ok'}
+        light = SandboxRuntime(executor_factory=lambda: executor, pool='light')
+        heavy = SandboxRuntime(executor_factory=lambda: executor, pool='heavy')
+        self.assertTrue(light.execute({
+            'request_id': 'a' * 32,
+            'tool': 'omics_inspect_toolchain',
+            'arguments': {},
+        })['ok'])
+        self.assertTrue(heavy.execute({
+            'request_id': 'b' * 32,
+            'tool': 'omics_run_analysis',
+            'arguments': {},
+        })['ok'])
+        with self.assertRaisesRegex(ValueError, 'heavy tool'):
+            light.execute({
+                'request_id': 'c' * 32,
+                'tool': 'omics_run_analysis',
+                'arguments': {},
+            })
+        with self.assertRaisesRegex(ValueError, 'light tool'):
+            heavy.execute({
+                'request_id': 'd' * 32,
+                'tool': 'omics_inspect_toolchain',
+                'arguments': {},
+            })
+        self.assertEqual(light.admitted_count, 1)
+        self.assertEqual(heavy.admitted_count, 1)
+
+    def test_sandbox_reserves_capacity_for_waiting_heavy_request(self):
+        light_started = Event()
+        heavy_started = Event()
+        second_light_started = Event()
+        release_light = Event()
+        release_heavy = Event()
+
+        def make_executor():
+            executor = Mock()
+
+            def execute(tool, _arguments, **_kwargs):
+                if tool == 'omics_run_analysis':
+                    heavy_started.set()
+                    self.assertTrue(release_heavy.wait(3))
+                elif not light_started.is_set():
+                    light_started.set()
+                    self.assertTrue(release_light.wait(3))
+                else:
+                    second_light_started.set()
+                return {'status': 'ok'}
+
+            executor.execute.side_effect = execute
+            return executor
+
+        runtime = SandboxRuntime(executor_factory=make_executor, max_concurrency=2)
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            first = pool.submit(runtime.execute, {
+                'request_id': 'a' * 32,
+                'tool': 'omics_inspect_toolchain',
+                'arguments': {},
+            })
+            self.assertTrue(light_started.wait(2))
+            heavy = pool.submit(runtime.execute, {
+                'request_id': 'b' * 32,
+                'tool': 'omics_run_analysis',
+                'arguments': {},
+            })
+            deadline = monotonic() + 2
+            while monotonic() < deadline:
+                with runtime._capacity:
+                    if runtime._waiting_exclusive:
+                        break
+                sleep(0.01)
+            else:
+                self.fail('heavy request did not enter the admission queue')
+            second = pool.submit(runtime.execute, {
+                'request_id': 'c' * 32,
+                'tool': 'omics_inspect_toolchain',
+                'arguments': {},
+            })
+            try:
+                self.assertFalse(heavy_started.is_set())
+                self.assertFalse(second_light_started.is_set())
+                release_light.set()
+                self.assertTrue(heavy_started.wait(2))
+                self.assertFalse(second_light_started.is_set())
+            finally:
+                release_light.set()
+                release_heavy.set()
+            self.assertTrue(first.result(timeout=2)['ok'])
+            self.assertTrue(heavy.result(timeout=2)['ok'])
+            self.assertTrue(second.result(timeout=2)['ok'])
+        self.assertTrue(second_light_started.is_set())
+        self.assertEqual(runtime.active_count, 0)
+
+    def test_sandbox_can_cancel_waiting_request(self):
+        started = Event()
+        release = Event()
+        executor = Mock()
+
+        def execute(_tool, _arguments, **_kwargs):
+            started.set()
+            self.assertTrue(release.wait(3))
+            return {'status': 'ok'}
+
+        executor.execute.side_effect = execute
+        runtime = SandboxRuntime(executor_factory=lambda: executor, max_concurrency=1)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(runtime.execute, {
+                'request_id': 'a' * 32,
+                'tool': 'omics_inspect_toolchain',
+                'arguments': {},
+            })
+            self.assertTrue(started.wait(2))
+            waiting = pool.submit(runtime.execute, {
+                'request_id': 'b' * 32,
+                'tool': 'omics_run_analysis',
+                'arguments': {},
+            })
+            deadline = monotonic() + 2
+            while monotonic() < deadline:
+                if runtime.cancel('b' * 32):
+                    break
+                sleep(0.01)
+            else:
+                self.fail('waiting request was not registered for cancellation')
+            with self.assertRaisesRegex(RuntimeError, 'cancelled'):
+                waiting.result(timeout=2)
+            release.set()
+            self.assertTrue(first.result(timeout=2)['ok'])
+        self.assertEqual(runtime.active_count, 0)
+
+    def test_large_knowledge_index_stays_exclusive(self):
+        with tempfile.TemporaryDirectory() as raw:
+            index = Path(raw) / 'large.json'
+            with index.open('wb') as handle:
+                handle.truncate(8 * 1024 * 1024 + 1)
+            self.assertFalse(SandboxRuntime._lightweight(
+                'knowledge_search', {'index_path': str(index)}
+            ))
+            self.assertTrue(SandboxRuntime._lightweight(
+                'knowledge_search', {'index_path': str(Path(__file__))}
+            ))
+
+    def test_sandbox_memory_budget_caps_parallel_admission(self):
+        with patch.dict(os.environ, {
+            'PLUGIN_SANDBOX_LIGHT_MEMORY_LIMIT_MB': '2048',
+            'PLUGIN_SANDBOX_MEMORY_BUDGET_MB': '4096',
+        }):
+            runtime = SandboxRuntime(max_concurrency=8)
+        self.assertEqual(runtime.max_concurrency, 2)
+
+    def test_sandbox_limits_memory_of_lightweight_children(self):
+        with patch.dict(os.environ, {
+            'JOB_MEMORY_LIMIT_MB': '4096',
+            'PLUGIN_SANDBOX_LIGHT_MEMORY_LIMIT_MB': '2048',
+        }):
+            with patch('src.plugin_sandbox_server.ProcessToolExecutor') as factory:
+                factory.return_value.execute.return_value = {'status': 'ok'}
+                runtime = SandboxRuntime(max_concurrency=2)
+                runtime.execute({
+                    'request_id': 'a' * 32,
+                    'tool': 'omics_inspect_toolchain',
+                    'arguments': {},
+                })
+                light_limit = factory.call_args.args[0].memory_limit_mb
+                runtime.execute({
+                    'request_id': 'b' * 32,
+                    'tool': 'omics_run_analysis',
+                    'arguments': {},
+                })
+                heavy_limit = factory.call_args.args[0].memory_limit_mb
+        self.assertEqual(light_limit, 2048)
+        self.assertEqual(heavy_limit, 4096)
+
     def test_sandbox_server_requires_strong_shared_token(self):
         with self.assertRaisesRegex(ValueError, 'at least 32'):
             create_server('127.0.0.1', 0, 'short')
+
+    def test_sandbox_server_hides_internal_execution_errors(self):
+        executor = Mock()
+        executor.execute.side_effect = RuntimeError(
+            'token=secret-value /srv/private/input.fastq'
+        )
+        runtime = SandboxRuntime(executor_factory=lambda: executor)
+        server = create_server('127.0.0.1', 0, TOKEN, runtime=runtime)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        payload = json.dumps({
+            'request_id': 'a' * 32,
+            'tool': 'research_catalog',
+            'arguments': {},
+        }).encode('utf-8')
+        request = Request(
+            f'http://127.0.0.1:{server.server_port}/v1/execute',
+            data=payload,
+            headers={
+                'Authorization': f'Bearer {TOKEN}',
+                'Content-Type': 'application/json',
+            },
+            method='POST',
+        )
+        try:
+            with self.assertRaises(HTTPError) as raised:
+                urlopen(request, timeout=5)
+            response = json.loads(raised.exception.read().decode('utf-8'))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        self.assertEqual(raised.exception.code, 500)
+        self.assertEqual(response, {
+            'ok': False,
+            'error_code': 'sandbox_execution_failed',
+            'error': 'plugin execution failed',
+        })
+        self.assertNotIn('secret-value', str(response))
+        self.assertNotIn('/srv/private', str(response))
+
+    def test_sandbox_preserves_deferred_retry_metadata(self):
+        worker = Mock()
+        worker.execute.side_effect = ServiceRetryDeferredError('uniprot', 45, 429)
+        with tempfile.TemporaryDirectory(prefix='deferred_sandbox_') as raw:
+            server = create_server(
+                '127.0.0.1', 0, TOKEN,
+                runtime=SandboxRuntime(
+                    executor_factory=lambda: worker,
+                    workspace_root=raw,
+                ),
+            )
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            executor = ContainerToolExecutor(
+                f'http://127.0.0.1:{server.server_port}',
+                TOKEN,
+                limits=self.limits(),
+                input_workspace_root=raw,
+            )
+            try:
+                with self.assertRaises(ServiceRetryDeferredError) as raised:
+                    executor.execute('demo_run', {})
+            finally:
+                executor.shutdown()
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+        self.assertEqual(raised.exception.service, 'uniprot')
+        self.assertEqual(raised.exception.retry_after_seconds, 45)
+        self.assertEqual(raised.exception.status_code, 429)
 
     def test_secure_compose_has_container_and_scanner_boundaries(self):
         root = Path(__file__).resolve().parent.parent
@@ -187,10 +576,14 @@ class PluginContainerTests(unittest.TestCase):
         )
         services = compose['services']
         sandbox = services['plugin-sandbox']
+        heavy_sandbox = services['plugin-sandbox-heavy']
         self.assertTrue(sandbox['read_only'])
         self.assertEqual(sandbox['cap_drop'], ['ALL'])
         self.assertIn('no-new-privileges:true', sandbox['security_opt'])
         self.assertEqual(sandbox['networks'], ['plugin_control'])
+        self.assertEqual(heavy_sandbox['networks'], ['plugin_control'])
+        self.assertEqual(heavy_sandbox['environment']['PLUGIN_SANDBOX_POOL'], 'heavy')
+        self.assertEqual(sandbox['environment']['PLUGIN_SANDBOX_POOL'], 'light')
         self.assertNotIn('ports', sandbox)
         self.assertEqual(
             services['worker']['environment']['JOB_EXECUTION_MODE'],
@@ -198,7 +591,23 @@ class PluginContainerTests(unittest.TestCase):
         )
         self.assertEqual(
             services['worker']['environment']['JOB_INPUT_WORKSPACE_ROOT'],
-            '/app/output/.job-inputs',
+            '/run/bioagent/plugin-exchange',
+        )
+        self.assertIn('SECURE_WORKER_MAX_CONCURRENCY:-4}', services['worker']['environment']['WORKER_MAX_CONCURRENCY'])
+        self.assertIn('SECURE_WORKER_LIGHT_RESERVED_SLOTS:-3}', services['worker']['environment']['WORKER_LIGHT_RESERVED_SLOTS'])
+        self.assertIn('SECURE_WORKER_TOTAL_CPU_CORES:-4}', services['worker']['environment']['JOB_TOTAL_CPU_CORES'])
+        self.assertIn('SECURE_PLUGIN_SANDBOX_CLIENT_CONCURRENCY:-4}', services['worker']['environment']['PLUGIN_SANDBOX_CLIENT_CONCURRENCY'])
+        self.assertEqual(
+            services['worker']['environment']['PLUGIN_SANDBOX_HEAVY_URL'],
+            'http://plugin-sandbox-heavy:8081',
+        )
+        self.assertIn(':-4}', sandbox['environment']['PLUGIN_SANDBOX_MAX_CONCURRENCY'])
+        self.assertIn(':-1024}', sandbox['environment']['PLUGIN_SANDBOX_LIGHT_MEMORY_LIMIT_MB'])
+        self.assertIn(':-4096}', sandbox['environment']['PLUGIN_SANDBOX_MEMORY_BUDGET_MB'])
+        self.assertNotIn('./output:/app/output:rw', sandbox['volumes'])
+        self.assertIn(
+            'plugin_exchange:/run/bioagent/plugin-exchange:rw',
+            sandbox['volumes'],
         )
         self.assertNotIn('ports', services['clamav'])
         self.assertTrue(compose['networks']['malware_scan']['internal'])

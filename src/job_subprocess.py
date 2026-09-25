@@ -1,11 +1,14 @@
 """Subprocess entry point for a single isolated research job."""
 
+from time import monotonic_ns, perf_counter
+
+_MODULE_ENTRY_NS = monotonic_ns()
+
 import json
 import math
 import os
 from pathlib import Path
 import sys
-from time import perf_counter
 import traceback
 
 try:
@@ -14,6 +17,14 @@ try:
 except ImportError:
     from observability import bind_context
     from run_context import bind_run_context
+
+
+def _retry_deferred_error(exc):
+    try:
+        from .external_service_policy import ServiceRetryDeferredError
+    except ImportError:
+        from external_service_policy import ServiceRetryDeferredError
+    return isinstance(exc, ServiceRetryDeferredError)
 
 
 def _apply_posix_limits(limits):
@@ -37,21 +48,51 @@ def main(argv=None):
         raise SystemExit('usage: job_subprocess.py REQUEST_PATH RESPONSE_PATH')
     request_path, response_path = map(Path, args)
     request = {}
-    started = perf_counter()
+    started_ns = monotonic_ns()
+    registry_import_seconds = None
+    tool_run_seconds = None
     try:
         request = json.loads(request_path.read_text(encoding='utf-8'))
         _apply_posix_limits(request.get('limits', {}))
-        try:
-            from .domain_registry import run_tool
-        except ImportError:
-            from domain_registry import run_tool
+        execution_domain = request.get('execution_domain')
+        if execution_domain in {'knowledge', 'literature', 'omics'}:
+            os.environ['BIO_AGENT_EXECUTION_DOMAIN'] = execution_domain
+        else:
+            os.environ.pop('BIO_AGENT_EXECUTION_DOMAIN', None)
+        registry_started = perf_counter()
+        descriptor = request.get('scoped_tool')
+        scoped_tool = None
+        if descriptor is None:
+            try:
+                from .domain_registry import run_tool
+            except ImportError:
+                from domain_registry import run_tool
+        else:
+            try:
+                from .scoped_tool_runtime import resolve_scoped_tool, run_scoped_tool
+            except ImportError:
+                from scoped_tool_runtime import resolve_scoped_tool, run_scoped_tool
+            scoped_tool = resolve_scoped_tool(request['tool'], descriptor)
+        registry_import_seconds = perf_counter() - registry_started
         context = (
             bind_run_context(request['run_context'])
             if request.get('run_context')
             else bind_context(**request.get('observability', {}))
         )
         with context:
-            result = run_tool(request['tool'], request.get('arguments', {}))
+            tool_started = perf_counter()
+            try:
+                if descriptor is None:
+                    result = run_tool(request['tool'], request.get('arguments', {}))
+                else:
+                    result = run_scoped_tool(
+                        request['tool'],
+                        request.get('arguments', {}),
+                        descriptor,
+                        resolved=scoped_tool,
+                    )
+            finally:
+                tool_run_seconds = perf_counter() - tool_started
         payload = {'ok': True, 'result': result}
         exit_code = 0
     except BaseException as exc:
@@ -61,12 +102,16 @@ def main(argv=None):
             'type': exc.__class__.__name__,
             'traceback': traceback.format_exc(limit=20),
         }
+        if _retry_deferred_error(exc):
+            payload.update(exc.as_payload())
+            payload['error'] = 'external service requested retry later'
         exit_code = 1
     tool = str(request.get('tool') or 'unknown')
     result_status = (
         payload.get('result', {}).get('status')
         if isinstance(payload.get('result'), dict) else None
     )
+    finished_ns = monotonic_ns()
     payload['telemetry'] = {
         'domain': tool.split('_', 1)[0] if '_' in tool else 'unknown',
         'tool': tool,
@@ -75,7 +120,14 @@ def main(argv=None):
             if not payload.get('ok') or result_status in {'error', 'failed', 'missing', 'not_found'}
             else 'success'
         ),
-        'duration_seconds': perf_counter() - started,
+        'duration_seconds': (finished_ns - started_ns) / 1_000_000_000,
+        'registry_import_seconds': registry_import_seconds,
+        'tool_run_seconds': tool_run_seconds,
+        'process_clock_ns': {
+            'module_entry': _MODULE_ENTRY_NS,
+            'execution_start': started_ns,
+            'execution_finished': finished_ns,
+        },
     }
     encoded = json.dumps(payload, ensure_ascii=False, default=str)
     max_result_bytes = int(request.get('limits', {}).get('max_result_bytes') or 0)

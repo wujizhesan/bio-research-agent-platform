@@ -21,6 +21,11 @@ tools/vina_1.2.7_linux_x86_64
 # 密钥
 config.local.yaml
 .env
+.env.production
+release-images*.env
+release-bundles/
+.release-bootstrap.*
+.release-candidate.*
 
 # 面试准备材料(仅本地学习,不公开)
 INTERVIEW_GUIDE.md

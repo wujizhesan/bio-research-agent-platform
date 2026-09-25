@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 
-ALLOWED_OPERATIONS = {"add_column", "create_index", "create_table"}
+ALLOWED_OPERATIONS = {"add_column", "create_index", "create_table", "execute"}
 
 
 def operation_name(call):
@@ -39,6 +39,81 @@ def validate_added_column(call, path, violations):
             )
 
 
+def static_string(node, constants):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return constants.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = static_string(node.left, constants)
+        right = static_string(node.right, constants)
+        return left + right if left is not None and right is not None else None
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "format"
+    ):
+        template = static_string(node.func.value, constants)
+        if template is None or node.args:
+            return None
+        values = {}
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                return None
+            value = static_string(keyword.value, constants)
+            if value is None:
+                return None
+            values[keyword.arg] = value
+        try:
+            return template.format(**values)
+        except (KeyError, ValueError):
+            return None
+    return None
+
+
+def validate_execute(call, path, violations, constants):
+    if not call.args:
+        violations.append(f"{path}:{call.lineno}: execute cannot be statically validated")
+        return
+    statement = call.args[0]
+    if (
+        isinstance(statement, ast.Call)
+        and isinstance(statement.func, ast.Attribute)
+        and statement.func.attr == "text"
+        and statement.args
+    ):
+        statement = statement.args[0]
+    statement_value = static_string(statement, constants)
+    if statement_value is None:
+        violations.append(f"{path}:{call.lineno}: execute must use static SQL")
+        return
+    sql = " ".join(statement_value.strip().rstrip(";").split()).upper()
+    is_security_expansion = (
+        sql.startswith("CREATE EXTENSION IF NOT EXISTS ")
+        or sql.startswith("CREATE EXTENSION ")
+        or sql.startswith("CREATE POLICY ")
+        or sql.startswith("CREATE FUNCTION ")
+        or sql.startswith("CREATE OR REPLACE FUNCTION ")
+        or sql.startswith("ALTER POLICY ")
+        or sql.startswith("GRANT ")
+        or sql.startswith("REVOKE ")
+        or (
+            sql.startswith("ALTER TABLE ")
+            and (
+                sql.endswith(" ENABLE ROW LEVEL SECURITY")
+                or sql.endswith(" FORCE ROW LEVEL SECURITY")
+            )
+        )
+    )
+    if (
+        not sql.startswith(("INSERT INTO ", "UPDATE "))
+        and not is_security_expansion
+    ) or ";" in sql:
+        violations.append(
+            f"{path}:{call.lineno}: execute only permits one backfill or additive security statement"
+        )
+
+
 def check_migration(path):
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(path))
@@ -49,6 +124,15 @@ def check_migration(path):
     ]
     if len(upgrades) != 1:
         return [f"{path}: expected exactly one upgrade function"]
+    constants = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if isinstance(target, ast.Name):
+            value = static_string(node.value, constants)
+            if value is not None:
+                constants[target.id] = value
     violations = []
     for node in ast.walk(upgrades[0]):
         if not isinstance(node, ast.Call):
@@ -63,6 +147,8 @@ def check_migration(path):
             continue
         if operation == "add_column":
             validate_added_column(node, path, violations)
+        elif operation == "execute":
+            validate_execute(node, path, violations, constants)
     return violations
 
 

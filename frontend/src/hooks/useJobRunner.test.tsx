@@ -1,5 +1,5 @@
 import { act, renderHook } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { apiFetch, followJob } from '../app/api'
 import type { Job } from '../app/types'
 import { useJobRunner } from './useJobRunner'
@@ -29,6 +29,10 @@ describe('useJobRunner', () => {
     showReportPreview.mockClear()
     vi.mocked(apiFetch).mockReset()
     vi.mocked(followJob).mockReset()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
   })
 
   it('提交任务后接收 SSE 终态并刷新任务列表', async () => {
@@ -70,6 +74,35 @@ describe('useJobRunner', () => {
     expect(refresh).toHaveBeenCalledOnce()
   })
 
+  it('把重连和轮询状态记录到执行轨迹', async () => {
+    const queued = job('queued')
+    const completed = job('completed')
+    vi.mocked(apiFetch).mockResolvedValue({ job: queued })
+    vi.mocked(followJob).mockImplementation(async (_base, _token, _jobId, onEvent, _signal, onConnectionState) => {
+      onConnectionState?.('reconnecting')
+      onConnectionState?.('connected')
+      onConnectionState?.('polling')
+      onEvent('job', { job: completed })
+    })
+    const { result } = renderHook(() => useJobRunner({
+      apiBase: 'https://api.example.test',
+      token: 'secret',
+      selectedProjectId: 'project-1',
+      refresh,
+      upsertJob,
+      setError,
+      showReportPreview,
+    }))
+
+    await act(() => result.current.submitToolJob('sequence_workbench', {}, '任务已接收'))
+
+    expect(result.current.events.map((event) => event.type)).toEqual([
+      'accepted', 'reconnecting', 'connected', 'polling', 'job',
+    ])
+    expect(result.current.events.find((event) => event.type === 'polling')?.detail).toContain('定期查询')
+    expect(result.current.connectionMode).toBe('idle')
+  })
+
   it('取消运行任务后同步任务和事件状态', async () => {
     const running = job('running')
     const cancelled = job('cancelled')
@@ -98,7 +131,7 @@ describe('useJobRunner', () => {
     const { result } = renderHook(() => useJobRunner({
       apiBase: 'https://api.example.test',
       token: 'secret',
-      selectedProjectId: '',
+      selectedProjectId: 'project-1',
       refresh,
       upsertJob,
       setError,
@@ -111,5 +144,70 @@ describe('useJobRunner', () => {
     expect(upsertJob).not.toHaveBeenCalled()
     expect(setError).toHaveBeenCalledWith('任务响应格式无效')
     expect(refresh).toHaveBeenCalledOnce()
+  })
+
+  it('未选择项目时阻止任务提交', async () => {
+    const { result } = renderHook(() => useJobRunner({
+      apiBase: 'https://api.example.test',
+      token: 'secret',
+      selectedProjectId: '',
+      refresh,
+      upsertJob,
+      setError,
+      showReportPreview,
+    }))
+
+    await act(() => result.current.submitToolJob('sequence_workbench', {}, '任务已接收'))
+
+    expect(apiFetch).not.toHaveBeenCalled()
+    expect(setError).toHaveBeenCalledWith('请先创建或选择项目')
+    expect(result.current.loading).toBe(false)
+  })
+
+  it('只把真实 HTML artifact 交给沙箱预览', async () => {
+    const report = new Blob(['<main>report</main>'], { type: 'text/html; charset=utf-8' })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      headers: new Headers({ 'Content-Disposition': 'attachment; filename="report.html"' }),
+      blob: vi.fn().mockResolvedValue(report),
+    }))
+    const { result } = renderHook(() => useJobRunner({
+      apiBase: 'https://api.example.test',
+      token: 'secret',
+      selectedProjectId: 'project-1',
+      refresh,
+      upsertJob,
+      setError,
+      showReportPreview,
+    }))
+
+    await act(() => result.current.previewJobArtifact('job-1', 'report.html'))
+
+    expect(showReportPreview).toHaveBeenCalledWith(report, 'report.html')
+    const request = vi.mocked(fetch).mock.calls[0][1]
+    expect(request?.credentials).toBe('include')
+    expect(new Headers(request?.headers).get('Authorization')).toBe('Bearer secret')
+  })
+
+  it('拒绝伪装成 HTML 文件名的非 HTML artifact', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      headers: new Headers({ 'Content-Disposition': 'attachment; filename="report.html"' }),
+      blob: vi.fn().mockResolvedValue(new Blob(['plain'], { type: 'text/plain' })),
+    }))
+    const { result } = renderHook(() => useJobRunner({
+      apiBase: 'https://api.example.test',
+      token: 'secret',
+      selectedProjectId: 'project-1',
+      refresh,
+      upsertJob,
+      setError,
+      showReportPreview,
+    }))
+
+    await act(() => result.current.previewJobArtifact('job-1', 'report.html'))
+
+    expect(showReportPreview).not.toHaveBeenCalled()
+    expect(setError).toHaveBeenCalledWith(expect.stringContaining('仅允许预览 HTML 报告'))
   })
 })

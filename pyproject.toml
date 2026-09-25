@@ -82,11 +82,17 @@ bio-agent-reproduce = "reproducibility:main"
 bio-agent-mcp = "mcp_server:main"
 bio-agent-api = "fastapi_app:main"
 bio-agent-eval = "research_evaluator:main"
+bio-agent-dispatcher = "dispatcher:main"
+bio-agent-artifact-gc = "artifact_recovery:main"
+bio-agent-artifact-backfill = "artifact_backfill:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 py-modules = [
   "agent",
+  "artifact_store",
+  "artifact_recovery",
+  "artifact_backfill",
   "api_a2a_routes",
   "api_contracts",
   "api_dependencies",
@@ -101,9 +107,13 @@ py-modules = [
   "compare_benchmarks",
   "config_loader",
   "database",
+  "dispatcher",
   "domain_registry",
   "dock_vina",
   "evidence_providers",
+  "execution_identity",
+  "execution_semantics",
+  "external_service_policy",
   "fetch_bindingdb_egfr",
   "fetch_chembl_egfr",
   "audit_log",
@@ -122,6 +132,7 @@ py-modules = [
   "literature_plugin",
   "library_data",
   "mcp_server",
+  "metrics_backend",
   "ml_predictor",
   "omics_agent",
   "omics_external_runtime",
@@ -156,11 +167,15 @@ py-modules = [
   "research_evaluator",
   "research_planner",
   "research_workflow_builder",
+  "request_limits",
   "resource_scheduling",
   "resplit_external",
   "run_benchmark_replicates",
+  "sandbox_workload",
+  "scoped_tool_runtime",
   "sequence_plugin",
   "sequence_builtin",
+  "settings",
   "streamlit_chat",
   "storage_workspace",
   "visualize",
@@ -169,10 +184,13 @@ py-modules = [
   "redis_job_metrics",
   "redis_job_recovery",
   "redis_job_store",
+  "queue_timing",
   "redis_job_worker",
+  "redis_worker_registry",
   "job_state_store",
   "tool_contracts",
   "worker",
+  "worker_health",
   "workflow_runner",
   "workflow_checkpoint",
 ]

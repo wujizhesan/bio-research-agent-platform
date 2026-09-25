@@ -9,11 +9,9 @@ from threading import RLock
 
 try:
     from .config_loader import PROJECT_ROOT
-    from .plugin_health import assess_plugin_health, validate_candidate
     from .observability import PLUGIN_HEALTH, log_event
 except ImportError:
     from config_loader import PROJECT_ROOT
-    from plugin_health import assess_plugin_health, validate_candidate
     from observability import PLUGIN_HEALTH, log_event
 
 
@@ -166,6 +164,10 @@ class PluginManager:
             raise ValueError(f'plugin is unavailable: {domain}')
         health = None
         if enabled:
+            try:
+                from .plugin_health import assess_plugin_health
+            except ImportError:
+                from plugin_health import assess_plugin_health
             health = assess_plugin_health(
                 domain,
                 self.source_loader(domain),
@@ -207,6 +209,10 @@ class PluginManager:
         return self.set_enabled(domain, False)
 
     def validate_candidate(self, manifest):
+        try:
+            from .plugin_health import validate_candidate
+        except ImportError:
+            from plugin_health import validate_candidate
         return validate_candidate(manifest)
 
     def _record_health(self, domain, health, auto_disable):
@@ -241,6 +247,10 @@ class PluginManager:
         return current
 
     def check_health(self, domain=None, auto_disable=True):
+        try:
+            from .plugin_health import assess_plugin_health
+        except ImportError:
+            from plugin_health import assess_plugin_health
         catalog = self._catalog_map()
         if domain is not None and domain not in catalog:
             raise ValueError(f'unknown plugin domain: {domain}')
@@ -275,5 +285,9 @@ class PluginManager:
 
 
 def is_domain_enabled(domain, state_path=None, catalog_loader=None):
-    item = PluginManager(state_path=state_path, catalog_loader=catalog_loader).get(domain)
+    manager = PluginManager(state_path=state_path, catalog_loader=catalog_loader)
+    if catalog_loader is None and domain in {'knowledge', 'literature', 'omics'}:
+        record = manager._read_state()['plugins'].get(domain, {})
+        return bool(record.get('enabled', True)) and not record.get('quarantined', False)
+    item = manager.get(domain)
     return True if item is None else bool(item.get('enabled', True))
