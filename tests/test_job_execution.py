@@ -8,7 +8,8 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from threading import Event, enumerate as enumerate_threads
+from unittest.mock import Mock, patch
 
 from src.job_execution import (
     ExecutionLimits,
@@ -385,6 +386,38 @@ class JobExecutionTests(unittest.TestCase):
         self.assertEqual(result['observability']['trace_id'], 'process-trace')
         self.assertEqual(result['observability']['job_id'], 'process-job')
 
+    def test_process_completion_wakes_before_next_heartbeat_interval(self):
+        heartbeat = Event()
+        waiters_before = set(enumerate_threads())
+        with tempfile.TemporaryDirectory(prefix='job_execution_') as raw:
+            executor = self._executor(raw, poll_interval_seconds=5, timeout_seconds=10)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                try:
+                    future = pool.submit(
+                        executor.execute,
+                        'tool',
+                        {'sleep': 0.1, 'value': 42},
+                        heartbeat=heartbeat.set,
+                    )
+                    self.assertTrue(heartbeat.wait(2))
+                    self.assertEqual(future.result(timeout=2)['value'], 42)
+                finally:
+                    executor.shutdown()
+        self.assertFalse(executor._active_processes)
+        self.assertFalse([
+            thread for thread in set(enumerate_threads()) - waiters_before
+            if thread.name == 'tool-process-wait'
+        ])
+
+    def test_process_executor_renews_heartbeat_while_waiting(self):
+        heartbeat = Mock()
+        with tempfile.TemporaryDirectory(prefix='job_execution_') as raw:
+            result = self._executor(raw).execute(
+                'tool', {'sleep': 0.1, 'value': 42}, heartbeat=heartbeat,
+            )
+        self.assertEqual(result['value'], 42)
+        self.assertGreaterEqual(heartbeat.call_count, 2)
+
     def test_process_executor_materializes_and_cleans_versioned_input(self):
         content = b'gene,value\nTP53,12\n'
         digest = hashlib.sha256(content).hexdigest()
@@ -430,9 +463,11 @@ class JobExecutionTests(unittest.TestCase):
 
     def test_process_executor_enforces_timeout(self):
         with tempfile.TemporaryDirectory(prefix='job_execution_') as raw:
-            executor = self._executor(raw, timeout_seconds=0.1)
+            executor = self._executor(raw, timeout_seconds=0.1, poll_interval_seconds=5)
+            started = time.monotonic()
             with self.assertRaisesRegex(JobExecutionTimedOut, '0.1 seconds'):
                 executor.execute('tool', {'sleep': 5})
+            self.assertLess(time.monotonic() - started, 2)
 
     def test_process_executor_propagates_run_context(self):
         with tempfile.TemporaryDirectory(prefix='job_execution_') as raw:

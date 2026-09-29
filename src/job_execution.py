@@ -7,10 +7,11 @@ import re
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import Future, wait
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event, Lock
-from time import monotonic, monotonic_ns, sleep
+from threading import Event, Lock, Thread
+from time import monotonic, monotonic_ns
 
 try:
     from .external_service_policy import (
@@ -357,6 +358,13 @@ class _WindowsJob:
             self.handle = None
 
 
+def _complete_process(process, completion):
+    try:
+        completion.set_result(process.wait())
+    except BaseException as exc:
+        completion.set_exception(exc)
+
+
 class ProcessToolExecutor:
     mode = 'process'
 
@@ -476,10 +484,19 @@ class ProcessToolExecutor:
                         self._stop(process)
                         raise JobExecutionCancelled('tool executor is shutting down')
                     self._active_processes.add(process)
+                process_waiter = None
                 try:
                     if process.poll() is None:
                         windows_job = _WindowsJob(process, self.limits)
-                    while process.poll() is None:
+                    completion = Future()
+                    process_waiter = Thread(
+                        target=_complete_process,
+                        args=(process, completion),
+                        name='tool-process-wait',
+                        daemon=True,
+                    )
+                    process_waiter.start()
+                    while not completion.done():
                         now = monotonic()
                         if cancelled and cancelled():
                             self._stop(process)
@@ -494,7 +511,13 @@ class ProcessToolExecutor:
                             )
                         if heartbeat:
                             heartbeat()
-                        sleep(self.limits.poll_interval_seconds)
+                        wait_seconds = self.limits.poll_interval_seconds
+                        if self.limits.timeout_seconds:
+                            wait_seconds = min(wait_seconds, max(
+                                self.limits.timeout_seconds - (monotonic() - started), 0
+                            ))
+                        wait((completion,), timeout=wait_seconds)
+                    completion.result()
                     if self._shutdown.is_set():
                         raise JobExecutionCancelled('tool executor is shutting down')
                 except Exception:
@@ -505,6 +528,8 @@ class ProcessToolExecutor:
                         self._active_processes.discard(process)
                     if windows_job is not None:
                         windows_job.close()
+                    if process_waiter is not None and process_waiter.ident is not None:
+                        process_waiter.join(timeout=self.limits.terminate_grace_seconds)
             process_end_ns = monotonic_ns()
             process_elapsed_seconds = (
                 process_end_ns - spawn_started_ns

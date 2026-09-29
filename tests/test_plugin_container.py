@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from threading import Event, Lock, Thread
 from time import monotonic, sleep
@@ -17,6 +18,7 @@ from src.external_service_policy import ServiceRetryDeferredError
 from src.job_execution import (
     ExecutionLimits,
     JobExecutionCancelled,
+    JobExecutionTimedOut,
     build_tool_executor_from_env,
 )
 from src.plugin_container import ContainerToolExecutor
@@ -58,6 +60,82 @@ class PluginContainerTests(unittest.TestCase):
         self.assertEqual(calls[0][0], '/v1/execute')
         self.assertEqual(calls[0][1]['tool'], 'demo_run')
         self.assertEqual(calls[0][1]['limits']['memory_limit_mb'], 512)
+
+    def test_container_completion_wakes_before_next_heartbeat_interval(self):
+        heartbeat = Event()
+        released = Event()
+
+        def transport(_path, _payload, _timeout):
+            released.wait(10)
+            return {'ok': True, 'result': {'status': 'ok', 'value': 7}}
+
+        executor = ContainerToolExecutor(
+            'http://plugin-sandbox:8081', TOKEN,
+            limits=replace(self.limits(), poll_interval_seconds=5, timeout_seconds=10),
+            transport=transport,
+        )
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                future = pool.submit(
+                    executor.execute, 'demo_run', {}, heartbeat=heartbeat.set,
+                )
+                self.assertTrue(heartbeat.wait(2))
+                released.set()
+                self.assertEqual(future.result(timeout=2)['value'], 7)
+            finally:
+                released.set()
+                executor.shutdown()
+
+    def test_container_executor_renews_heartbeat_while_waiting(self):
+        released = Event()
+        heartbeats = []
+
+        def heartbeat():
+            heartbeats.append(monotonic())
+            if len(heartbeats) == 3:
+                released.set()
+
+        def transport(_path, _payload, _timeout):
+            released.wait(2)
+            return {'ok': True, 'result': {'status': 'ok'}}
+
+        executor = ContainerToolExecutor(
+            'http://plugin-sandbox:8081', TOKEN,
+            limits=self.limits(), transport=transport,
+        )
+        try:
+            self.assertEqual(executor.execute('demo_run', {}, heartbeat=heartbeat)['status'], 'ok')
+            self.assertGreaterEqual(len(heartbeats), 3)
+        finally:
+            released.set()
+            executor.shutdown()
+
+    def test_container_timeout_is_not_delayed_by_heartbeat_interval(self):
+        released = Event()
+        calls = []
+
+        def transport(path, _payload, _timeout):
+            calls.append(path)
+            if path == '/v1/execute':
+                released.wait(5)
+                return {'ok': False, 'error': 'cancelled'}
+            released.set()
+            return {'ok': True}
+
+        executor = ContainerToolExecutor(
+            'http://plugin-sandbox:8081', TOKEN,
+            limits=replace(self.limits(), timeout_seconds=0.1, poll_interval_seconds=5),
+            transport=transport,
+        )
+        started = monotonic()
+        try:
+            with self.assertRaises(JobExecutionTimedOut):
+                executor.execute('demo_run', {})
+            self.assertLess(monotonic() - started, 2)
+            self.assertTrue(any(path.startswith('/v1/cancel/') for path in calls))
+        finally:
+            released.set()
+            executor.shutdown()
 
     def test_container_executor_propagates_cancellation(self):
         executing = Event()

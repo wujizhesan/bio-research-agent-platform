@@ -4,10 +4,10 @@ import json
 import os
 import re
 import shutil
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from threading import Event, Lock
-from time import monotonic, sleep
+from time import monotonic
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import uuid4
@@ -441,7 +441,12 @@ class ContainerToolExecutor:
                     )
                 if heartbeat:
                     heartbeat()
-                sleep(self.limits.poll_interval_seconds)
+                wait_seconds = self.limits.poll_interval_seconds
+                if self.limits.timeout_seconds:
+                    wait_seconds = min(wait_seconds, max(
+                        self.limits.timeout_seconds - (monotonic() - started), 0
+                    ))
+                wait((future,), timeout=wait_seconds)
             response = future.result()
         finally:
             with self._active_lock:
