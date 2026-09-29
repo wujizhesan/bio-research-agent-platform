@@ -74,6 +74,13 @@ class FakeS3Client:
             raise KeyError(ExtraArgs['VersionId'])
         Path(filename).write_bytes(item['content'])
 
+    def download_fileobj(self, bucket, key, fileobj, ExtraArgs=None):
+        item = self.objects[(bucket, key)]
+        if ExtraArgs and ExtraArgs.get('VersionId') != item['version_id']:
+            raise KeyError(ExtraArgs['VersionId'])
+        for offset in range(0, len(item['content']), 3):
+            fileobj.write(item['content'][offset:offset + 3])
+
     def delete_object(self, Bucket, Key, VersionId=None, ExpectedBucketOwner=None):
         item = self.objects[(Bucket, Key)]
         if VersionId is not None and VersionId != item['version_id']:
