@@ -1,5 +1,6 @@
 """Durable publication for generated job artifacts."""
 
+from contextlib import suppress
 from dataclasses import dataclass
 import gzip
 import hashlib
@@ -70,31 +71,58 @@ def _reject_symlinks(path):
         raise StorageIntegrityError('artifact publication rejects symbolic links')
 
 
+class _ArchiveChecksumWriter:
+    def __init__(self, handle):
+        self.handle = handle
+        self.digest = hashlib.sha256()
+        self.size_bytes = 0
+
+    def write(self, data):
+        written = self.handle.write(data)
+        if written != len(data):
+            raise StorageIntegrityError('artifact archive write was incomplete')
+        if written:
+            self.digest.update(data)
+            self.size_bytes += written
+        return written
+
+    def flush(self):
+        self.handle.flush()
+
+
 def _archive_directory(source, target, root_name):
     source = Path(source)
-    with target.open('wb') as raw:
-        with gzip.GzipFile(fileobj=raw, mode='wb', filename='', mtime=0) as compressed:
-            with tarfile.open(
-                fileobj=compressed,
-                mode='w',
-                format=tarfile.PAX_FORMAT,
-            ) as archive:
-                entries = [source, *sorted(source.rglob('*'))]
-                for entry in entries:
-                    relative = entry.relative_to(source)
-                    arcname = Path(root_name) / relative
-                    info = archive.gettarinfo(str(entry), arcname.as_posix())
-                    info.uid = 0
-                    info.gid = 0
-                    info.uname = ''
-                    info.gname = ''
-                    info.mtime = 0
-                    info.mode = 0o755 if entry.is_dir() else 0o644
-                    if entry.is_file():
-                        with entry.open('rb') as handle:
-                            archive.addfile(info, handle)
-                    else:
-                        archive.addfile(info)
+    raw = target.open('wb')
+    try:
+        with raw:
+            writer = _ArchiveChecksumWriter(raw)
+            with gzip.GzipFile(fileobj=writer, mode='wb', filename='', mtime=0) as compressed:
+                with tarfile.open(
+                    fileobj=compressed,
+                    mode='w',
+                    format=tarfile.PAX_FORMAT,
+                ) as archive:
+                    entries = [source, *sorted(source.rglob('*'))]
+                    for entry in entries:
+                        relative = entry.relative_to(source)
+                        arcname = Path(root_name) / relative
+                        info = archive.gettarinfo(str(entry), arcname.as_posix())
+                        info.uid = 0
+                        info.gid = 0
+                        info.uname = ''
+                        info.gname = ''
+                        info.mtime = 0
+                        info.mode = 0o755 if entry.is_dir() else 0o644
+                        if entry.is_file():
+                            with entry.open('rb') as handle:
+                                archive.addfile(info, handle)
+                        else:
+                            archive.addfile(info)
+    except Exception:
+        with suppress(OSError):
+            target.unlink(missing_ok=True)
+        raise
+    return writer.digest.hexdigest(), writer.size_bytes
 
 
 def _artifact_id(context, parameter, index):
@@ -283,10 +311,11 @@ class S3ArtifactStore:
         content_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
         if staged.is_dir():
             packaged = staged.parent / f'.{artifact_id}.tar.gz'
-            _archive_directory(staged, packaged, target.name)
+            sha256, size = _archive_directory(staged, packaged, target.name)
             upload_path = packaged
             content_type = 'application/gzip'
-        sha256, size = _sha256(upload_path)
+        else:
+            sha256, size = _sha256(upload_path)
         if size < 1:
             if packaged is not None:
                 _remove(packaged)

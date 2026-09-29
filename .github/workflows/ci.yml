@@ -449,6 +449,12 @@ jobs:
             exec -T plugin-sandbox python -m scripts.benchmark_storage_materialization \
             --samples 16 --sizes-mib 1,16,64 --workspace-root /run/bioagent/plugin-exchange \
             > output/storage-materialization-benchmark.json
+      - name: Compare streaming checksums for directory artifact archives
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml \
+            exec -T plugin-sandbox python -m scripts.benchmark_artifact_archiving \
+            --samples 16 --sizes-mib 1,16 --workspace-root /run/bioagent/plugin-exchange \
+            > output/artifact-archiving-benchmark.json
       - name: Capture secure job latency baseline
         run: |
           python -m scripts.benchmark_secure_jobs \
@@ -619,6 +625,7 @@ jobs:
             output/knowledge-index-benchmark.json
             output/contract-validation-benchmark.json
             output/storage-materialization-benchmark.json
+            output/artifact-archiving-benchmark.json
             output/secure-fullstack-e2e
             output/monitoring-smoke
           if-no-files-found: ignore
