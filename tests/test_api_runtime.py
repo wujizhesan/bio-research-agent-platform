@@ -1,7 +1,8 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 from src.api_runtime import ApiRuntime, _build_jobs, build_api_runtime
 
@@ -137,6 +138,26 @@ class ApiRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pipeline.required)
         self.assertEqual(pipeline.clamav.host, 'clamav')
         self.assertIsNotNone(pipeline.cdr)
+
+    async def test_runtime_closes_its_listener_for_an_injected_postgres_database(self):
+        database = FakeDatabase()
+        database.url = 'postgresql+asyncpg://api@db/research'
+        listener = Mock(close=AsyncMock())
+        runtime = ApiRuntime(
+            jobs=FakeJobs(), plugins=object(), database=database,
+            storage=FakeStorage(), audit=object(), auth=object(),
+            login_rate_limiter=FakeRateLimiter(), job_backend='redis',
+            storage_backend='local', owns_jobs=False, owns_database=False,
+        )
+        app = SimpleNamespace(state=SimpleNamespace())
+        with patch('src.api_runtime.JobEventListener', return_value=listener) as factory:
+            async with runtime.lifespan(app):
+                self.assertIs(app.state.job_event_listener, listener)
+                listener.start.assert_called_once()
+        factory.assert_called_once_with(database.url)
+        listener.close.assert_awaited_once()
+        self.assertIsNone(app.state.job_event_listener)
+        self.assertFalse(database.closed)
 
     async def test_owned_runtime_closes_resources_after_lifespan(self):
         jobs = FakeJobs()

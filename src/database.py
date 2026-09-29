@@ -20,6 +20,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
+try:
+    from .job_event_notifications import JOB_EVENT_CHANNEL, job_event_key
+except ImportError:
+    from job_event_notifications import JOB_EVENT_CHANNEL, job_event_key
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TERMINAL_STATUSES = {'completed', 'failed', 'cancelled', 'indeterminate'}
@@ -1148,9 +1153,18 @@ class Database:
         values_list = list(values_by_key.values())
         if self.url.startswith('postgresql'):
             statement = postgres_insert(JobEventRow).values(values_list)
-            await session.execute(statement.on_conflict_do_nothing(
+            inserted = await session.execute(statement.on_conflict_do_nothing(
                 index_elements=[JobEventRow.job_id, JobEventRow.revision],
-            ))
+            ).returning(JobEventRow.job_id))
+            keys = [job_event_key(job_id) for job_id in set(inserted.scalars())]
+            if keys:
+                await session.execute(
+                    text(
+                        'SELECT pg_notify(:channel, event_key) '
+                        'FROM unnest(CAST(:keys AS text[])) AS events(event_key)'
+                    ),
+                    {'channel': JOB_EVENT_CHANNEL, 'keys': keys},
+                )
             return
         for values in values_list:
             existing = await session.get(JobEventRow, {

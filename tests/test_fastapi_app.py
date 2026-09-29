@@ -18,6 +18,7 @@ import src.fastapi_app as fastapi_module
 from src.audit_log import AuditLogger
 from src.auth import AuthService
 from src.database import Database, JobOutboxRow
+from src.job_event_notifications import JobEventListener, job_event_key
 from src.fastapi_app import create_app
 from src.file_storage import LocalFileStorage, StoredFile
 from src.job_manager import JobManager
@@ -875,6 +876,75 @@ class FastApiAppTests(unittest.TestCase):
             finally:
                 self._close_app(app)
 
+    def test_redis_sse_keeps_a_commit_notification_arriving_during_database_lookup(self):
+        with tempfile.TemporaryDirectory(prefix='fastapi_commit_wake_') as raw:
+            manager = RedisReplayJobManager()
+            database = Database(
+                f"sqlite+aiosqlite:///{(Path(raw) / 'api.sqlite3').as_posix()}"
+            )
+            asyncio.run(database.init_schema())
+            record = {
+                'job_id': 'commit-wake-job',
+                'tool': 'research_catalog',
+                'status': 'running',
+                'created_at': '2026-09-29T00:00:00+00:00',
+                '_revision': 1,
+            }
+            asyncio.run(database.upsert_job(record))
+            listener = JobEventListener('postgresql://unused/research')
+            listener.ready.set()
+            subscribe = listener.subscribe
+
+            def checked_subscribe(job_id):
+                wake = subscribe(job_id)
+                wait = wake.wait
+
+                async def checked_wait():
+                    self.assertTrue(wake.is_set(), 'notification was lost during lookup')
+                    return await wait()
+
+                wake.wait = checked_wait
+                return wake
+
+            listener.subscribe = checked_subscribe
+            reads = 0
+
+            async def read_events(*_args, **_kwargs):
+                nonlocal reads
+                reads += 1
+                if reads == 2:
+                    listener._notify(None, 1, None, job_event_key('commit-wake-job'))
+                    return []
+                terminal = reads > 2
+                return [{
+                    'revision': 2 if terminal else 1,
+                    'event_id': '2000-0' if terminal else '1000-0',
+                    'terminal': terminal,
+                    'job': {**record, 'status': 'completed' if terminal else 'running'},
+                }]
+
+            database.list_job_events = read_events
+            app = create_app(
+                job_manager=manager,
+                plugin_manager=PluginManager(state_path=Path(raw) / 'plugins.json'),
+                database=database,
+                audit_log=AuditLogger(Path(raw) / 'audit.jsonl'),
+            )
+            app.state.job_event_listener = listener
+            try:
+                with TestClient(app) as client:
+                    with client.stream(
+                        'GET', '/api/v1/jobs/commit-wake-job/events?interval_seconds=5',
+                    ) as events:
+                        body = ''.join(events.iter_text())
+                self.assertIn('id: r-2', body)
+                self.assertIn('"status": "completed"', body)
+                self.assertEqual(reads, 3)
+                self.assertEqual(manager.cursors, [])
+                self.assertEqual(listener._subscribers, {})
+            finally:
+                self._close_app(app)
+
     def test_redis_sse_replays_running_job_after_stream_loss(self):
         class RedisDisconnectedJobManager(RedisLostEventJobManager):
             def read_job_events(self, *_args, **_kwargs):
@@ -984,6 +1054,9 @@ class FastApiAppTests(unittest.TestCase):
                     database=database,
                     audit_log=AuditLogger(Path(raw) / 'audit.jsonl'),
                 )
+                listener = JobEventListener('postgresql://unused/research')
+                listener.ready.set()
+                app.state.job_event_listener = listener
                 try:
                     with TestClient(app) as client:
                         token_response = client.post('/api/v1/auth/token', data={
@@ -1005,6 +1078,7 @@ class FastApiAppTests(unittest.TestCase):
                     self.assertIn('event: access_revoked', body)
                     self.assertIn('"status": "access_revoked"', body)
                     self.assertGreaterEqual(membership_checks, 2)
+                    self.assertEqual(listener._subscribers, {})
                 finally:
                     self._close_app(app)
 

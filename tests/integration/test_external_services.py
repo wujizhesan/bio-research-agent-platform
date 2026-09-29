@@ -30,6 +30,7 @@ from scripts.configure_tenant_context import (
     configure as configure_tenant_context,
 )
 from src.job_execution import InlineToolExecutor
+from src.job_event_notifications import JobEventListener
 from src.job_state_store import DatabaseDispatchSource, DatabaseStateWriter
 from src.redis_job_manager import RedisJobManager
 
@@ -114,6 +115,70 @@ class ExternalServiceTests(unittest.TestCase):
                 await cleanup.execute(
                     text('DELETE FROM projects WHERE project_id = :project_id'),
                     {'project_id': project_id},
+                )
+            await owner.close()
+
+    def test_job_event_notifications_follow_commit_and_ignore_rollback_and_duplicates(self):
+        asyncio.run(self._job_event_notifications_follow_commit())
+
+    async def _job_event_notifications_follow_commit(self):
+        owner = Database(os.environ['DATABASE_URL'])
+        api = Database(os.environ['API_DATABASE_URL'])
+        listener = JobEventListener(os.environ['API_DATABASE_URL'])
+        project_id = f'event-notify-{uuid4().hex}'
+        job_id = uuid4().hex
+        wake = listener.subscribe(job_id)
+        created_at = '2026-09-29T00:00:00+00:00'
+        record = {
+            'job_id': job_id,
+            'project_id': project_id,
+            'tool': 'research_catalog',
+            'status': 'running',
+            'created_at': created_at,
+            '_revision': 2,
+        }
+        listener.start()
+        try:
+            await asyncio.wait_for(listener.ready.wait(), 3)
+            await owner.create_project(project_id, 'Event notification', None, 'alice', created_at)
+            set_database_principal(Principal('alice', ('researcher',), 'jwt'))
+            await api.stage_job({**record, 'status': 'queued', '_revision': 1}, project_id=project_id)
+            await asyncio.wait_for(wake.wait(), 2)
+            wake.clear()
+            async with api.sessions() as session:
+                await api._persist_job_events(session, [record])
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(wake.wait(), 0.05)
+                self.assertEqual(
+                    [event['revision'] for event in await api.list_job_events(job_id)], [1]
+                )
+                await session.rollback()
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(wake.wait(), 0.05)
+            async with api.sessions() as session:
+                await api._persist_job_events(session, [record])
+                await session.commit()
+            await asyncio.wait_for(wake.wait(), 2)
+            self.assertEqual(
+                [event['revision'] for event in await api.list_job_events(job_id)], [1, 2]
+            )
+            wake.clear()
+            async with api.sessions() as session:
+                await api._persist_job_events(session, [record])
+                await session.commit()
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(wake.wait(), 0.05)
+        finally:
+            listener.unsubscribe(job_id, wake)
+            await listener.close()
+            set_database_principal()
+            await api.close()
+            async with owner.engine.begin() as cleanup:
+                await cleanup.execute(
+                    text('DELETE FROM job_records WHERE job_id = :job_id'), {'job_id': job_id}
+                )
+                await cleanup.execute(
+                    text('DELETE FROM projects WHERE project_id = :project_id'), {'project_id': project_id}
                 )
             await owner.close()
 

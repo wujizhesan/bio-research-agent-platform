@@ -222,6 +222,11 @@ jobs:
           uv run --no-sync python scripts/configure_tenant_context.py --enable
       - name: Test real PostgreSQL and Redis
         run: uv run --no-sync python -m pytest tests/integration/test_external_services.py -q
+      - name: Compare committed SSE event delivery
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_job_event_delivery \
+            --samples 16 --commit-delays-ms 20,80 > output/job-event-delivery-benchmark.json
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
@@ -302,6 +307,7 @@ jobs:
           path: |
             output/ci-fullstack-*.log
             output/ci-fullstack-health.json
+            output/job-event-delivery-benchmark.json
             frontend/playwright-report
             frontend/test-results
           if-no-files-found: ignore

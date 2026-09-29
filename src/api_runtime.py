@@ -12,6 +12,7 @@ try:
     from .file_storage import LocalFileStorage, S3FileStorage
     from .job_manager import JobManager
     from .job_execution import build_tool_executor_from_env, job_max_workers_from_env
+    from .job_event_notifications import JobEventListener
     from .plugin_manager import PluginManager
     from .redis_job_manager import RedisJobManager
     from .settings import PlatformSettings
@@ -23,6 +24,7 @@ except ImportError:
     from file_storage import LocalFileStorage, S3FileStorage
     from job_manager import JobManager
     from job_execution import build_tool_executor_from_env, job_max_workers_from_env
+    from job_event_notifications import JobEventListener
     from plugin_manager import PluginManager
     from redis_job_manager import RedisJobManager
     from settings import PlatformSettings
@@ -46,6 +48,7 @@ class ApiRuntime:
     def bind(self, app):
         app.state.job_manager = self.jobs
         app.state.job_backend = self.job_backend
+        app.state.job_event_listener = None
         app.state.plugin_manager = self.plugins
         app.state.database = self.database
         app.state.file_storage = self.storage
@@ -59,9 +62,18 @@ class ApiRuntime:
     @asynccontextmanager
     async def lifespan(self, _app):
         await self.database.init_schema()
+        listener = None
+        database_url = getattr(self.database, 'url', '')
+        if self.job_backend == 'redis' and database_url.startswith('postgresql'):
+            listener = JobEventListener(database_url)
+            _app.state.job_event_listener = listener
+            listener.start()
         try:
             yield
         finally:
+            if listener is not None:
+                await listener.close()
+                _app.state.job_event_listener = None
             if self.owns_jobs:
                 self.jobs.shutdown()
             try:

@@ -580,6 +580,11 @@ def _register_job_event_routes(
                     subscriber = subscribe(job_id)
 
         async def stream():
+            durable_listener = getattr(app.state, 'job_event_listener', None)
+            durable_wake = (
+                durable_listener.subscribe(job_id)
+                if durable_mode and durable_listener is not None else None
+            )
             last_signature = None
             event_cursor = last_event_id or query_last_event_id or '0-0'
             if not durable_mode and event_cursor.startswith('r-'):
@@ -596,6 +601,8 @@ def _register_job_event_routes(
             next_access_check = monotonic() + 1.0
             try:
                 while True:
+                    if durable_wake is not None:
+                        durable_wake.clear()
                     now = monotonic()
                     if now >= next_access_check:
                         try:
@@ -745,6 +752,18 @@ def _register_job_event_routes(
                                 return
                         else:
                             yield ': keep-alive\n\n'
+                        if durable_wake is not None and durable_listener.ready.is_set():
+                            wait_seconds = max(0, min(
+                                1.0, next_access_check - monotonic(),
+                                deadline - monotonic(),
+                            ))
+                            try:
+                                await asyncio.wait_for(
+                                    durable_wake.wait(), timeout=wait_seconds
+                                )
+                            except asyncio.TimeoutError:
+                                pass
+                            continue
                         if pending_durable_until > monotonic():
                             await asyncio.sleep(min(
                                 max(interval_seconds, 0.2),
@@ -940,6 +959,8 @@ def _register_job_event_routes(
                     if subscriber is None and event_reader is None:
                         await asyncio.sleep(interval_seconds)
             finally:
+                if durable_wake is not None:
+                    durable_listener.unsubscribe(job_id, durable_wake)
                 if subscriber is not None:
                     await asyncio.to_thread(subscriber.close)
 
