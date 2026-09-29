@@ -9,7 +9,6 @@ from pathlib import Path
 from urllib.parse import quote
 from uuid import uuid4
 
-import pandas as pd
 import requests
 
 try:
@@ -136,6 +135,8 @@ class LocalEvidenceProvider:
         self.evidence_csv = str(evidence_csv)
 
     def search(self, gene_ids):
+        import pandas as pd
+
         evidence = pd.read_csv(self.evidence_csv)
         required = {'gene_id', 'source', 'title', 'evidence'}
         missing = required - set(evidence.columns)

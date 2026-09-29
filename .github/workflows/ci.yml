@@ -417,6 +417,11 @@ jobs:
           docker compose -f docker-compose.yml -f docker-compose.secure.yml \
             exec -T plugin-sandbox python -m scripts.benchmark_isolated_imports \
             --samples 16 > output/isolated-import-benchmark.json
+      - name: Compare evidence provider import costs on the same sandbox host
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml \
+            exec -T plugin-sandbox python -m scripts.benchmark_isolated_imports \
+            --profile evidence --samples 16 > output/evidence-import-benchmark.json
       - name: Compare executor completion waits on the same sandbox host
         run: |
           docker compose -f docker-compose.yml -f docker-compose.secure.yml \
@@ -587,6 +592,7 @@ jobs:
             output/heavy-light-resources.json
             output/worker-slot-benchmark.json
             output/isolated-import-benchmark.json
+              output/evidence-import-benchmark.json
               output/executor-completion-benchmark.json
             output/secure-fullstack-e2e
             output/monitoring-smoke

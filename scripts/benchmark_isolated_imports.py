@@ -16,6 +16,13 @@ IMPORTS = {
         'import src.job_subprocess; import src.scoped_tool_runtime'
     ),
 }
+IMPORT_PROFILES = {
+    'runtime': IMPORTS,
+    'evidence': {
+        'lazy': 'import src.evidence_providers; import sys; assert "pandas" not in sys.modules',
+        'eager': 'import pandas; import src.evidence_providers',
+    },
+}
 
 
 def measure(source, env):
@@ -36,15 +43,16 @@ def measure(source, env):
     return elapsed
 
 
-def benchmark(samples):
+def benchmark(samples, profile='runtime'):
     env = {**os.environ, 'BIO_AGENT_ISOLATED_TOOL_CHILD': '1'}
-    for source in IMPORTS.values():
+    imports = IMPORT_PROFILES[profile]
+    for source in imports.values():
         measure(source, env)
-    timings = {name: [] for name in IMPORTS}
+    timings = {name: [] for name in imports}
     for index in range(samples):
-        order = tuple(IMPORTS) if index % 2 == 0 else tuple(reversed(IMPORTS))
+        order = tuple(imports) if index % 2 == 0 else tuple(reversed(imports))
         for name in order:
-            timings[name].append(measure(IMPORTS[name], env))
+            timings[name].append(measure(imports[name], env))
     summary = {
         name: {
             'median_seconds': round(median(values), 4),
@@ -62,16 +70,18 @@ def benchmark(samples):
         ),
         'paired_samples': samples,
     }
+    summary['profile'] = profile
     return summary
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--samples', type=int, default=16)
+    parser.add_argument('--profile', choices=tuple(IMPORT_PROFILES), default='runtime')
     args = parser.parse_args(argv)
     if args.samples < 2:
         parser.error('samples must be at least two')
-    print(json.dumps(benchmark(args.samples), sort_keys=True))
+    print(json.dumps(benchmark(args.samples, args.profile), sort_keys=True))
 
 
 if __name__ == '__main__':
