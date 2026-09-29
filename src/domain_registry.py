@@ -7,7 +7,7 @@ from importlib.metadata import entry_points
 from time import perf_counter
 from types import SimpleNamespace
 
-from jsonschema import ValidationError, validate
+from jsonschema import ValidationError
 
 _EXECUTION_DOMAIN = os.environ.get('BIO_AGENT_EXECUTION_DOMAIN')
 _SCOPED_DOMAIN = (
@@ -32,6 +32,7 @@ try:
         from . import sequence_plugin as SEQUENCE_PLUGIN
     from .plugin_registry import DomainRegistry, validate_tool_map
     from .plugin_manifest import build_manifest, validate_install_candidate
+    from .tool_contracts import validate_contract as validate
     from .external_service_policy import ServiceRetryDeferredError
     from .observability import (
         TOOL_ACTIVE,
@@ -68,6 +69,7 @@ except ImportError:
         import sequence_plugin as SEQUENCE_PLUGIN
     from plugin_registry import DomainRegistry, validate_tool_map
     from plugin_manifest import build_manifest, validate_install_candidate
+    from tool_contracts import validate_contract as validate
     from external_service_policy import ServiceRetryDeferredError
     from observability import (
         TOOL_ACTIVE,

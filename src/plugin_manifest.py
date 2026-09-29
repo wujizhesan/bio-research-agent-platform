@@ -4,12 +4,12 @@ from importlib.metadata import PackageNotFoundError, version as package_version
 import json
 import re
 
-from jsonschema.validators import validator_for
 from packaging.requirements import InvalidRequirement, Requirement
 
 try:
     from .execution_semantics import normalize_artifact_contracts, normalize_execution_semantics
     from .resource_scheduling import ResourceRequest
+    from .tool_contracts import contract_validator
     from .plugin_security import (
         normalize_permissions,
         permission_grant_report,
@@ -19,6 +19,7 @@ try:
 except ImportError:
     from execution_semantics import normalize_artifact_contracts, normalize_execution_semantics
     from resource_scheduling import ResourceRequest
+    from tool_contracts import contract_validator
     from plugin_security import (
         normalize_permissions,
         permission_grant_report,
@@ -51,7 +52,7 @@ def validate_json_schema(schema, label):
     if not isinstance(schema, dict):
         raise ValueError(f'{label} must be a JSON Schema mapping')
     try:
-        validator_for(schema).check_schema(schema)
+        contract_validator(schema)
     except Exception as exc:
         raise ValueError(f'invalid {label}: {exc}') from exc
     return schema

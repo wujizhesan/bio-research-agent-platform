@@ -432,6 +432,11 @@ jobs:
           docker compose -f docker-compose.yml -f docker-compose.secure.yml \
             exec -T plugin-sandbox python -m scripts.benchmark_knowledge_index \
             --samples 8 --sizes 8,64,512 > output/knowledge-index-benchmark.json
+      - name: Compare reusable plugin contract validators
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml \
+            exec -T plugin-sandbox python -m scripts.benchmark_contract_validation \
+            --samples 16 --iterations 25 > output/contract-validation-benchmark.json
       - name: Capture secure job latency baseline
         run: |
           python -m scripts.benchmark_secure_jobs \
@@ -600,6 +605,7 @@ jobs:
             output/evidence-import-benchmark.json
             output/executor-completion-benchmark.json
             output/knowledge-index-benchmark.json
+            output/contract-validation-benchmark.json
             output/secure-fullstack-e2e
             output/monitoring-smoke
           if-no-files-found: ignore

@@ -27,6 +27,7 @@ try:
     )
     from .run_context import current_run_context
     from .storage_workspace import materialize_storage_references
+    from .tool_contracts import validate_contract
 except ImportError:
     from external_service_policy import (
         ServiceRetryDeferredError,
@@ -41,6 +42,7 @@ except ImportError:
     )
     from run_context import current_run_context
     from storage_workspace import materialize_storage_references
+    from tool_contracts import validate_contract
 
 
 _PUBLIC_EXECUTION_MESSAGES = {
@@ -142,10 +144,10 @@ def _scoped_builtin_descriptor(spec):
 
 
 def _validate_scoped_result(tool, result, spec):
-    from jsonschema import ValidationError, validate
+    from jsonschema import ValidationError
 
     try:
-        validate(instance=result, schema=spec.get('returns') or {})
+        validate_contract(instance=result, schema=spec.get('returns') or {})
     except ValidationError as exc:
         reason = f'output contract violation for {tool}: {exc.message}'
         try:
@@ -424,7 +426,7 @@ class ProcessToolExecutor:
                 client=self.storage_client,
             )
             if descriptor is not None:
-                from jsonschema import ValidationError, validate
+                from jsonschema import ValidationError
 
                 resolved_arguments = json.loads(json.dumps(
                     resolved_arguments, ensure_ascii=False, default=str
@@ -435,7 +437,7 @@ class ProcessToolExecutor:
                         'error': 'tool arguments must be an object',
                     }
                 try:
-                    validate(
+                    validate_contract(
                         instance=resolved_arguments,
                         schema=spec['parameters'],
                     )
