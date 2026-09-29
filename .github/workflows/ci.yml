@@ -427,6 +427,11 @@ jobs:
           docker compose -f docker-compose.yml -f docker-compose.secure.yml \
             exec -T plugin-sandbox python -m scripts.benchmark_executor_completion \
             --samples 16 > output/executor-completion-benchmark.json
+      - name: Compare precomputed knowledge indexes at multiple corpus sizes
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml \
+            exec -T plugin-sandbox python -m scripts.benchmark_knowledge_index \
+            --samples 8 --sizes 8,64,512 > output/knowledge-index-benchmark.json
       - name: Capture secure job latency baseline
         run: |
           python -m scripts.benchmark_secure_jobs \
@@ -592,8 +597,9 @@ jobs:
             output/heavy-light-resources.json
             output/worker-slot-benchmark.json
             output/isolated-import-benchmark.json
-              output/evidence-import-benchmark.json
-              output/executor-completion-benchmark.json
+            output/evidence-import-benchmark.json
+            output/executor-completion-benchmark.json
+            output/knowledge-index-benchmark.json
             output/secure-fullstack-e2e
             output/monitoring-smoke
           if-no-files-found: ignore
