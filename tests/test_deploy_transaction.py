@@ -338,17 +338,21 @@ exit "${VERIFY_EXIT:-0}"
                 self.assertIn("image and release-state fields", result.stderr)
                 self.assertFalse(log.exists())
 
-    def test_rejects_duplicate_postgres_images_before_running_compose(self):
-        with tempfile.TemporaryDirectory() as directory:
-            deploy, log, environment = self.prepare(directory)
-            candidate = deploy / "release-images.next.env"
-            candidate.write_text(
-                candidate.read_text(encoding="utf-8") + "POSTGRES_IMAGE=unverified-image\n",
-                encoding="utf-8",
-            )
-            result = self.run_deploy(deploy, environment)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertFalse(log.exists())
+    def test_rejects_ambiguous_images_before_running_compose(self):
+        for name in ("BACKEND_IMAGE", "FRONTEND_IMAGE", "POSTGRES_IMAGE"):
+            for invalid in ("duplicate", "empty"):
+                with self.subTest(name=name, invalid=invalid), tempfile.TemporaryDirectory() as directory:
+                    deploy, log, environment = self.prepare(directory)
+                    candidate = deploy / "release-images.next.env"
+                    lines = candidate.read_text(encoding="utf-8").splitlines()
+                    if invalid == "duplicate":
+                        lines.append(f"{name}=unverified-image")
+                    else:
+                        lines = [f"{name}=" if line.startswith(f"{name}=") else line for line in lines]
+                    candidate.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    result = self.run_deploy(deploy, environment)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(log.exists())
 
     def test_rollback_preserves_previous_postgres_image(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -29,8 +29,8 @@ environment_value() {
   local name=$2
   local value
   value=$(sed -n "s/^${name}=//p" "$path")
-  test -n "$value"
-  test "$(grep -c "^${name}=" "$path")" -eq 1
+  test -n "$value" || return 1
+  test "$(grep -c "^${name}=" "$path")" -eq 1 || return 1
   printf '%s' "$value"
 }
 
