@@ -324,6 +324,32 @@ exit "${VERIFY_EXIT:-0}"
             self.assertIn("backend-image-override next-backend", commands)
             self.assertIn("rollback completed", result.stderr)
 
+    def test_rejects_image_overrides_in_production_config(self):
+        for name in ("BACKEND_IMAGE", "FRONTEND_IMAGE", "POSTGRES_IMAGE"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                deploy, log, environment = self.prepare(directory)
+                config = deploy / ".env.production"
+                config.write_text(
+                    config.read_text(encoding="utf-8") + f"{name}=unverified-image\n",
+                    encoding="utf-8",
+                )
+                result = self.run_deploy(deploy, environment)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("image and release-state fields", result.stderr)
+                self.assertFalse(log.exists())
+
+    def test_rejects_duplicate_postgres_images_before_running_compose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory)
+            candidate = deploy / "release-images.next.env"
+            candidate.write_text(
+                candidate.read_text(encoding="utf-8") + "POSTGRES_IMAGE=unverified-image\n",
+                encoding="utf-8",
+            )
+            result = self.run_deploy(deploy, environment)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(log.exists())
+
     def test_rollback_preserves_previous_postgres_image(self):
         with tempfile.TemporaryDirectory() as directory:
             deploy, log, environment = self.prepare(

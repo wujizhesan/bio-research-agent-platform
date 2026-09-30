@@ -124,7 +124,10 @@ write_release_state() {
   local backend_image frontend_image postgres_image release_tag git_sha bundle_digest secret_name expected_bundle_digest
   backend_image=$(environment_value "$image_path" BACKEND_IMAGE)
   frontend_image=$(environment_value "$image_path" FRONTEND_IMAGE)
-  postgres_image=$(environment_value "$image_path" POSTGRES_IMAGE 2>/dev/null || true)
+  postgres_image=
+  if grep -q '^POSTGRES_IMAGE=' "$image_path"; then
+    postgres_image=$(environment_value "$image_path" POSTGRES_IMAGE)
+  fi
   release_tag=$(environment_value "$image_path" RELEASE_TAG)
   git_sha=$(environment_value "$image_path" GIT_SHA)
   bundle_digest=$(release_bundle_digest "$bundle_path")
@@ -280,7 +283,7 @@ if grep -Eq '^(POSTGRES_PASSWORD|CADD_JWT_SECRET|RLS_CONTEXT_SIGNING_KEY|PLUGIN_
   echo "production secrets must be supplied through *_FILE" >&2
   exit 1
 fi
-if grep -Eq '^(BACKEND_IMAGE|FRONTEND_IMAGE|RELEASE_TAG|GIT_SHA|RELEASE_CONFIG_VERSION|RELEASE_BUNDLE_DIR|RELEASE_BUNDLE_SHA256|MONITORING_CONFIG_DIR|[A-Z0-9_]+_SHA256)=' .env.production; then
+if grep -Eq '^(BACKEND_IMAGE|FRONTEND_IMAGE|POSTGRES_IMAGE|RELEASE_TAG|GIT_SHA|RELEASE_CONFIG_VERSION|RELEASE_BUNDLE_DIR|RELEASE_BUNDLE_SHA256|MONITORING_CONFIG_DIR|[A-Z0-9_]+_SHA256)=' .env.production; then
   echo "image and release-state fields must not be set in .env.production" >&2
   exit 1
 fi
