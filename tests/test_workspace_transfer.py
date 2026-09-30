@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import stat
 import tempfile
+from time import sleep
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -69,7 +70,7 @@ class WorkspaceTransferTests(unittest.TestCase):
                         dst.write(src.read(1))
                         raise KeyboardInterrupt('cancel') if phase == 'interrupt' else OSError('copy failed')
 
-                    selected = 'shutil.copystat' if phase == 'metadata' else '_copy_file_data'
+                    selected = '_copy_file_metadata' if phase == 'metadata' else '_copy_file_data'
                     kwargs = {'side_effect': OSError('metadata failed')} if phase == 'metadata' else {'side_effect': fail_copy}
                     with patch('src.workspace_transfer.' + selected, **kwargs):
                         with self.assertRaises(KeyboardInterrupt if phase == 'interrupt' else OSError):
@@ -194,13 +195,14 @@ class WorkspaceTransferTests(unittest.TestCase):
                 file = source / 'nested' / 'file'
                 file.write_bytes(b'data')
                 manifest = WorkspaceTransfer.capture(source)
-                original = shutil.copystat
+                original = transfer._copy_file_metadata
                 changed = []
 
                 def mutate_metadata(src, dst, *args, **kwargs):
                     result = original(src, dst, *args, **kwargs)
                     if Path(src) == file and not changed:
                         changed.append(True)
+                        sleep(0.02)
                         if mutation == 'new-entry':
                             (source / 'nested' / 'new').write_bytes(b'new')
                         elif mutation == 'delete-entry':
@@ -213,8 +215,8 @@ class WorkspaceTransferTests(unittest.TestCase):
                             (source / 'nested').mkdir()
                     return result
 
-                with patch('src.workspace_transfer.shutil.copystat', side_effect=mutate_metadata):
-                    with self.assertRaises(JobExecutionError):
+                with patch('src.workspace_transfer._copy_file_metadata', side_effect=mutate_metadata):
+                    with self.assertRaises((JobExecutionError, OSError)):
                         manifest.copy(root / 'target')
                 self.assertFalse((root / 'target').exists())
 
@@ -345,6 +347,10 @@ class WorkspaceTransferTests(unittest.TestCase):
         from io import BytesIO
 
         class Reader(BytesIO):
+            def readinto(self, buffer):
+                self.asserted_counts.append(len(buffer))
+                return super().readinto(buffer)
+
             def read(self, count=-1):
                 self.asserted_counts.append(count)
                 return super().read(count)
@@ -357,6 +363,40 @@ class WorkspaceTransferTests(unittest.TestCase):
                 transfer._copy_file_data(source, output, transfer.CHUNK_SIZE + 5)
         self.assertEqual(len(output.getvalue()), transfer.CHUNK_SIZE + 5)
         self.assertEqual(source.asserted_counts, [transfer.CHUNK_SIZE, 5, 1])
+
+    @unittest.skipUnless(transfer._FD_METADATA, 'Linux descriptor metadata')
+    def test_descriptor_metadata_preserves_xattrs_and_checks_changes(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / 'source'
+            source.write_bytes(b'data')
+            try:
+                os.setxattr(source, 'user.research', b'\x00research\xff')
+            except OSError as exc:
+                if exc.errno in {errno.ENOTSUP, errno.EPERM}:
+                    self.skipTest('filesystem does not support user xattrs')
+                raise
+            source.chmod(0o440)
+            target = root / 'target'
+            _copy_path(source, target)
+            self.assertEqual(os.getxattr(target, 'user.research'), b'\x00research\xff')
+            self.assertEqual(target.stat().st_atime_ns, source.stat().st_atime_ns)
+            self.assertEqual(self.snapshot(target), self.snapshot(source))
+            target.chmod(0o640)
+            target.unlink()
+            source.chmod(0o640)
+            original = transfer._copy_file_metadata
+
+            def change_attribute(src, dst, *args, **kwargs):
+                original(src, dst, *args, **kwargs)
+                sleep(0.02)
+                os.setxattr(src, 'user.research', b'changed')
+
+            with patch('src.workspace_transfer._copy_file_metadata', side_effect=change_attribute):
+                with self.assertRaises(JobExecutionError):
+                    _copy_path(source, target)
+            self.assertFalse(target.exists())
+            source.chmod(0o640)
 
 
 if __name__ == '__main__':

@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from scripts.benchmark_workspace_transfer_baseline import BASELINE_SOURCE_COMMIT, LegacyWorkspaceExecutor
 from src.plugin_container import ContainerToolExecutor
+from src.workspace_transfer import WorkspaceTransfer, _FD_METADATA
 
 
 def snapshot(root):
@@ -59,17 +60,31 @@ def run_transfer(executor_type, source, expected, scenario, phase, instrument=Fa
         target = artifacts / 'result'
         executor = SimpleNamespace(input_roots=(source.parent,), artifact_root=artifacts, workspace_max_bytes=1024 ** 3)
         traversals = []
+        captures = []
+        enumerations = []
         original_rglob = Path.rglob
+        original_capture = WorkspaceTransfer.capture
+        original_scandir = os.scandir
 
         def counted(path, *args, **kwargs):
             if path == source:
                 traversals.append('rglob')
             return original_rglob(path, *args, **kwargs)
 
+        def captured(path):
+            if Path(path) == source:
+                captures.append('capture')
+            return original_capture(path)
+
+        def scanned(path):
+            if not isinstance(path, int) and Path(path) == source:
+                enumerations.append('scandir')
+            return original_scandir(path)
+
         module = 'scripts.benchmark_workspace_transfer_baseline' if executor_type is LegacyWorkspaceExecutor else 'src.plugin_container'
         with patch(module + '._tool_filesystem_contract', return_value=({'input_path'}, {}, set())):
             if instrument:
-                with patch.object(Path, 'rglob', counted):
+                with patch.object(Path, 'rglob', counted), patch.object(WorkspaceTransfer, 'capture', side_effect=captured), patch.object(os, 'scandir', side_effect=scanned):
                     result, copied = perform(executor_type, executor, source, workspace, target, phase)
                 elapsed = None
             else:
@@ -81,7 +96,7 @@ def run_transfer(executor_type, source, expected, scenario, phase, instrument=Fa
             assert result == ({'input_path': str(copied), 'unrelated': 7}, ())
         else:
             assert result == ((str(source), str(target)),)
-        return {'elapsed_seconds': elapsed, 'source_rglob_calls': len(traversals)}
+        return {'elapsed_seconds': elapsed, 'source_rglob_calls': len(traversals), 'source_capture_calls': len(captures), 'source_root_scandir_calls': len(enumerations)}
 
 
 def perform(executor_type, executor, source, workspace, target, phase):
@@ -150,6 +165,7 @@ def main():
         'timed_samples_instrumented': False, 'warmup_pairs_per_scenario': 1,
         'fixture_generation_verification_and_cleanup_outside_timing': True,
         'directory_copy_enumeration': {'legacy': 'shutil.copytree enumerates source again', 'manifest': 'copies captured manifest without further enumeration'},
+        'directory_capture_method': 'scandir' if _FD_METADATA else 'rglob_with_full_stat',
         'rows': rows,
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
