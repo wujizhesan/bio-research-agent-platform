@@ -240,6 +240,12 @@ jobs:
           uv run --no-sync python -m scripts.benchmark_upload_concurrency \
             --samples 8 --concurrency 2,4,8 --workspace-root output \
             > output/upload-concurrency-benchmark.json
+      - name: Compare upload storage usage responsiveness
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_upload_usage \
+            --samples 8 --histories 0,256,2048 --workspace-root output \
+            > output/upload-usage-benchmark.json
       - name: Compare committed SSE event delivery
         run: |
           mkdir -p output
@@ -327,6 +333,7 @@ jobs:
             output/ci-fullstack-health.json
             output/job-event-delivery-benchmark.json
             output/upload-concurrency-benchmark.json
+            output/upload-usage-benchmark.json
             output/cdr-text-benchmark.json
             frontend/playwright-report
             frontend/test-results

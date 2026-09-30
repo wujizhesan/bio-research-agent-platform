@@ -138,9 +138,34 @@ class LocalFileStorage:
                     continue
         return total
 
+    @staticmethod
+    async def _wait_for_worker(pending):
+        try:
+            return await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            # Keep the caller's quota lock or scan slot until the worker exits.
+            while not pending.done():
+                try:
+                    await asyncio.shield(pending)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            if not pending.cancelled():
+                pending.exception()
+            raise
+
+    async def _storage_usage_async(self):
+        context = copy_context()
+        pending = asyncio.get_running_loop().run_in_executor(
+            None, context.run, self._storage_usage,
+            frozenset(self._upload_reservations),
+        )
+        return await self._wait_for_worker(pending)
+
     async def _begin_upload(self, file_id):
         async with self._quota_lock:
-            self._quota_usage_bytes = self._storage_usage(self._upload_reservations)
+            self._quota_usage_bytes = await self._storage_usage_async()
             if (
                 self._quota_usage_bytes + self._reserved_bytes + METADATA_RESERVE_BYTES
                 > self.total_quota_bytes
@@ -176,7 +201,7 @@ class LocalFileStorage:
             'security': stored.security,
         }, ensure_ascii=False).encode('utf-8')
         async with self._quota_lock:
-            current_usage = self._storage_usage(self._upload_reservations)
+            current_usage = await self._storage_usage_async()
             remaining = self._reserved_bytes - self._upload_reservations[stored.file_id]
             committed = stored.size_bytes + len(metadata)
             if current_usage + remaining + committed > self.total_quota_bytes:
@@ -194,7 +219,7 @@ class LocalFileStorage:
                     directory.rmdir()
             finally:
                 self._reserved_bytes -= self._upload_reservations.pop(file_id)
-                self._quota_usage_bytes = self._storage_usage(self._upload_reservations)
+                self._quota_usage_bytes = await self._storage_usage_async()
 
     async def _scan_upload(self, target, filename):
         async with self._scan_slots:
@@ -202,19 +227,7 @@ class LocalFileStorage:
             pending = asyncio.get_running_loop().run_in_executor(
                 None, context.run, self.security_pipeline.process, target, filename,
             )
-            try:
-                return await asyncio.shield(pending)
-            except asyncio.CancelledError:
-                while not pending.done():
-                    try:
-                        await asyncio.shield(pending)
-                    except asyncio.CancelledError:
-                        continue
-                    except BaseException:
-                        break
-                if not pending.cancelled():
-                    pending.exception()
-                raise
+            return await self._wait_for_worker(pending)
 
     @staticmethod
     def _validate_text(content: bytes) -> str:
@@ -356,7 +369,13 @@ class LocalFileStorage:
             await self._commit_upload(stored)
             return stored
         except BaseException:
-            await self._abort_upload(file_id, directory)
+            cleanup = asyncio.create_task(self._abort_upload(file_id, directory))
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            cleanup.result()
             raise
 
     def get(self, file_id: str, reference=None) -> StoredFile:

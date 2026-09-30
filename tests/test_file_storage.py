@@ -630,5 +630,177 @@ class ConcurrentUploadTests(unittest.IsolatedAsyncioTestCase):
                 await storage.save(Upload(b'x' * 1000, 'retry.txt'))
 
 
+class BlockingUsageStorage(LocalFileStorage):
+    def __init__(self, root, blocked_call, fail_blocked=False, subject=None):
+        super().__init__(root)
+        self.loop = asyncio.get_running_loop()
+        self.blocked_call = blocked_call
+        self.fail_blocked = fail_blocked
+        self.subject = subject
+        self.started = asyncio.Event()
+        self.release = threading.Event()
+        self.guard = threading.Lock()
+        self.calls = 0
+        self.active = 0
+        self.peak = 0
+        self.threads = []
+        self.contexts = []
+
+    def _storage_usage(self, exclude_uploads=()):
+        with self.guard:
+            self.calls += 1
+            call = self.calls
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            self.threads.append(threading.get_ident())
+            if self.subject is not None:
+                self.contexts.append(self.subject.get())
+        try:
+            if call == self.blocked_call:
+                self.loop.call_soon_threadsafe(self.started.set)
+                if not self.release.wait(5):
+                    raise TimeoutError('storage usage was not released')
+                if self.fail_blocked:
+                    raise OSError('storage usage failure')
+            return super()._storage_usage(exclude_uploads)
+        finally:
+            with self.guard:
+                self.active -= 1
+
+
+class StorageUsageAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_begin_commit_and_abort_allow_other_event_loop_work(self):
+        subject = ContextVar('usage-test-subject', default='missing')
+        for phase, blocked_call, payload in (
+            ('begin', 1, b'content'),
+            ('commit', 2, b'content'),
+            ('abort', 2, b''),
+        ):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as raw:
+                storage = BlockingUsageStorage(raw, blocked_call, subject=subject)
+                token = subject.set(phase)
+                try:
+                    task = asyncio.create_task(storage.save(Upload(payload, 'sample.txt')))
+                finally:
+                    subject.reset(token)
+                try:
+                    await asyncio.wait_for(storage.started.wait(), 5)
+                    await asyncio.sleep(0)
+                    self.assertFalse(task.done())
+                    self.assertTrue(storage._quota_lock.locked())
+                    self.assertFalse(list(storage.root.glob('*/metadata.json')))
+                finally:
+                    storage.release.set()
+                if phase == 'abort':
+                    with self.assertRaisesRegex(ValueError, 'empty'):
+                        await task
+                    self.assertEqual(list(storage.root.iterdir()), [])
+                else:
+                    stored = await task
+                    self.assertEqual(storage.get(stored.file_id), stored)
+                self.assertEqual(storage._reserved_bytes, 0)
+                self.assertEqual(set(storage.contexts), {phase})
+                self.assertNotIn(threading.get_ident(), storage.threads)
+                self.assertEqual(storage.peak, 1)
+
+    async def test_repeated_cancellation_keeps_usage_worker_bounded(self):
+        for phase, blocked_call in (('begin', 1), ('commit', 2)):
+            for fail_worker in (False, True):
+                with self.subTest(phase=phase, fail_worker=fail_worker), tempfile.TemporaryDirectory() as raw:
+                    storage = BlockingUsageStorage(raw, blocked_call, fail_worker)
+                    task = asyncio.create_task(storage.save(
+                        Upload(b'cancelled', 'cancelled.txt'), 'a' * 32,
+                    ))
+                    queued = None
+                    try:
+                        await asyncio.wait_for(storage.started.wait(), 5)
+                        queued = asyncio.create_task(storage.save(
+                            Upload(b'retry', 'retry.txt'), 'b' * 32,
+                        ))
+                        for _ in range(2):
+                            task.cancel()
+                            await asyncio.sleep(0)
+                            self.assertFalse(task.done())
+                            self.assertFalse(queued.done())
+                            self.assertEqual(storage.calls, blocked_call)
+                            self.assertTrue(storage._quota_lock.locked())
+                    finally:
+                        storage.release.set()
+                        results = await asyncio.gather(task, *([queued] if queued else []), return_exceptions=True)
+                    self.assertIsInstance(results[0], asyncio.CancelledError)
+                    stored = results[1]
+                    self.assertEqual(stored.path.read_bytes(), b'retry')
+                    self.assertEqual(list(storage.root.iterdir()), [stored.path.parent])
+                    self.assertEqual(storage._reserved_bytes, 0)
+                    self.assertEqual(storage._upload_reservations, {})
+                    self.assertEqual(storage.peak, 1)
+
+    async def test_cancellation_cannot_interrupt_cleanup_waiting_for_quota_lock(self):
+        reading = asyncio.Event()
+
+        class SlowUpload(Upload):
+            async def read(self, _size):
+                reading.set()
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as raw:
+            storage = BlockingUsageStorage(raw, 2)
+            task = asyncio.create_task(storage.save(
+                SlowUpload(b'content', 'cancelled.txt'), 'a' * 32,
+            ))
+            queued = None
+            try:
+                await asyncio.wait_for(reading.wait(), 5)
+                queued = asyncio.create_task(storage.save(Upload(b'retry', 'retry.txt'), 'b' * 32))
+                await asyncio.wait_for(storage.started.wait(), 5)
+                for _ in range(3):
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(task.done())
+                    self.assertIn('a' * 32, storage._upload_reservations)
+            finally:
+                storage.release.set()
+                results = await asyncio.gather(task, *([queued] if queued else []), return_exceptions=True)
+            self.assertIsInstance(results[0], asyncio.CancelledError)
+            stored = results[1]
+            self.assertEqual(list(storage.root.iterdir()), [stored.path.parent])
+            self.assertEqual(storage._reserved_bytes, 0)
+            self.assertEqual(storage._upload_reservations, {})
+            self.assertEqual(storage.peak, 1)
+
+    async def test_repeated_cancellation_waits_for_cleanup_usage_refresh(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / 'external.txt').write_bytes(b'existing')
+            storage = BlockingUsageStorage(root, 2)
+            task = asyncio.create_task(storage.save(Upload(b'', 'empty.txt')))
+            try:
+                await asyncio.wait_for(storage.started.wait(), 5)
+                for _ in range(3):
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(task.done())
+            finally:
+                storage.release.set()
+            with self.assertRaisesRegex(ValueError, 'empty'):
+                await task
+            self.assertEqual(storage._quota_usage_bytes, len(b'existing'))
+            self.assertEqual(storage._reserved_bytes, 0)
+            self.assertEqual(storage._upload_reservations, {})
+            self.assertEqual(list(root.iterdir()), [root / 'external.txt'])
+
+    async def test_usage_worker_errors_propagate_and_release_quota(self):
+        for phase, blocked_call in (('begin', 1), ('commit', 2)):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as raw:
+                storage = BlockingUsageStorage(raw, blocked_call, fail_blocked=True)
+                storage.release.set()
+                with self.assertRaisesRegex(OSError, 'storage usage failure'):
+                    await storage.save(Upload(b'content', 'sample.txt'))
+                self.assertEqual(list(storage.root.iterdir()), [])
+                self.assertEqual(storage._reserved_bytes, 0)
+                retry = await storage.save(Upload(b'retry', 'retry.txt'))
+                self.assertEqual(retry.path.read_bytes(), b'retry')
+
+
 if __name__ == '__main__':
     unittest.main()
