@@ -19,7 +19,13 @@ def _compose_sequence(loader, node):
     return loader.construct_sequence(node)
 
 
-ComposeLoader.add_constructor('!reset', _compose_sequence)
+def _compose_reset(loader, node):
+    if isinstance(node, yaml.ScalarNode):
+        return None
+    return loader.construct_sequence(node)
+
+
+ComposeLoader.add_constructor('!reset', _compose_reset)
 ComposeLoader.add_constructor('!override', _compose_sequence)
 
 
@@ -52,17 +58,26 @@ class SupplyChainConfigurationTests(unittest.TestCase):
             ROOT / ".github" / "workflows" / "ci.yml",
         ]
         references = []
+        built_images = set()
         for path in files:
             content = path.read_text(encoding="utf-8")
+            if path.name.startswith("docker-compose"):
+                compose = yaml.safe_load(content)
+                built_images.update(
+                    service["image"] for service in compose["services"].values()
+                    if "build" in service and "image" in service
+                )
             references.extend(
                 re.findall(r"^\s*(?:image|pull_image):\s*([^\s#]+)", content, re.MULTILINE)
             )
         self.assertTrue(references)
         for reference in references:
+            if reference in built_images:
+                continue
             self.assertRegex(reference, SHA256_REFERENCE)
 
     def test_dockerfile_bases_use_digests(self):
-        for relative_path in ("Dockerfile", "frontend/Dockerfile"):
+        for relative_path in ("Dockerfile", "frontend/Dockerfile", "Dockerfile.postgres"):
             content = (ROOT / relative_path).read_text(encoding="utf-8")
             references = re.findall(r"^FROM\s+([^\s]+)", content, re.MULTILINE)
             self.assertTrue(references)
@@ -111,6 +126,12 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn("Require successful CI for source commit", workflow)
         self.assertIn("release:\n    types: [published]", workflow)
         self.assertNotIn("push:\n    tags:", workflow)
+        release = yaml.safe_load(workflow)
+        postgres = next(
+            image for image in release["jobs"]["publish"]["strategy"]["matrix"]["include"]
+            if image["name"] == "postgres"
+        )
+        self.assertEqual(postgres["dockerfile"], "./Dockerfile.postgres")
 
     def test_production_deployment_requires_approval_and_verified_digests(self):
         workflow = yaml.safe_load(
@@ -142,12 +163,23 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn("^https://", deployment)
         self.assertIn("--no-build", deployment_script)
         self.assertIn("verify_public_deployment", deployment_script)
+        self.assertIn("POSTGRES_DIGEST", json.dumps(verify))
+        for name in ("Verify release provenance", "Verify release SBOM attestations"):
+            step = next(step for step in verify["steps"] if step["name"] == name)
+            self.assertIn('"$POSTGRES_IMAGE"', step["run"])
+            self.assertEqual(
+                step["env"]["POSTGRES_IMAGE"],
+                "${{ steps.images.outputs.postgres_image }}",
+            )
 
         compose = yaml.load(
             (ROOT / "docker-compose.deploy.yml").read_text(encoding="utf-8"),
             Loader=ComposeLoader,
         )
         self.assertEqual(compose["services"]["api"]["image"], "${BACKEND_IMAGE:?required}")
+        self.assertEqual(compose["services"]["db"]["image"], "${POSTGRES_IMAGE:?required}")
+        self.assertEqual(compose["services"]["db"]["pull_policy"], "always")
+        self.assertIsNone(compose["services"]["db"]["build"])
         self.assertEqual(compose["services"]["worker"]["image"], "${BACKEND_IMAGE:?required}")
         self.assertEqual(
             compose["services"]["artifact-maintenance"]["image"],
@@ -445,9 +477,37 @@ class SupplyChainConfigurationTests(unittest.TestCase):
             set(baseline["images"]),
             {"redis", "postgres", "clamav", "prometheus", "alertmanager"},
         )
-        for image in baseline["images"].values():
+        for name, image in baseline["images"].items():
+            if name == "postgres":
+                self.assertEqual(image["exceptions"], [])
+                continue
             self.assertRegex(image["image_ref"], SHA256_REFERENCE)
         self.assertEqual(baseline["policy"]["max_exception_days"], {"HIGH": 30, "CRITICAL": 7})
+
+    def test_postgres_fix_is_built_and_scanned_without_exceptions(self):
+        workflow = yaml.safe_load(
+            (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        )
+        postgres = next(
+            image for image in workflow["jobs"]["container"]["strategy"]["matrix"]["include"]
+            if image["name"] == "postgres"
+        )
+        self.assertEqual(postgres["dockerfile"], "Dockerfile.postgres")
+        self.assertEqual(postgres["exit_code"], "1")
+        self.assertNotIn("pull_image", postgres)
+        baseline = json.loads(
+            (ROOT / "security" / "container-vulnerability-baseline.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(baseline["images"]["postgres"]["image_ref"], postgres["image_ref"])
+        for name in ("docker-compose.yml", "docker-compose.recovery.yml"):
+            db = yaml.safe_load((ROOT / name).read_text(encoding="utf-8"))["services"]["db"]
+            self.assertEqual(db["image"], postgres["image_ref"])
+            self.assertEqual(db["build"]["dockerfile"], postgres["dockerfile"])
+        services = workflow["jobs"]["services"]
+        self.assertNotIn("postgres", services["services"])
+        start = next(step for step in services["steps"] if step["name"] == "Build and start patched PostgreSQL")
+        self.assertIn(postgres["image_ref"], start["run"])
+        self.assertIn("/proc/1", start["run"])
 
     def test_dependency_license_and_signature_policy_is_enforced(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")

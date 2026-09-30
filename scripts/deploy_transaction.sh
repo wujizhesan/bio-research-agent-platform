@@ -121,9 +121,10 @@ write_release_state() {
   local output_path=$3
   local bundle_path=$4
   local monitoring_dir=$5
-  local backend_image frontend_image release_tag git_sha bundle_digest secret_name expected_bundle_digest
+  local backend_image frontend_image postgres_image release_tag git_sha bundle_digest secret_name expected_bundle_digest
   backend_image=$(environment_value "$image_path" BACKEND_IMAGE)
   frontend_image=$(environment_value "$image_path" FRONTEND_IMAGE)
+  postgres_image=$(environment_value "$image_path" POSTGRES_IMAGE 2>/dev/null || true)
   release_tag=$(environment_value "$image_path" RELEASE_TAG)
   git_sha=$(environment_value "$image_path" GIT_SHA)
   bundle_digest=$(release_bundle_digest "$bundle_path")
@@ -139,6 +140,9 @@ write_release_state() {
   printf '\nBACKEND_IMAGE=%s\nFRONTEND_IMAGE=%s\nRELEASE_TAG=%s\nGIT_SHA=%s\nRELEASE_CONFIG_VERSION=3\nRELEASE_BUNDLE_DIR=%s\nRELEASE_BUNDLE_SHA256=%s\nMONITORING_CONFIG_DIR=%s\n' \
     "$backend_image" "$frontend_image" "$release_tag" "$git_sha" \
     "$bundle_path" "$bundle_digest" "$monitoring_dir" >> "$output_path"
+  if test -n "$postgres_image"; then
+    printf 'POSTGRES_IMAGE=%s\n' "$postgres_image" >> "$output_path"
+  fi
   for secret_name in "${release_secret_names[@]}"; do
     printf '%s_SHA256=%s\n' "$secret_name" \
       "$(secret_file_digest "$config_path" "$secret_name")" >> "$output_path"
@@ -188,10 +192,16 @@ verify_legacy_release_state() {
 verify_live_release() {
   local service expected_image expected_hash hash_line container_ids container_id actual_image actual_hash
   local started_at started_seconds secret_name secret_path secret_modified
-  for service in api worker dispatcher artifact-maintenance plugin-sandbox plugin-sandbox-heavy web; do
+  local -a services=(api worker dispatcher artifact-maintenance plugin-sandbox plugin-sandbox-heavy web)
+  if grep -q '^POSTGRES_IMAGE=' release-images.env; then
+    services+=(db)
+  fi
+  for service in "${services[@]}"; do
     expected_image=$(environment_value release-images.env BACKEND_IMAGE)
     if test "$service" = web; then
       expected_image=$(environment_value release-images.env FRONTEND_IMAGE)
+    elif test "$service" = db; then
+      expected_image=$(environment_value release-images.env POSTGRES_IMAGE)
     fi
     hash_line=$("${bootstrap_compose[@]}" config --hash "$service")
     expected_hash=${hash_line#"$service "}
@@ -494,7 +504,7 @@ fi
 
 "${next_compose[@]}" config --quiet
 "${next_compose[@]}" pull \
-  api dispatcher worker artifact-maintenance web plugin-sandbox plugin-sandbox-heavy migration recovery-check recovery-evidence-publisher \
+  db api dispatcher worker artifact-maintenance web plugin-sandbox plugin-sandbox-heavy migration recovery-check recovery-evidence-publisher \
   storage-check pitr-checkpoint prometheus alertmanager
 "${next_compose[@]}" run --rm --no-deps api \
   python -c 'from src.auth import AuthService; AuthService.from_env()'

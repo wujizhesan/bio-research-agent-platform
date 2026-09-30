@@ -131,6 +131,7 @@ class DeployTransactionTests(unittest.TestCase):
             )
         (deploy / "release-images.next.env").write_text(
             "BACKEND_IMAGE=next-backend\nFRONTEND_IMAGE=next-frontend\n"
+            "POSTGRES_IMAGE=next-postgres\n"
             "RELEASE_TAG=v0.2.0-rc.1\nGIT_SHA=" + "a" * 40 + "\n"
             "RELEASE_BUNDLE_DIR=release-bundles/candidate\n"
             f"RELEASE_BUNDLE_SHA256={bundle_digest(candidate)}\n",
@@ -162,6 +163,8 @@ if [[ "$1" == inspect ]]; then
       printf 'stale-image\\n'
     elif [[ "$4" == container-web ]]; then
       printf 'current-frontend\\n'
+    elif [[ "$4" == container-db ]]; then
+      printf 'current-postgres\\n'
     else
       printf 'current-backend\\n'
     fi
@@ -244,6 +247,9 @@ exit "${VERIFY_EXIT:-0}"
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse((deploy / "release-images.next.env").exists())
             self.assertIn("next-backend", (deploy / "release-images.env").read_text())
+            self.assertIn("POSTGRES_IMAGE=next-postgres", (deploy / "release-images.env").read_text())
+            pull = next(line for line in commands if " pull " in line)
+            self.assertIn("pull db ", pull)
             self.assertIn(
                 "RELEASE_CONFIG_VERSION=3",
                 (deploy / "release-images.env").read_text(),
@@ -317,6 +323,29 @@ exit "${VERIFY_EXIT:-0}"
             self.assertLess(rollback_enforcement, rollback_start)
             self.assertIn("backend-image-override next-backend", commands)
             self.assertIn("rollback completed", result.stderr)
+
+    def test_rollback_preserves_previous_postgres_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(
+                directory, current=True, bootstrap_current=False,
+            )
+            state = deploy / "release-images.env"
+            state.write_text(
+                state.read_text(encoding="utf-8") + "POSTGRES_IMAGE=current-postgres\n",
+                encoding="utf-8",
+            )
+            result = self.run_deploy(deploy, environment, bootstrap=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("ps -q db", log.read_text(encoding="utf-8"))
+            environment["NEXT_UP_FAIL"] = "1"
+            result = self.run_deploy(deploy, environment)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("rollback completed", result.stderr)
+            self.assertIn("POSTGRES_IMAGE=current-postgres", state.read_text(encoding="utf-8"))
+            self.assertIn(
+                "POSTGRES_IMAGE=next-postgres",
+                (deploy / "release-images.next.env").read_text(encoding="utf-8"),
+            )
 
     def test_existing_release_requires_explicit_config_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:

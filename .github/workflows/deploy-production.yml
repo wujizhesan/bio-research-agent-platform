@@ -15,6 +15,10 @@ on:
         description: Frontend image sha256 digest
         required: true
         type: string
+      postgres_digest:
+        description: PostgreSQL image sha256 digest
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -33,6 +37,7 @@ jobs:
     outputs:
       backend_image: ${{ steps.images.outputs.backend_image }}
       frontend_image: ${{ steps.images.outputs.frontend_image }}
+      postgres_image: ${{ steps.images.outputs.postgres_image }}
       source_commit: ${{ steps.release.outputs.source_commit }}
     steps:
       - name: Validate digest-pinned inputs
@@ -40,14 +45,17 @@ jobs:
         env:
           BACKEND_DIGEST: ${{ inputs.backend_digest }}
           FRONTEND_DIGEST: ${{ inputs.frontend_digest }}
+          POSTGRES_DIGEST: ${{ inputs.postgres_digest }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]
           [[ "$BACKEND_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
           [[ "$FRONTEND_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$POSTGRES_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
           echo "backend_image=ghcr.io/${GITHUB_REPOSITORY_OWNER}/bio-research-agent-platform@${BACKEND_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "frontend_image=ghcr.io/${GITHUB_REPOSITORY_OWNER}/bio-research-agent-platform-frontend@${FRONTEND_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "postgres_image=ghcr.io/${GITHUB_REPOSITORY_OWNER}/bio-research-agent-platform-postgres@${POSTGRES_DIGEST}" >> "$GITHUB_OUTPUT"
       - name: Authenticate to GHCR
         env:
           GH_TOKEN: ${{ github.token }}
@@ -70,19 +78,22 @@ jobs:
         env:
           BACKEND_IMAGE: ${{ steps.images.outputs.backend_image }}
           FRONTEND_IMAGE: ${{ steps.images.outputs.frontend_image }}
+          POSTGRES_IMAGE: ${{ steps.images.outputs.postgres_image }}
         run: |
           docker buildx imagetools inspect "$BACKEND_IMAGE"
           docker buildx imagetools inspect "$FRONTEND_IMAGE"
+          docker buildx imagetools inspect "$POSTGRES_IMAGE"
       - name: Verify release provenance
         env:
           BACKEND_IMAGE: ${{ steps.images.outputs.backend_image }}
           FRONTEND_IMAGE: ${{ steps.images.outputs.frontend_image }}
+          POSTGRES_IMAGE: ${{ steps.images.outputs.postgres_image }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/release.yml
           SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
         run: |
-          for image in "$BACKEND_IMAGE" "$FRONTEND_IMAGE"; do
+          for image in "$BACKEND_IMAGE" "$FRONTEND_IMAGE" "$POSTGRES_IMAGE"; do
             gh attestation verify "oci://${image}" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$SIGNER_WORKFLOW" \
@@ -94,12 +105,13 @@ jobs:
         env:
           BACKEND_IMAGE: ${{ steps.images.outputs.backend_image }}
           FRONTEND_IMAGE: ${{ steps.images.outputs.frontend_image }}
+          POSTGRES_IMAGE: ${{ steps.images.outputs.postgres_image }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/release.yml
           SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
         run: |
-          for image in "$BACKEND_IMAGE" "$FRONTEND_IMAGE"; do
+          for image in "$BACKEND_IMAGE" "$FRONTEND_IMAGE" "$POSTGRES_IMAGE"; do
             gh attestation verify "oci://${image}" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$SIGNER_WORKFLOW" \
@@ -158,6 +170,7 @@ jobs:
           BACKEND_IMAGE: ${{ needs.verify.outputs.backend_image }}
           DEPLOY_PATH: ${{ vars.PRODUCTION_DEPLOY_PATH }}
           FRONTEND_IMAGE: ${{ needs.verify.outputs.frontend_image }}
+          POSTGRES_IMAGE: ${{ needs.verify.outputs.postgres_image }}
           GIT_SHA: ${{ needs.verify.outputs.source_commit }}
           HEALTH_URL: ${{ vars.PRODUCTION_API_HEALTH_URL }}
           RELEASE_TAG: ${{ inputs.release_tag }}
@@ -184,8 +197,8 @@ jobs:
             done | sha256sum | cut -d ' ' -f 1
           )
           script_digest=$(sha256sum scripts/deploy_transaction.sh | cut -d ' ' -f 1)
-          printf 'BACKEND_IMAGE=%s\nFRONTEND_IMAGE=%s\nRELEASE_TAG=%s\nGIT_SHA=%s\nRELEASE_BUNDLE_DIR=%s\nRELEASE_BUNDLE_SHA256=%s\n' \
-            "$BACKEND_IMAGE" "$FRONTEND_IMAGE" "$RELEASE_TAG" "$GIT_SHA" "$bundle_dir" "$bundle_digest" \
+          printf 'BACKEND_IMAGE=%s\nFRONTEND_IMAGE=%s\nPOSTGRES_IMAGE=%s\nRELEASE_TAG=%s\nGIT_SHA=%s\nRELEASE_BUNDLE_DIR=%s\nRELEASE_BUNDLE_SHA256=%s\n' \
+            "$BACKEND_IMAGE" "$FRONTEND_IMAGE" "$POSTGRES_IMAGE" "$RELEASE_TAG" "$GIT_SHA" "$bundle_dir" "$bundle_digest" \
             > release-images.next.env
           printf -v prepare_command 'mkdir -p %q %q' "$DEPLOY_PATH" "$DEPLOY_PATH/monitoring"
           ssh -i "$HOME/.ssh/id_deploy" -p "$SSH_PORT" \

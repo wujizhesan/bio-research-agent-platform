@@ -1,0 +1,8 @@
+FROM postgres:16.15-alpine3.24@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+
+RUN apk add --no-cache gosu=1.19-r5 \
+    && rm /usr/local/bin/gosu \
+    && ln -s /usr/bin/gosu /usr/local/bin/gosu \
+    && gosu --version \
+    && test "$(gosu postgres id -u)" = "$(id -u postgres)" \
+    && test "$(gosu postgres id -g)" = "$(id -g postgres)"

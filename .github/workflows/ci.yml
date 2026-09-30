@@ -96,19 +96,6 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     services:
-      postgres:
-        image: postgres:16.15-alpine3.24@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
-        env:
-          POSTGRES_DB: bioagent_ci
-          POSTGRES_USER: bioagent
-          POSTGRES_PASSWORD: bioagent-ci-password
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U bioagent -d bioagent_ci"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
       redis:
         image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
         ports:
@@ -134,6 +121,25 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Build and start patched PostgreSQL
+        run: |
+          docker build --file Dockerfile.postgres --tag bio-research-postgres:16.15-gosu1.19-r5 .
+          docker run -d --name bioagent-ci-postgres -p 5432:5432 \
+            -e POSTGRES_DB=bioagent_ci -e POSTGRES_USER=bioagent \
+            -e POSTGRES_PASSWORD=bioagent-ci-password \
+            --health-cmd 'pg_isready -U bioagent -d bioagent_ci' \
+            --health-interval 5s --health-timeout 5s --health-retries 20 \
+            bio-research-postgres:16.15-gosu1.19-r5
+          for attempt in {1..60}; do
+            if [ "$(docker inspect --format '{{.State.Health.Status}}' bioagent-ci-postgres)" = healthy ]; then
+              docker exec bioagent-ci-postgres sh -ec \
+                'test "$(stat -c %u /proc/1)" = "$(id -u postgres)"; test "$(gosu postgres id -u)" = "$(id -u postgres)"'
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs bioagent-ci-postgres
+          exit 1
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
@@ -311,6 +317,11 @@ jobs:
             frontend/playwright-report
             frontend/test-results
           if-no-files-found: ignore
+      - name: Clean up integration PostgreSQL
+        if: always()
+        run: |
+          docker logs bioagent-ci-postgres || true
+          docker rm -f bioagent-ci-postgres || true
 
   secure-plugin-e2e:
     name: Secure full-stack container execution
@@ -363,7 +374,7 @@ jobs:
         run: |
           for attempt in 1 2 3; do
             if docker compose -f docker-compose.yml -f docker-compose.secure.yml \
-              build api migration dispatcher worker plugin-sandbox plugin-sandbox-heavy; then
+              build db api migration dispatcher worker plugin-sandbox plugin-sandbox-heavy; then
               exit 0
             fi
             if [ "$attempt" -eq 3 ]; then
@@ -799,10 +810,11 @@ jobs:
             baseline_name: redis
             exit_code: '0'
           - name: postgres
-            image_ref: postgres:16.15-alpine3.24@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
-            pull_image: postgres:16.15-alpine3.24@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+            image_ref: bio-research-postgres:16.15-gosu1.19-r5
+            build_context: .
+            dockerfile: Dockerfile.postgres
             baseline_name: postgres
-            exit_code: '0'
+            exit_code: '1'
           - name: clamav
             image_ref: clamav/clamav:1.5@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422
             pull_image: clamav/clamav:1.5@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422
@@ -829,6 +841,20 @@ jobs:
         run: docker pull "${{ matrix.pull_image }}"
       - name: Prepare SBOM output
         run: mkdir -p output/sbom output/security
+      - name: Verify gosu binary and retain build evidence
+        if: matrix.name == 'postgres'
+        run: |
+          container_id=$(docker create "${{ matrix.image_ref }}")
+          trap 'docker rm "$container_id" >/dev/null' EXIT
+          docker cp "$container_id:/usr/bin/gosu" output/security/postgres-gosu.bin
+          docker run --rm --entrypoint sh "${{ matrix.image_ref }}" -ec \
+            'apk info -v gosu; gosu --version; sha256sum /usr/bin/gosu; test "$(gosu postgres id -u)" = "$(id -u postgres)"' \
+            > output/security/postgres-gosu-build.txt
+          go version -m output/security/postgres-gosu.bin >> output/security/postgres-gosu-build.txt
+          grep -q 'go1.26.8' output/security/postgres-gosu-build.txt
+          GOTOOLCHAIN=go1.26.8 go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          "$(go env GOPATH)/bin/govulncheck" -mode=binary \
+            output/security/postgres-gosu.bin > output/security/postgres-gosu-govulncheck.txt
       - name: Generate image CycloneDX SBOM
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
