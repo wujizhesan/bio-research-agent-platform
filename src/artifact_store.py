@@ -95,11 +95,12 @@ class DirectoryManifest:
         if not stat.S_ISDIR(root_info.st_mode):
             raise StorageIntegrityError('artifact directory is unavailable')
         entries = []
+        root_parts = len(root.parts)
         for path in sorted(root.rglob('*')):
             info = path.lstat()
             if stat.S_ISLNK(info.st_mode):
                 raise StorageIntegrityError('artifact publication rejects symbolic links')
-            entries.append(DirectoryEntry(path.relative_to(root), info))
+            entries.append(DirectoryEntry(Path(*path.parts[root_parts:]), info))
         return cls(root, root_info, tuple(entries))
 
     @property
@@ -251,14 +252,13 @@ def _archive_directory(source, target, root_name, compresslevel=9, directory_man
                     format=tarfile.PAX_FORMAT,
                 ) as archive:
                     entries = (
-                        [(source, directory_manifest.root_info), *(
-                            (source / item.relative, item.info)
+                        [(source, Path(), directory_manifest.root_info), *(
+                            (source / item.relative, item.relative, item.info)
                             for item in directory_manifest.entries
                         )] if directory_manifest is not None else
-                        [(entry, None) for entry in [source, *sorted(source.rglob('*'))]]
+                        [(entry, entry.relative_to(source), None) for entry in [source, *sorted(source.rglob('*'))]]
                     )
-                    for entry, expected in entries:
-                        relative = entry.relative_to(source)
+                    for entry, relative, expected in entries:
                         arcname = Path(root_name) / relative
                         is_directory = stat.S_ISDIR(expected.st_mode) if expected is not None else entry.is_dir()
                         is_file = stat.S_ISREG(expected.st_mode) if expected is not None else entry.is_file()
