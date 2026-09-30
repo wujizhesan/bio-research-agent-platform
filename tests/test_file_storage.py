@@ -733,6 +733,227 @@ class ConcurrentUploadTests(unittest.IsolatedAsyncioTestCase):
                 await storage.save(Upload(b'x' * 1000, 'retry.txt'))
 
 
+class UploadInspectionAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def _exercise_stage(self, phase, cancel=False, fail=False):
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = threading.Event()
+        subject = ContextVar('inspection-test-subject', default='missing')
+        observations = []
+        state = {'calls': 0, 'scanned': False, 'stat_seen': False, 'hash_ready': False, 'hash_opened': False}
+
+        def observe(stage):
+            observations.append((stage, threading.get_ident(), subject.get()))
+            if stage == phase:
+                loop.call_soon_threadsafe(started.set)
+                if not release.wait(5):
+                    raise TimeoutError('inspection was not released')
+                if fail:
+                    raise OSError(f'{stage} worker failure')
+
+        class Storage(LocalFileStorage):
+            def _inspect_content(self, target, filename, size_bytes):
+                if filename != 'sample.txt':
+                    return super()._inspect_content(target, filename, size_bytes)
+                state['calls'] += 1
+                observe('before' if state['calls'] == 1 else 'after')
+                result = super()._inspect_content(target, filename, size_bytes)
+                state['hash_ready'] = state['calls'] == 2
+                return result
+
+        class Pipeline:
+            def process(self, path, _filename):
+                observations.append(('scan', threading.get_ident(), subject.get()))
+                Path(path).write_bytes(b'rebuilt\r\n')
+                state['scanned'] = True
+                return FileSecurityResult('clean', 'clean', 'reconstructed', 2)
+
+        original_stat, original_open = Path.stat, Path.open
+
+        def stat(path, *args, **kwargs):
+            if path.name == 'sample.txt' and state['scanned'] and not state['stat_seen']:
+                state['stat_seen'] = True
+                observe('stat')
+            return original_stat(path, *args, **kwargs)
+
+        class HashReader:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return self.handle.__exit__(*args)
+
+            def read(self, size):
+                if not state['hash_opened']:
+                    state['hash_opened'] = True
+                    observe('hash')
+                return self.handle.read(size)
+
+        def open_file(path, mode='r', *args, **kwargs):
+            handle = original_open(path, mode, *args, **kwargs)
+            if path.name == 'sample.txt' and mode == 'rb' and state['hash_ready']:
+                return HashReader(handle)
+            return handle
+
+        with tempfile.TemporaryDirectory() as raw:
+            storage = Storage(raw, security_pipeline=Pipeline())
+            token = subject.set(phase)
+            try:
+                with mock.patch.object(Path, 'stat', stat), mock.patch.object(Path, 'open', open_file):
+                    task = asyncio.create_task(storage.save(Upload(b'original', 'sample.txt'), 'a' * 32))
+                    try:
+                        await asyncio.wait_for(started.wait(), 5)
+                        await asyncio.sleep(0)
+                        self.assertFalse(task.done())
+                        self.assertFalse(storage._quota_lock.locked())
+                        self.assertGreater(storage._reserved_bytes, 0)
+                        self.assertTrue((storage.root / ('a' * 32) / 'sample.txt').exists())
+                        self.assertFalse((storage.root / ('a' * 32) / 'metadata.json').exists())
+                        if cancel:
+                            for _ in range(3):
+                                task.cancel()
+                                await asyncio.sleep(0)
+                                self.assertFalse(task.done())
+                                self.assertGreater(storage._reserved_bytes, 0)
+                                self.assertEqual(len(list(storage.root.iterdir())), 1)
+                    finally:
+                        release.set()
+                    if cancel:
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                    elif fail:
+                        with self.assertRaisesRegex(OSError, f'{phase} worker failure'):
+                            await task
+                    else:
+                        stored = await task
+            finally:
+                subject.reset(token)
+            self.assertEqual(storage._reserved_bytes, 0)
+            self.assertEqual(storage._upload_reservations, {})
+            self.assertTrue(observations)
+            self.assertTrue(all(thread != threading.get_ident() for _, thread, _ in observations))
+            self.assertEqual({context for _, _, context in observations}, {phase})
+            if cancel or fail:
+                self.assertEqual(list(storage.root.iterdir()), [])
+                retry = await storage.save(Upload(b'retry', 'retry.txt'))
+                self.assertEqual(retry.path.read_bytes(), b'rebuilt\r\n')
+            else:
+                self.assertEqual([stage for stage, _, _ in observations], ['before', 'scan', 'stat', 'after', 'hash'])
+                self.assertEqual(stored.path.read_bytes(), b'rebuilt\r\n')
+                self.assertEqual(stored.size_bytes, len(b'rebuilt\r\n'))
+                self.assertEqual(stored.sha256, hashlib.sha256(b'rebuilt\r\n').hexdigest())
+                self.assertEqual(storage.get(stored.file_id), stored)
+
+    async def test_inspection_stat_and_hash_allow_other_work_and_keep_context(self):
+        for phase in ('before', 'stat', 'after', 'hash'):
+            with self.subTest(phase=phase):
+                await self._exercise_stage(phase)
+
+    async def test_repeated_cancellation_waits_for_inspection_and_hash(self):
+        for phase in ('before', 'stat', 'after', 'hash'):
+            for fail in (False, True):
+                with self.subTest(phase=phase, fail=fail):
+                    await self._exercise_stage(phase, cancel=True, fail=fail)
+
+    async def test_inspection_stat_and_hash_errors_clean_up_and_allow_retry(self):
+        for phase in ('before', 'stat', 'after', 'hash'):
+            with self.subTest(phase=phase):
+                await self._exercise_stage(phase, fail=True)
+
+    async def test_inspection_and_scan_share_bound_and_queued_cancellation(self):
+        loop = asyncio.get_running_loop()
+        scanned, both = asyncio.Event(), asyncio.Event()
+        release, guard = threading.Event(), threading.Lock()
+        counts = {'active': 0, 'peak': 0, 'started': 0}
+
+        def block(stage):
+            with guard:
+                counts['active'] += 1
+                counts['started'] += 1
+                counts['peak'] = max(counts['peak'], counts['active'])
+                if stage == 'scan':
+                    loop.call_soon_threadsafe(scanned.set)
+                if counts['active'] == 2:
+                    loop.call_soon_threadsafe(both.set)
+            try:
+                if not release.wait(5):
+                    raise TimeoutError('file worker was not released')
+            finally:
+                with guard:
+                    counts['active'] -= 1
+
+        class Storage(LocalFileStorage):
+            def _inspect_content(self, target, filename, size_bytes):
+                if filename in {'inspect.txt', 'queued.txt'}:
+                    block('inspect')
+                return super()._inspect_content(target, filename, size_bytes)
+
+        class Pipeline:
+            def process(self, _path, filename):
+                if filename == 'scan.txt':
+                    block('scan')
+                return FileSecurityResult('clean', 'clean', 'disabled', 1)
+
+        with tempfile.TemporaryDirectory() as raw:
+            storage = Storage(raw, security_pipeline=Pipeline())
+            tasks = [asyncio.create_task(storage.save(Upload(b'content', 'scan.txt'), 'a' * 32))]
+            try:
+                await asyncio.wait_for(scanned.wait(), 5)
+                tasks.append(asyncio.create_task(storage.save(Upload(b'content', 'inspect.txt'), 'b' * 32)))
+                await asyncio.wait_for(both.wait(), 5)
+                tasks.append(asyncio.create_task(storage.save(Upload(b'content', 'queued.txt'), 'c' * 32)))
+                async def wait_staged():
+                    while 'c' * 32 not in storage._upload_reservations:
+                        await asyncio.sleep(0)
+
+                await asyncio.wait_for(wait_staged(), 5)
+                for _ in range(3):
+                    tasks[0].cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(tasks[0].done())
+                    self.assertEqual(counts['started'], 2)
+                tasks[2].cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await tasks[2]
+                self.assertFalse((storage.root / ('c' * 32)).exists())
+                self.assertEqual(counts['started'], 2)
+            finally:
+                release.set()
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+            self.assertIsInstance(results[0], asyncio.CancelledError)
+            self.assertEqual(results[1].path.read_bytes(), b'content')
+            self.assertEqual(counts['peak'], 2)
+            self.assertEqual(list(storage.root.iterdir()), [results[1].path.parent])
+            self.assertEqual(storage._reserved_bytes, 0)
+            self.assertEqual(storage._upload_reservations, {})
+
+    async def test_reconstructed_content_is_rejected_before_commit(self):
+        header = b'##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n'
+        for filename, original, rebuilt, limits, message in (
+            ('sample.txt', b'original', b'MZpayload', {}, 'executable'),
+            ('sample.txt', b'original', b'PK\x03\x04payload', {}, 'archive'),
+            ('sample.vcf.gz', gzip.compress(header), b'\x1f\x8bbroken', {}, 'invalid gzip'),
+            ('sample.vcf.gz', gzip.compress(header), gzip.compress(b'plain text'), {}, 'does not match'),
+            ('sample.vcf.gz', gzip.compress(header), gzip.compress(header + b'A' * 2000), {'max_decompressed_bytes': 1024}, 'decompressed size'),
+            ('sample.vcf.gz', gzip.compress(header), gzip.compress(header + b'A' * 2000), {'max_compression_ratio': 3}, 'compression ratio'),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as raw:
+                class Pipeline:
+                    def process(self, path, _filename):
+                        Path(path).write_bytes(rebuilt)
+                        return FileSecurityResult('clean', 'clean', 'reconstructed', 2)
+
+                storage = LocalFileStorage(raw, security_pipeline=Pipeline(), **limits)
+                with self.assertRaisesRegex(ValueError, message):
+                    await storage.save(Upload(original, filename))
+                self.assertEqual(list(storage.root.iterdir()), [])
+                self.assertEqual(storage._reserved_bytes, 0)
+                self.assertEqual(storage._upload_reservations, {})
+
+
 class BlockingUsageStorage(LocalFileStorage):
     def __init__(self, root, blocked_call, fail_blocked=False, subject=None):
         super().__init__(root)

@@ -143,7 +143,7 @@ class LocalFileStorage:
         try:
             return await asyncio.shield(pending)
         except asyncio.CancelledError:
-            # Keep the caller's quota lock or scan slot until the worker exits.
+            # Keep the caller's quota lock or worker slot until the worker exits.
             while not pending.done():
                 try:
                     await asyncio.shield(pending)
@@ -221,13 +221,18 @@ class LocalFileStorage:
                 self._reserved_bytes -= self._upload_reservations.pop(file_id)
                 self._quota_usage_bytes = await self._storage_usage_async()
 
-    async def _scan_upload(self, target, filename):
+    async def _run_file_worker(self, function, *args):
         async with self._scan_slots:
             context = copy_context()
             pending = asyncio.get_running_loop().run_in_executor(
-                None, context.run, self.security_pipeline.process, target, filename,
+                None, context.run, function, *args,
             )
             return await self._wait_for_worker(pending)
+
+    async def _scan_upload(self, target, filename):
+        return await self._run_file_worker(
+            self.security_pipeline.process, target, filename,
+        )
 
     @staticmethod
     def _validate_text(content: bytes) -> str:
@@ -291,6 +296,14 @@ class LocalFileStorage:
             raise ValueError('content does not match .vcf')
         return CONTENT_TYPES.get(extension, 'text/plain')
 
+    def _inspect_and_hash(self, target, filename, size_bytes):
+        content_type = self._inspect_content(target, filename, size_bytes)
+        digest = hashlib.sha256()
+        with target.open('rb') as source:
+            for chunk in iter(lambda: source.read(CHUNK_SIZE), b''):
+                digest.update(chunk)
+        return content_type, digest
+
     def planned_storage_key(self, file_id: str, filename: str) -> str | None:
         if not FILE_ID_PATTERN.fullmatch(str(file_id)):
             raise ValueError('invalid stored file id')
@@ -335,14 +348,14 @@ class LocalFileStorage:
                     digest.update(chunk)
             if size_bytes == 0:
                 raise ValueError('empty files are not allowed')
-            content_type = self._inspect_content(
-                target, filename, size_bytes
+            content_type = await self._run_file_worker(
+                self._inspect_content, target, filename, size_bytes,
             )
             security = None
             if self.security_pipeline is not None:
                 scan_result = await self._scan_upload(target, filename)
                 security = scan_result.as_dict()
-                size_bytes = target.stat().st_size
+                size_bytes = (await self._run_file_worker(target.stat)).st_size
                 if size_bytes > self.max_bytes:
                     raise ValueError(
                         'CDR output exceeds maximum upload size'
@@ -350,13 +363,9 @@ class LocalFileStorage:
                 await self._reserve_upload_bytes(
                     file_id, size_bytes, 'CDR output exceeds upload storage quota',
                 )
-                content_type = self._inspect_content(
-                    target, filename, size_bytes
+                content_type, digest = await self._run_file_worker(
+                    self._inspect_and_hash, target, filename, size_bytes,
                 )
-                digest = hashlib.sha256()
-                with target.open('rb') as source:
-                    for chunk in iter(lambda: source.read(CHUNK_SIZE), b''):
-                        digest.update(chunk)
             stored = StoredFile(
                 file_id=file_id,
                 filename=filename,

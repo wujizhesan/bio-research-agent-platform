@@ -252,6 +252,12 @@ jobs:
           uv run --no-sync python -m scripts.benchmark_upload_usage \
             --samples 8 --histories 0,256,2048 --workspace-root output \
             > output/upload-usage-benchmark.json
+      - name: Compare complete upload inspection responsiveness
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_upload_inspection \
+            --samples 8 --sizes-mib 1,16 --concurrency 1,2 --workspace-root output \
+            > output/upload-inspection-benchmark.json
       - name: Compare committed SSE event delivery
         run: |
           mkdir -p output
@@ -340,6 +346,7 @@ jobs:
             output/job-event-delivery-benchmark.json
             output/upload-concurrency-benchmark.json
             output/upload-usage-benchmark.json
+            output/upload-inspection-benchmark.json
             output/cdr-text-benchmark.json
             output/vcf-compression-benchmark.json
             frontend/playwright-report
