@@ -258,6 +258,12 @@ jobs:
           uv run --no-sync python -m scripts.benchmark_upload_inspection \
             --samples 8 --sizes-mib 1,16 --concurrency 1,2 --workspace-root output \
             > output/upload-inspection-benchmark.json
+      - name: Compare directory publication manifest reuse
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_directory_publication \
+            --samples 8 --file-counts 32,512,2048 --workspace-root output \
+            > output/directory-publication-benchmark.json
       - name: Compare committed SSE event delivery
         run: |
           mkdir -p output
@@ -347,6 +353,7 @@ jobs:
             output/upload-concurrency-benchmark.json
             output/upload-usage-benchmark.json
             output/upload-inspection-benchmark.json
+            output/directory-publication-benchmark.json
             output/cdr-text-benchmark.json
             output/vcf-compression-benchmark.json
             frontend/playwright-report

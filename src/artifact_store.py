@@ -1,14 +1,16 @@
 """Durable publication for generated job artifacts."""
 
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 import gzip
 import hashlib
+import inspect
 import mimetypes
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import tarfile
 
 try:
@@ -38,18 +40,161 @@ def _remove(path):
         return
 
 
-def _sha256(path):
+def _stat_fingerprint(info, renamed=False):
+    # Renaming the published root changes ctime without changing its contents.
+    return (
+        info.st_mode, info.st_dev, info.st_ino, info.st_nlink,
+        info.st_size, info.st_mtime_ns,
+        None if renamed else info.st_ctime_ns,
+    )
+
+
+def _check_stat(actual, expected, renamed=False):
+    if _stat_fingerprint(actual, renamed) != _stat_fingerprint(expected, renamed):
+        raise StorageIntegrityError('artifact changed during publication')
+
+
+def _checked_stat(path, expected, renamed=False):
+    try:
+        actual = path.lstat()
+    except OSError as exc:
+        raise StorageIntegrityError('artifact changed during publication') from exc
+    _check_stat(actual, expected, renamed)
+
+
+@contextmanager
+def _verified_file(path, expected=None):
+    if expected is not None:
+        _checked_stat(path, expected)
+    with Path(path).open('rb') as handle:
+        if expected is not None:
+            _check_stat(os.fstat(handle.fileno()), expected)
+        yield handle
+        if expected is not None:
+            _check_stat(os.fstat(handle.fileno()), expected)
+
+
+@dataclass(frozen=True)
+class DirectoryEntry:
+    relative: Path
+    info: os.stat_result
+
+
+@dataclass(frozen=True)
+class DirectoryManifest:
+    root: Path
+    root_info: os.stat_result
+    entries: tuple[DirectoryEntry, ...]
+
+    @classmethod
+    def capture(cls, root):
+        root = Path(root)
+        root_info = root.lstat()
+        if stat.S_ISLNK(root_info.st_mode):
+            raise StorageIntegrityError('artifact publication rejects symbolic links')
+        if not stat.S_ISDIR(root_info.st_mode):
+            raise StorageIntegrityError('artifact directory is unavailable')
+        entries = []
+        for path in sorted(root.rglob('*')):
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                raise StorageIntegrityError('artifact publication rejects symbolic links')
+            entries.append(DirectoryEntry(path.relative_to(root), info))
+        return cls(root, root_info, tuple(entries))
+
+    @property
+    def has_files(self):
+        return any(stat.S_ISREG(entry.info.st_mode) for entry in self.entries)
+
+    def reservation_size(self, archive=False):
+        size = sum(
+            entry.info.st_size for entry in self.entries
+            if stat.S_ISREG(entry.info.st_mode)
+        )
+        if archive:
+            size += max(1024 * 1024, size // 20)
+        return max(size, 1)
+
+    def fingerprint(self):
+        return (
+            self.root, _stat_fingerprint(self.root_info),
+            tuple((entry.relative, _stat_fingerprint(entry.info)) for entry in self.entries),
+        )
+
+    def matches(self, fingerprint):
+        root, root_fingerprint, entries = fingerprint
+        return (
+            self.root == root
+            and _stat_fingerprint(self.root_info) == root_fingerprint
+            and len(self.entries) == len(entries)
+            and all(
+                entry.relative == relative
+                and _stat_fingerprint(entry.info) == expected
+                for entry, (relative, expected) in zip(self.entries, entries)
+            )
+        )
+
+    def check_root(self, root):
+        if self.root != Path(root):
+            raise StorageIntegrityError('artifact manifest does not match directory')
+        _checked_stat(Path(root), self.root_info)
+
+    def check_directories(self, root, renamed=False):
+        root = Path(root)
+        _checked_stat(root, self.root_info, renamed)
+        for entry in self.entries:
+            if stat.S_ISDIR(entry.info.st_mode):
+                _checked_stat(root / entry.relative, entry.info)
+
+
+def _accepts_directory_manifest(method):
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        or (
+            parameter.name == 'directory_manifest'
+            and parameter.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        )
+        for parameter in parameters
+    )
+
+
+def _supports_directory_manifests(store):
+    return (
+        getattr(store, 'supports_directory_manifests', False) is True
+        and _accepts_directory_manifest(store.plan)
+        and _accepts_directory_manifest(store.publish)
+    )
+
+
+def _directory_plan_options(store, manifest):
+    return (
+        {'directory_manifest': manifest}
+        if manifest is not None and _accepts_directory_manifest(store.plan) else {}
+    )
+
+
+def _sha256(path, expected=None):
     digest = hashlib.sha256()
     size = 0
-    with Path(path).open('rb') as handle:
+    with _verified_file(Path(path), expected) as handle:
         for chunk in iter(lambda: handle.read(CHUNK_SIZE), b''):
             size += len(chunk)
             digest.update(chunk)
     return digest.hexdigest(), size
 
 
-def _reservation_size(path, archive=False):
+def _reservation_size(path, archive=False, directory_manifest=None):
     path = Path(path)
+    if directory_manifest is not None:
+        directory_manifest.check_root(path)
+        return directory_manifest.reservation_size(archive)
     if path.is_file():
         return max(path.stat().st_size, 1)
     size = sum(
@@ -90,7 +235,7 @@ class _ArchiveChecksumWriter:
         self.handle.flush()
 
 
-def _archive_directory(source, target, root_name, compresslevel=9):
+def _archive_directory(source, target, root_name, compresslevel=9, directory_manifest=None):
     source = Path(source)
     raw = target.open('wb')
     try:
@@ -105,27 +250,48 @@ def _archive_directory(source, target, root_name, compresslevel=9):
                     mode='w',
                     format=tarfile.PAX_FORMAT,
                 ) as archive:
-                    entries = [source, *sorted(source.rglob('*'))]
-                    for entry in entries:
+                    entries = (
+                        [(source, directory_manifest.root_info), *(
+                            (source / item.relative, item.info)
+                            for item in directory_manifest.entries
+                        )] if directory_manifest is not None else
+                        [(entry, None) for entry in [source, *sorted(source.rglob('*'))]]
+                    )
+                    for entry, expected in entries:
                         relative = entry.relative_to(source)
                         arcname = Path(root_name) / relative
-                        info = archive.gettarinfo(str(entry), arcname.as_posix())
-                        info.uid = 0
-                        info.gid = 0
-                        info.uname = ''
-                        info.gname = ''
-                        info.mtime = 0
-                        info.mode = 0o755 if entry.is_dir() else 0o644
-                        if entry.is_file():
-                            with entry.open('rb') as handle:
+                        is_directory = stat.S_ISDIR(expected.st_mode) if expected is not None else entry.is_dir()
+                        is_file = stat.S_ISREG(expected.st_mode) if expected is not None else entry.is_file()
+                        if expected is not None and not is_file:
+                            _checked_stat(entry, expected)
+                        if is_file:
+                            with _verified_file(entry, expected) as handle:
+                                info = archive.gettarinfo(
+                                    str(entry), arcname.as_posix(),
+                                    fileobj=handle if expected is not None else None,
+                                )
+                                _normalize_tarinfo(info, is_directory)
                                 archive.addfile(info, handle)
                         else:
+                            info = archive.gettarinfo(str(entry), arcname.as_posix())
+                            _normalize_tarinfo(info, is_directory)
                             archive.addfile(info)
+        if directory_manifest is not None:
+            directory_manifest.check_directories(source)
     except Exception:
         with suppress(OSError):
             target.unlink(missing_ok=True)
         raise
     return writer.digest.hexdigest(), writer.size_bytes
+
+
+def _normalize_tarinfo(info, is_directory):
+    info.uid = 0
+    info.gid = 0
+    info.uname = ''
+    info.gname = ''
+    info.mtime = 0
+    info.mode = 0o755 if is_directory else 0o644
 
 
 def _artifact_id(context, parameter, index):
@@ -170,8 +336,11 @@ class PublishedArtifactHandle:
 
 class LocalArtifactStore:
     backend = 'local'
+    supports_directory_manifests = True
 
-    def plan(self, staged, target, parameter, kind, context, index):
+    def plan(self, staged, target, parameter, kind, context, index, *, directory_manifest=None):
+        if directory_manifest is None and Path(staged).is_dir():
+            directory_manifest = DirectoryManifest.capture(staged)
         target = Path(target)
         artifact_id = _artifact_id(context, parameter, index)
         return {
@@ -182,35 +351,48 @@ class LocalArtifactStore:
             'filename': target.name,
             'storage_backend': self.backend,
             'path': str(target),
-            'reserved_bytes': _reservation_size(staged),
+            'reserved_bytes': _reservation_size(staged, directory_manifest=directory_manifest),
         }
 
-    def publish(self, staged, target, parameter, kind, context, index):
+    def publish(self, staged, target, parameter, kind, context, index, *, directory_manifest=None):
         staged = Path(staged)
         target = Path(target)
-        _reject_symlinks(staged)
+        if directory_manifest is None and staged.is_dir():
+            directory_manifest = DirectoryManifest.capture(staged)
+        if directory_manifest is not None:
+            directory_manifest.check_root(staged)
+        else:
+            _reject_symlinks(staged)
         if target.exists():
             raise FileExistsError(f'artifact target already exists: {target.name}')
-        plan = self.plan(staged, target, parameter, kind, context, index)
+        plan = self.plan(
+            staged, target, parameter, kind, context, index,
+            **_directory_plan_options(self, directory_manifest),
+        )
         target.parent.mkdir(parents=True, exist_ok=True)
         os.replace(staged, target)
-        if target.is_dir():
-            digest = hashlib.sha256()
-            size = 0
-            for entry in sorted(target.rglob('*')):
-                if not entry.is_file():
-                    continue
-                relative = entry.relative_to(target).as_posix().encode('utf-8')
-                file_hash, file_size = _sha256(entry)
-                digest.update(relative)
-                digest.update(b'\0')
-                digest.update(file_hash.encode('ascii'))
-                size += file_size
-            sha256 = digest.hexdigest()
-            content_type = 'application/x-directory'
-        else:
-            sha256, size = _sha256(target)
-            content_type = mimetypes.guess_type(target.name)[0] or 'application/octet-stream'
+        try:
+            if directory_manifest is not None:
+                digest = hashlib.sha256()
+                size = 0
+                for entry in directory_manifest.entries:
+                    if not stat.S_ISREG(entry.info.st_mode):
+                        continue
+                    relative = entry.relative.as_posix().encode('utf-8')
+                    file_hash, file_size = _sha256(target / entry.relative, entry.info)
+                    digest.update(relative)
+                    digest.update(b'\0')
+                    digest.update(file_hash.encode('ascii'))
+                    size += file_size
+                directory_manifest.check_directories(target, renamed=True)
+                sha256 = digest.hexdigest()
+                content_type = 'application/x-directory'
+            else:
+                sha256, size = _sha256(target)
+                content_type = mimetypes.guess_type(target.name)[0] or 'application/octet-stream'
+        except Exception:
+            _remove(target)
+            raise
         record = {
             **plan,
             'content_type': content_type,
@@ -229,6 +411,7 @@ class LocalArtifactStore:
 
 class S3ArtifactStore:
     backend = 's3'
+    supports_directory_manifests = True
 
     def __init__(
         self,
@@ -268,9 +451,11 @@ class S3ArtifactStore:
             request['ExpectedBucketOwner'] = self.expected_bucket_owner
         return request
 
-    def plan(self, staged, target, parameter, kind, context, index):
+    def plan(self, staged, target, parameter, kind, context, index, *, directory_manifest=None):
         staged = Path(staged)
         target = Path(target)
+        if directory_manifest is None and staged.is_dir():
+            directory_manifest = DirectoryManifest.capture(staged)
         artifact_id = _artifact_id(context, parameter, index)
         publication_id = _publication_id(context, artifact_id)
         filename = _safe_segment(target.name, f'artifact-{index}')
@@ -299,14 +484,23 @@ class S3ArtifactStore:
             'reserved_bytes': _reservation_size(
                 staged,
                 archive=str(kind) == 'directory' or staged.is_dir(),
+                directory_manifest=directory_manifest,
             ),
         }
 
-    def publish(self, staged, target, parameter, kind, context, index):
+    def publish(self, staged, target, parameter, kind, context, index, *, directory_manifest=None):
         staged = Path(staged)
         target = Path(target)
-        _reject_symlinks(staged)
-        plan = self.plan(staged, target, parameter, kind, context, index)
+        if directory_manifest is None and staged.is_dir():
+            directory_manifest = DirectoryManifest.capture(staged)
+        if directory_manifest is not None:
+            directory_manifest.check_root(staged)
+        else:
+            _reject_symlinks(staged)
+        plan = self.plan(
+            staged, target, parameter, kind, context, index,
+            **_directory_plan_options(self, directory_manifest),
+        )
         artifact_id = plan['artifact_id']
         packaged = None
         upload_path = staged
@@ -316,6 +510,7 @@ class S3ArtifactStore:
             packaged = staged.parent / f'.{artifact_id}.tar.gz'
             sha256, size = _archive_directory(
                 staged, packaged, target.name, compresslevel=1,
+                directory_manifest=directory_manifest,
             )
             upload_path = packaged
             content_type = 'application/gzip'

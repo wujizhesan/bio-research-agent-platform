@@ -1,4 +1,5 @@
 import hashlib
+import os
 from io import BytesIO
 import tarfile
 import tempfile
@@ -11,11 +12,14 @@ from scripts.benchmark_artifact_archiving import archive_with_reread
 from src.artifact_store import (
     LocalArtifactStore,
     S3ArtifactStore,
+    DirectoryManifest,
     _ArchiveChecksumWriter,
     _archive_directory,
+    _sha256,
     pack_execution_result,
     unpack_execution_result,
 )
+from src.execution_semantics import ArtifactTransaction, StagedArtifact
 from src.storage_workspace import S3ObjectReference, StorageIntegrityError
 
 
@@ -46,6 +50,250 @@ class FakeS3Client:
 
 
 class ArtifactStoreTests(unittest.TestCase):
+    def _directory_transaction(self, root, store, required=True, plan=True):
+        staged, target = root / 'staged', root / 'dataset'
+        staged.mkdir()
+        (staged / 'nested').mkdir()
+        (staged / 'empty').mkdir()
+        (staged / 'a.txt').write_bytes(b'alpha\n')
+        (staged / 'nested' / '科研结果.txt').write_bytes(b'beta\n')
+        transaction = ArtifactTransaction({}, [
+            StagedArtifact(0, 'output_dir', target, staged, True, required),
+        ])
+        context = {'job_id': 'job-directory', 'execution_key': 'execution-directory'}
+        plans = transaction.plan(store, context) if plan else ()
+        return transaction, staged, target, context, plans
+
+    def test_manifest_publication_preserves_bytes_metadata_and_reservation(self):
+        for backend in ('local', 's3'):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as raw:
+                root, client = Path(raw), FakeS3Client()
+                store = LocalArtifactStore() if backend == 'local' else S3ArtifactStore('results', client=client)
+                transaction, staged, target, context, plans = self._directory_transaction(root, store)
+                publication = transaction.publish({'output_dir': str(staged)}, store, context)
+                record = publication.artifacts[0]
+                self.assertEqual(record['reserved_bytes'], plans[0]['reserved_bytes'])
+                self.assertEqual(record['artifact_id'], plans[0]['artifact_id'])
+                if backend == 'local':
+                    digest = hashlib.sha256()
+                    for relative, payload in (('a.txt', b'alpha\n'), ('nested/科研结果.txt', b'beta\n')):
+                        digest.update(relative.encode())
+                        digest.update(b'\0')
+                        digest.update(hashlib.sha256(payload).hexdigest().encode())
+                        self.assertEqual((target / relative).read_bytes(), payload)
+                    self.assertEqual(record['sha256'], digest.hexdigest())
+                    self.assertEqual(record['size_bytes'], 11)
+                    self.assertEqual(publication.result['output_dir'], str(target))
+                else:
+                    body = client.objects[('results', record['storage_key'])]['body']
+                    expected = root / 'expected.tar.gz'
+                    _archive_directory(staged, expected, 'dataset', compresslevel=1)
+                    self.assertEqual(body, expected.read_bytes())
+                    self.assertEqual(record['sha256'], hashlib.sha256(body).hexdigest())
+                    self.assertEqual(record['size_bytes'], len(body))
+                    self.assertLessEqual(len(body), record['reserved_bytes'])
+                publication.finalize()
+                if backend == 's3':
+                    self.assertFalse(staged.exists())
+
+    def test_directory_changes_after_planning_are_rejected_and_rolled_back(self):
+        for backend in ('local', 's3'):
+            for mutation in ('add', 'delete', 'rename', 'rewrite', 'replace', 'type', 'empty_directory', 'root'):
+                with self.subTest(backend=backend, mutation=mutation), tempfile.TemporaryDirectory() as raw:
+                    root, client = Path(raw), FakeS3Client()
+                    store = LocalArtifactStore() if backend == 'local' else S3ArtifactStore('results', client=client)
+                    transaction, staged, target, context, _ = self._directory_transaction(root, store)
+                    path = staged / 'a.txt'
+                    if mutation == 'add':
+                        (staged / 'new.txt').write_bytes(b'new')
+                    elif mutation == 'delete':
+                        path.unlink()
+                    elif mutation == 'rename':
+                        path.rename(staged / 'renamed.txt')
+                    elif mutation == 'rewrite':
+                        info = path.stat()
+                        path.write_bytes(b'other\n')
+                        os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+                    elif mutation == 'replace':
+                        replacement = staged / 'replacement'
+                        replacement.write_bytes(path.read_bytes())
+                        info = path.stat()
+                        os.utime(replacement, ns=(info.st_atime_ns, info.st_mtime_ns))
+                        replacement.replace(path)
+                    elif mutation == 'type':
+                        path.unlink()
+                        path.mkdir()
+                    elif mutation == 'empty_directory':
+                        (staged / 'empty' / 'new').mkdir()
+                    else:
+                        staged.rename(root / 'old-stage')
+                        staged.mkdir()
+                        (staged / 'replacement.txt').write_bytes(b'replaced')
+                    with self.assertRaisesRegex(StorageIntegrityError, 'changed after planning'):
+                        transaction.publish({'output_dir': str(staged)}, store, context)
+                    self.assertFalse(staged.exists())
+                    self.assertFalse(target.exists())
+                    self.assertEqual(client.objects, {})
+                    self.assertEqual(list(root.glob('*.tar.gz')), [])
+
+    def test_directory_links_are_rejected_before_and_after_planning(self):
+        for backend in ('local', 's3'):
+            for timing in ('before', 'after'):
+                for link_root in (False, True):
+                    with self.subTest(backend=backend, timing=timing, link_root=link_root), tempfile.TemporaryDirectory() as raw:
+                        root, client = Path(raw), FakeS3Client()
+                        outside = root / 'outside'
+                        outside.mkdir()
+                        (outside / 'secret.txt').write_bytes(b'outside')
+                        store = LocalArtifactStore() if backend == 'local' else S3ArtifactStore('results', client=client)
+                        transaction, staged, target, context, _ = self._directory_transaction(root, store, plan=timing == 'after')
+                        link = staged / 'nested' / 'link'
+                        if link_root:
+                            staged.rename(root / 'old-stage')
+                            link = staged
+                        try:
+                            link.symlink_to(outside, target_is_directory=True)
+                        except OSError as exc:
+                            self.skipTest(f'symbolic links unavailable: {exc}')
+                        with self.assertRaisesRegex(RuntimeError, 'symbolic'):
+                            if timing == 'before':
+                                transaction.plan(store, context)
+                            else:
+                                transaction.publish({'output_dir': str(staged)}, store, context)
+                        transaction.rollback()
+                        self.assertFalse(staged.exists())
+                        self.assertFalse(target.exists())
+                        self.assertEqual((outside / 'secret.txt').read_bytes(), b'outside')
+                        self.assertEqual(client.objects, {})
+
+    def test_local_change_during_hashing_removes_moved_target(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root, store = Path(raw), LocalArtifactStore()
+            transaction, staged, target, context, _ = self._directory_transaction(root, store)
+
+            def mutate(path, expected=None):
+                Path(path).write_bytes(b'changed during hashing')
+                return _sha256(path, expected)
+
+            with patch('src.artifact_store._sha256', side_effect=mutate):
+                with self.assertRaisesRegex(StorageIntegrityError, 'changed during publication'):
+                    transaction.publish({'output_dir': str(staged)}, store, context)
+            self.assertFalse(staged.exists())
+            self.assertFalse(target.exists())
+
+    def test_s3_change_during_archive_read_removes_partial_package(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root, client = Path(raw), FakeS3Client()
+            store = S3ArtifactStore('results', client=client)
+            transaction, staged, target, context, _ = self._directory_transaction(root, store)
+            addfile = tarfile.TarFile.addfile
+
+            def mutate(archive, info, fileobj=None):
+                if fileobj is not None:
+                    Path(fileobj.name).write_bytes(b'changed during archive read')
+                return addfile(archive, info, fileobj)
+
+            with patch.object(tarfile.TarFile, 'addfile', mutate):
+                with self.assertRaisesRegex(StorageIntegrityError, 'changed during publication'):
+                    transaction.publish({'output_dir': str(staged)}, store, context)
+            self.assertFalse(staged.exists())
+            self.assertFalse(target.exists())
+            self.assertEqual(list(root.glob('*.tar.gz')), [])
+            self.assertEqual(client.objects, {})
+
+    def test_optional_directory_growth_after_empty_plan_is_rejected(self):
+        for generated in (False, True):
+            with self.subTest(generated=generated), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                staged, target = root / 'staged', root / 'dataset'
+                if generated:
+                    staged.mkdir()
+                transaction = ArtifactTransaction({}, [StagedArtifact(0, 'output_dir', target, staged, True, False)])
+                store = LocalArtifactStore()
+                self.assertEqual(transaction.plan(store, {}), ())
+                staged.mkdir(exist_ok=True)
+                (staged / 'unexpected.txt').write_bytes(b'new artifact')
+                with self.assertRaisesRegex(StorageIntegrityError, 'changed after planning'):
+                    transaction.publish({}, store, {})
+                self.assertFalse(staged.exists())
+                self.assertFalse(target.exists())
+
+    def test_legacy_store_keeps_existing_plan_and_publish_arguments(self):
+        class LegacyStore:
+            def plan(self, staged, target, parameter, kind, context, index):
+                return LocalArtifactStore().plan(staged, target, parameter, kind, context, index)
+
+            def publish(self, staged, target, parameter, kind, context, index):
+                return LocalArtifactStore().publish(staged, target, parameter, kind, context, index)
+
+        class LegacySubclass(LocalArtifactStore):
+            def plan(self, staged, target, parameter, kind, context, index):
+                return super().plan(staged, target, parameter, kind, context, index)
+
+        for store in (LegacyStore(), LegacySubclass()):
+            with self.subTest(store=type(store).__name__), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                transaction, staged, target, context, _ = self._directory_transaction(root, store)
+                publication = transaction.publish({}, store, context)
+                self.assertEqual((target / 'a.txt').read_bytes(), b'alpha\n')
+                self.assertEqual(publication.artifacts[0]['size_bytes'], 11)
+                publication.finalize()
+
+    def test_manifest_from_another_directory_is_rejected(self):
+        for backend in ('local', 's3'):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as raw:
+                root, client = Path(raw), FakeS3Client()
+                staged, other = root / 'staged', root / 'other'
+                staged.mkdir()
+                other.mkdir()
+                (staged / 'result.txt').write_bytes(b'result')
+                manifest = DirectoryManifest.capture(other)
+                store = LocalArtifactStore() if backend == 'local' else S3ArtifactStore('results', client=client)
+                for operation in (store.plan, store.publish):
+                    with self.assertRaisesRegex(StorageIntegrityError, 'does not match directory'):
+                        operation(staged, root / 'target', 'output_dir', 'directory', {}, 0, directory_manifest=manifest)
+                self.assertEqual((staged / 'result.txt').read_bytes(), b'result')
+                self.assertFalse((root / 'target').exists())
+                self.assertEqual(client.objects, {})
+
+    def test_replanning_refreshes_manifest_and_allows_read_access(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root, store = Path(raw), LocalArtifactStore()
+            transaction, staged, target, context, first = self._directory_transaction(root, store, plan=False)
+            path = staged / 'a.txt'
+            os.utime(path, ns=(0, 0))
+            first = transaction.plan(store, context)
+            path.read_bytes()
+            (staged / 'new.txt').write_bytes(b'new')
+            refreshed = transaction.plan(store, context)
+            path.read_bytes()
+            self.assertEqual(refreshed[0]['reserved_bytes'], first[0]['reserved_bytes'] + 3)
+            publication = transaction.publish({}, store, context)
+            self.assertEqual(publication.artifacts[0]['size_bytes'], 14)
+            self.assertEqual((target / 'new.txt').read_bytes(), b'new')
+            publication.finalize()
+
+    def test_manifest_archive_preserves_hardlinks(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root, client = Path(raw), FakeS3Client()
+            store = S3ArtifactStore('results', client=client)
+            transaction, staged, target, context, _ = self._directory_transaction(root, store, plan=False)
+            try:
+                os.link(staged / 'a.txt', staged / 'alias.txt')
+            except OSError as exc:
+                self.skipTest(f'hard links unavailable: {exc}')
+            transaction.plan(store, context)
+            publication = transaction.publish({}, store, context)
+            record = publication.artifacts[0]
+            body = client.objects[('results', record['storage_key'])]['body']
+            expected = root / 'expected.tar.gz'
+            _archive_directory(staged, expected, 'dataset', compresslevel=1)
+            self.assertEqual(body, expected.read_bytes())
+            with tarfile.open(fileobj=BytesIO(body), mode='r:gz') as archive:
+                self.assertTrue(archive.getmember('dataset/alias.txt').islnk())
+                self.assertEqual(archive.extractfile('dataset/alias.txt').read(), b'alpha\n')
+            publication.finalize()
+
     def test_local_store_publishes_integrity_manifest(self):
         with tempfile.TemporaryDirectory(prefix='artifact_local_') as raw:
             root = Path(raw)

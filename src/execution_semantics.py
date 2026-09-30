@@ -5,6 +5,11 @@ import os
 from pathlib import Path
 import shutil
 
+try:
+    from .artifact_store import DirectoryManifest, StorageIntegrityError, _supports_directory_manifests
+except ImportError:
+    from artifact_store import DirectoryManifest, StorageIntegrityError, _supports_directory_manifests
+
 
 VALID_EXECUTION_SEMANTICS = frozenset({'pure', 'idempotent', 'side_effecting'})
 VALID_ARTIFACT_KINDS = frozenset({'file', 'directory'})
@@ -214,6 +219,7 @@ class ArtifactTransaction:
         self.arguments = arguments
         self.artifacts = tuple(artifacts)
         self._finished = False
+        self._planned_directory_fingerprints = None
 
     @classmethod
     def prepare(cls, arguments, spec, execution_key):
@@ -266,7 +272,7 @@ class ArtifactTransaction:
             selected[parameter] = staged_values if isinstance(raw, list) else staged_values[0]
         return cls(selected, artifacts)
 
-    def _validated_artifacts(self):
+    def _validated_artifacts(self, directory_manifests=None):
         selected = []
         for artifact in self.artifacts:
             if not artifact.staged.exists():
@@ -284,11 +290,18 @@ class ArtifactTransaction:
                     raise RuntimeError(
                         f'artifact must be a directory: {artifact.parameter}'
                     )
-                files = [
-                    entry for entry in artifact.staged.rglob('*')
-                    if entry.is_file() and not entry.is_symlink()
-                ]
-                if not files:
+                if directory_manifests is None:
+                    files = [
+                        entry
+                        for entry in artifact.staged.rglob('*')
+                        if entry.is_file() and not entry.is_symlink()
+                    ]
+                    has_files = bool(files)
+                else:
+                    manifest = DirectoryManifest.capture(artifact.staged)
+                    directory_manifests[artifact.ordinal] = manifest
+                    has_files = manifest.has_files
+                if not has_files:
                     if artifact.required:
                         raise RuntimeError(
                             f'required artifact directory is empty: {artifact.parameter}'
@@ -307,7 +320,10 @@ class ArtifactTransaction:
         return tuple(selected)
 
     def plan(self, store, context):
-        return tuple(
+        self._planned_directory_fingerprints = None
+        manifests = {} if _supports_directory_manifests(store) else None
+        artifacts = self._validated_artifacts(manifests)
+        plans = tuple(
             store.plan(
                 artifact.staged,
                 artifact.target,
@@ -315,9 +331,15 @@ class ArtifactTransaction:
                 'directory' if artifact.directory else 'file',
                 context,
                 artifact.ordinal,
+                **({'directory_manifest': manifests[artifact.ordinal]} if manifests is not None and artifact.directory else {}),
             )
-            for artifact in self._validated_artifacts()
+            for artifact in artifacts
         )
+        self._planned_directory_fingerprints = (
+            {ordinal: manifest.fingerprint() for ordinal, manifest in manifests.items()}
+            if manifests is not None else None
+        )
+        return plans
 
     def commit(self, result):
         replacements = []
@@ -347,7 +369,16 @@ class ArtifactTransaction:
         handles = []
         replacements = []
         try:
-            for artifact in self._validated_artifacts():
+            manifests = {} if _supports_directory_manifests(store) else None
+            artifacts = self._validated_artifacts(manifests)
+            if manifests is not None and self._planned_directory_fingerprints is not None:
+                planned = self._planned_directory_fingerprints
+                if manifests.keys() != planned.keys() or any(
+                    not manifest.matches(planned[ordinal])
+                    for ordinal, manifest in manifests.items()
+                ):
+                    raise StorageIntegrityError('artifact directory changed after planning')
+            for artifact in artifacts:
                 handle = store.publish(
                     artifact.staged,
                     artifact.target,
@@ -355,6 +386,7 @@ class ArtifactTransaction:
                     'directory' if artifact.directory else 'file',
                     context,
                     artifact.ordinal,
+                    **({'directory_manifest': manifests[artifact.ordinal]} if manifests is not None and artifact.directory else {}),
                 )
                 handles.append(handle)
                 replacements.append((
@@ -373,7 +405,7 @@ class ArtifactTransaction:
         if self._finished:
             return
         for artifact in self.artifacts:
-            if artifact.staged.is_dir():
+            if artifact.staged.is_dir() and not artifact.staged.is_symlink():
                 shutil.rmtree(artifact.staged, ignore_errors=True)
             else:
                 artifact.staged.unlink(missing_ok=True)
