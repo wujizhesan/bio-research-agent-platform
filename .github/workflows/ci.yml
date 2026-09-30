@@ -294,6 +294,12 @@ jobs:
           uv run --no-sync python -m scripts.benchmark_stderr_tail \
             --samples 8 --workspace-root output \
             > output/stderr-tail-benchmark.json
+      - name: Compare bounded isolated worker response reads
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_process_response \
+            --samples 8 --workspace-root output \
+            > output/process-response-benchmark.json
       - name: Compare streaming CDR memory and complete uploads
         run: |
           mkdir -p output
@@ -396,6 +402,7 @@ jobs:
             output/workspace-transfer-benchmark.json
             output/materialization-quota-benchmark.json
             output/stderr-tail-benchmark.json
+            output/process-response-benchmark.json
             output/cdr-streaming-benchmark.json
             output/cdr-text-benchmark.json
             output/vcf-compression-benchmark.json

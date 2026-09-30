@@ -379,6 +379,36 @@ def _read_stderr_tail(path):
     return text.replace('\r\n', '\n').replace('\r', '\n')[-max_chars:].strip()
 
 
+def _read_process_response(path, max_bytes):
+    try:
+        with path.open('rb') as source:
+            size = os.fstat(source.fileno()).st_size
+            if size > max_bytes:
+                raise JobExecutionError(f'job result exceeded {max_bytes} byte limit')
+            encoded = source.read(min(size + 1, max_bytes + 1))
+            if len(encoded) > size:
+                chunks = [encoded]
+                remaining = max_bytes + 1 - len(encoded)
+                while remaining:
+                    chunk = source.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                encoded = b''.join(chunks)
+                del chunks
+        if len(encoded) > max_bytes:
+            raise JobExecutionError(f'job result exceeded {max_bytes} byte limit')
+        text = encoded.decode('utf-8')
+        del encoded
+        payload = json.loads(text)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise JobExecutionError('isolated worker returned an invalid response') from exc
+    if not isinstance(payload, dict):
+        raise JobExecutionError('isolated worker returned an invalid response')
+    return payload
+
+
 class ProcessToolExecutor:
     mode = 'process'
 
@@ -552,14 +582,7 @@ class ProcessToolExecutor:
                 detail = _read_stderr_tail(error_path)
                 suffix = f': {detail}' if detail else ''
                 raise JobExecutionError(f'isolated worker exited with code {process.returncode}{suffix}')
-            if response_path.stat().st_size > self.limits.max_result_bytes:
-                raise JobExecutionError(
-                    f'job result exceeded {self.limits.max_result_bytes} byte limit'
-                )
-            try:
-                payload = json.loads(response_path.read_text(encoding='utf-8'))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise JobExecutionError('isolated worker returned an invalid response') from exc
+            payload = _read_process_response(response_path, self.limits.max_result_bytes)
             if descriptor is not None and payload.get('ok'):
                 payload['result'] = _validate_scoped_result(
                     tool, payload.get('result'), spec
