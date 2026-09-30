@@ -2,6 +2,7 @@ import asyncio
 import gzip
 import hashlib
 import json
+import os
 import random
 import sys
 import tempfile
@@ -12,6 +13,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from unittest import mock
 
+from scripts.benchmark_quota_scan_baseline import WalkQuotaStorage
 from src.file_security import (
     ClamAVScanner,
     ContentDisarmReconstructor,
@@ -797,6 +799,26 @@ class ConcurrentUploadTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(list(root.iterdir()), [root / 'external.txt'])
             self.assertEqual(storage._reserved_bytes, 0)
 
+    async def test_commit_rechecks_existing_external_file_growth(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            external = root / 'external.txt'
+            external.write_bytes(b'small')
+
+            class Pipeline:
+                def process(self, _path, _filename):
+                    external.write_bytes(b'x' * 1900)
+                    return FileSecurityResult('clean', 'clean', 'reconstructed', 2)
+
+            storage = LocalFileStorage(root, total_quota_bytes=2200, security_pipeline=Pipeline())
+            with self.assertRaisesRegex(ValueError, 'quota'):
+                await storage.save(Upload(b'a' * 100, 'sample.txt'))
+            self.assertEqual(list(root.iterdir()), [external])
+            self.assertEqual(external.stat().st_size, 1900)
+            self.assertEqual(storage._quota_usage_bytes, 1900)
+            self.assertEqual(storage._reserved_bytes, 0)
+            self.assertEqual(storage._upload_reservations, {})
+
     async def test_duplicate_id_preserves_another_in_flight_upload(self):
         reading = asyncio.Event()
         release = asyncio.Event()
@@ -1105,6 +1127,192 @@ class UploadInspectionAsyncTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(list(storage.root.iterdir()), [])
                 self.assertEqual(storage._reserved_bytes, 0)
                 self.assertEqual(storage._upload_reservations, {})
+
+
+class StorageUsageTraversalTests(unittest.TestCase):
+    def _compare(self, root, expected, excluded=()):
+        self.assertEqual(WalkQuotaStorage(root)._storage_usage(excluded), expected)
+        self.assertEqual(LocalFileStorage(root)._storage_usage(excluded), expected)
+
+    def test_nested_files_and_root_only_directory_exclusions(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            for name, size in (
+                ('root.txt', 3), ('.hidden', 5), ('active/payload.txt', 13),
+                ('kept/metadata.json', 7), ('kept/active/input.txt', 11),
+                ('.downloads/item.txt', 17),
+            ):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b'x' * size)
+            for excluded, expected in (
+                ((), 56), (('active',), 43),
+                (frozenset({'active', 'root.txt'}), 43),
+                (('kept',), 38), (('missing',), 56),
+            ):
+                with self.subTest(excluded=excluded):
+                    self._compare(root, expected, excluded)
+
+    def test_each_scan_sees_external_growth_deletion_and_recreation(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            nested = root / 'nested'
+            nested.mkdir()
+            (nested / 'metadata.json').write_bytes(b'{}')
+            external = root / 'external.txt'
+            external.write_bytes(b'old')
+            self._compare(root, 5)
+            external.write_bytes(b'new content')
+            self._compare(root, 13)
+            external.unlink()
+            self._compare(root, 2)
+            external.write_bytes(b'back')
+            self._compare(root, 6)
+            (nested / 'metadata.json').unlink()
+            nested.rmdir()
+            self._compare(root, 4)
+
+    def test_file_links_count_targets_and_directory_and_broken_links_are_skipped(self):
+        with tempfile.TemporaryDirectory() as raw:
+            parent = Path(raw)
+            root = parent / 'uploads'
+            root.mkdir()
+            child = root / 'child'
+            child.mkdir()
+            (root / 'root.txt').write_bytes(b'abc')
+            (child / 'data.txt').write_bytes(b'x' * 7)
+            outside = parent / 'outside'
+            outside.mkdir()
+            (outside / 'data.txt').write_bytes(b'x' * 11)
+            try:
+                os.symlink(outside / 'data.txt', root / 'file-link')
+                os.symlink(outside, root / 'directory-link', target_is_directory=True)
+                os.symlink(root, child / 'cycle', target_is_directory=True)
+                os.symlink(outside / 'missing', root / 'broken-link')
+            except OSError as exc:
+                self.skipTest(f'symlinks unavailable: {exc}')
+            self._compare(root, 21)
+
+    def test_scan_errors_preserve_counts_and_close_directory_handles(self):
+        original_scandir, original_stat = os.scandir, Path.stat
+        for fault, expected in (
+            ('open', 12), ('iterate', 0), ('classify', 15), ('stat', 10),
+        ):
+            for implementation in (WalkQuotaStorage, LocalFileStorage):
+                with self.subTest(fault=fault, implementation=implementation.__name__), tempfile.TemporaryDirectory() as raw:
+                    root = Path(raw).resolve()
+                    (root / 'visible.txt').write_bytes(b'x' * 5)
+                    (root / 'other.txt').write_bytes(b'x' * 7)
+                    child = root / 'child'
+                    child.mkdir()
+                    (child / 'data.txt').write_bytes(b'abc')
+                    storage = implementation(root)
+                    state = {'active': 0, 'peak': 0}
+
+                    class Entry:
+                        def __init__(self, entry):
+                            self.entry = entry
+
+                        def __getattr__(self, name):
+                            return getattr(self.entry, name)
+
+                        def is_dir(self, *args, **kwargs):
+                            if fault == 'classify' and self.name == 'visible.txt':
+                                raise PermissionError('classification failed')
+                            return self.entry.is_dir(*args, **kwargs)
+
+                        def stat(self, *args, **kwargs):
+                            if fault == 'stat' and self.name == 'visible.txt':
+                                raise FileNotFoundError('file disappeared')
+                            return self.entry.stat(*args, **kwargs)
+
+                    class Entries:
+                        def __init__(self, handle, directory):
+                            self.handle = handle
+                            self.directory = directory
+                            self.count = 0
+
+                        def __enter__(self):
+                            self.handle.__enter__()
+                            state['active'] += 1
+                            state['peak'] = max(state['peak'], state['active'])
+                            return self
+
+                        def __exit__(self, *args):
+                            state['active'] -= 1
+                            return self.handle.__exit__(*args)
+
+                        def __iter__(self):
+                            return self
+
+                        def __next__(self):
+                            if fault == 'iterate' and self.directory == root and self.count == 1:
+                                raise PermissionError('directory iteration failed')
+                            entry = next(self.handle)
+                            self.count += 1
+                            return Entry(entry)
+
+                    def scandir(directory):
+                        directory = Path(directory)
+                        if fault == 'open' and directory == child:
+                            raise PermissionError('directory unavailable')
+                        return Entries(original_scandir(directory), directory)
+
+                    def stat(path, *args, **kwargs):
+                        if fault == 'stat' and path.name == 'visible.txt':
+                            raise FileNotFoundError('file disappeared')
+                        return original_stat(path, *args, **kwargs)
+
+                    with mock.patch('os.scandir', side_effect=scandir), mock.patch.object(Path, 'stat', stat):
+                        self.assertEqual(storage._storage_usage(), expected)
+                    self.assertEqual(state['active'], 0)
+                    self.assertEqual(state['peak'], 1)
+
+    def test_directory_replaced_by_symlink_is_not_followed(self):
+        original_scandir = os.scandir
+        for implementation in (WalkQuotaStorage, LocalFileStorage):
+            with self.subTest(implementation=implementation.__name__), tempfile.TemporaryDirectory() as raw:
+                parent = Path(raw)
+                root = parent / 'uploads'
+                root.mkdir()
+                child = root / 'child'
+                child.mkdir()
+                (root / 'root.txt').write_bytes(b'abc')
+                outside = parent / 'outside'
+                outside.mkdir()
+                (outside / 'large.txt').write_bytes(b'x' * 1000)
+                probe = parent / 'link-probe'
+                try:
+                    os.symlink(outside, probe, target_is_directory=True)
+                except OSError as exc:
+                    self.skipTest(f'symlinks unavailable: {exc}')
+                probe.unlink()
+                storage = implementation(root)
+
+                class Entries:
+                    def __init__(self):
+                        self.handle = original_scandir(root)
+
+                    def __enter__(self):
+                        self.handle.__enter__()
+                        return self
+
+                    def __iter__(self):
+                        return self
+
+                    def __next__(self):
+                        return next(self.handle)
+
+                    def __exit__(self, *args):
+                        self.handle.close()
+                        child.rmdir()
+                        os.symlink(outside, child, target_is_directory=True)
+
+                def scandir(directory):
+                    return Entries() if Path(directory) == root else original_scandir(directory)
+
+                with mock.patch('os.scandir', side_effect=scandir):
+                    self.assertEqual(storage._storage_usage(), 3)
 
 
 class BlockingUsageStorage(LocalFileStorage):

@@ -8,14 +8,15 @@ from pathlib import Path
 from statistics import median
 from time import perf_counter
 
-from src.file_storage import LocalFileStorage, METADATA_RESERVE_BYTES
+from src.file_storage import METADATA_RESERVE_BYTES
+from scripts.benchmark_quota_scan_baseline import WalkQuotaStorage
 
 
 BASELINE_SOURCE_COMMIT = '373ce90a05c07a651e5d6d6d6dbdc64d952306f0'
 HEARTBEAT_SECONDS = 0.001
 
 
-class ProfiledUsageStorage(LocalFileStorage):
+class ProfiledUsageStorage(WalkQuotaStorage):
     def __init__(self, root):
         super().__init__(root)
         self.usage_seconds = 0.0

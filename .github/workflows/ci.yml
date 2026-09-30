@@ -252,6 +252,12 @@ jobs:
           uv run --no-sync python -m scripts.benchmark_upload_usage \
             --samples 8 --histories 0,256,2048 --workspace-root output \
             > output/upload-usage-benchmark.json
+      - name: Compare directory quota scanning and complete uploads
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_quota_scan \
+            --samples 8 --histories 0,256,2048 --concurrency 1,8 --workspace-root output \
+            > output/quota-scan-benchmark.json
       - name: Compare complete upload inspection responsiveness
         run: |
           mkdir -p output
@@ -359,6 +365,7 @@ jobs:
             output/job-event-delivery-benchmark.json
             output/upload-concurrency-benchmark.json
             output/upload-usage-benchmark.json
+            output/quota-scan-benchmark.json
             output/upload-inspection-benchmark.json
             output/directory-publication-benchmark.json
             output/cdr-streaming-benchmark.json

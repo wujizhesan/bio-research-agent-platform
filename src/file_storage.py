@@ -129,15 +129,35 @@ class LocalFileStorage:
         return path
 
     def _storage_usage(self, exclude_uploads=()) -> int:
+        root = os.fspath(self.root)
+        pending = [root]
         total = 0
-        for directory, names, filenames in os.walk(self.root):
-            if Path(directory) == self.root:
-                names[:] = [name for name in names if name not in exclude_uploads]
-            for filename in filenames:
+        while pending:
+            directory = pending.pop()
+            if directory != root and os.path.islink(directory):
+                continue
+            directories = []
+            files = []
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        try:
+                            is_directory = entry.is_dir()
+                        except OSError:
+                            is_directory = False
+                        if is_directory:
+                            if directory != root or entry.name not in exclude_uploads:
+                                directories.append(entry.path)
+                        else:
+                            files.append(entry)
+            except OSError:
+                continue
+            for entry in files:
                 try:
-                    total += (Path(directory) / filename).stat().st_size
+                    total += entry.stat().st_size
                 except OSError:
                     continue
+            pending.extend(reversed(directories))
         return total
 
     @staticmethod
