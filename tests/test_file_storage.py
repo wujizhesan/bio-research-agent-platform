@@ -1,9 +1,12 @@
 import asyncio
 import gzip
+import hashlib
 import sys
 import tempfile
+import threading
 import types
 import unittest
+from contextvars import ContextVar
 from pathlib import Path
 from unittest import mock
 
@@ -12,6 +15,7 @@ from src.file_security import (
     ContentDisarmReconstructor,
     FileSecurityError,
     FileSecurityPipeline,
+    FileSecurityResult,
     build_file_security_pipeline_from_env,
 )
 from src.file_storage import LocalFileStorage, S3FileStorage
@@ -326,6 +330,304 @@ class LocalFileStorageSecurityTests(unittest.TestCase):
             bomb = gzip.compress(b'A' * 10000)
             with self.assertRaisesRegex(ValueError, 'compression ratio'):
                 asyncio.run(storage.save(Upload(bomb, 'bomb.vcf.gz')))
+
+
+class ConcurrentUploadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_reader_does_not_block_another_upload(self):
+        reading = asyncio.Event()
+        release = asyncio.Event()
+
+        class SlowUpload(Upload):
+            async def read(self, size):
+                reading.set()
+                await release.wait()
+                return await super().read(size)
+
+        with tempfile.TemporaryDirectory() as raw:
+            storage = LocalFileStorage(raw)
+            slow = asyncio.create_task(storage.save(SlowUpload(b'slow', 'slow.txt')))
+            try:
+                await asyncio.wait_for(reading.wait(), 5)
+                fast = await asyncio.wait_for(storage.save(Upload(b'fast', 'fast.txt')), 5)
+                self.assertEqual(fast.path.read_bytes(), b'fast')
+                self.assertFalse(slow.done())
+            finally:
+                release.set()
+                await slow
+            self.assertEqual(storage._reserved_bytes, 0)
+
+    async def test_scans_overlap_with_a_bound_and_queued_cancellation(self):
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = threading.Event()
+        guard = threading.Lock()
+        counts = {'active': 0, 'peak': 0, 'started': 0}
+
+        class Pipeline:
+            def process(self, _path, _filename):
+                with guard:
+                    counts['active'] += 1
+                    counts['started'] += 1
+                    counts['peak'] = max(counts['peak'], counts['active'])
+                    if counts['active'] == 2:
+                        loop.call_soon_threadsafe(started.set)
+                try:
+                    if not release.wait(5):
+                        raise TimeoutError('scan was not released')
+                    return FileSecurityResult('clean', 'clean', 'reconstructed', 2)
+                finally:
+                    with guard:
+                        counts['active'] -= 1
+
+        with tempfile.TemporaryDirectory() as raw:
+            storage = LocalFileStorage(raw, security_pipeline=Pipeline())
+            tasks = [asyncio.create_task(storage.save(
+                Upload(b'content', 'sample.txt'), file_id=str(index) * 32,
+            )) for index in (1, 2, 3)]
+            try:
+                await asyncio.wait_for(started.wait(), 5)
+                self.assertEqual(counts['started'], 2)
+                for index in (1, 2, 3):
+                    with self.assertRaises(FileNotFoundError):
+                        storage.get(str(index) * 32)
+                tasks[2].cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await tasks[2]
+                self.assertFalse((storage.root / ('3' * 32)).exists())
+            finally:
+                release.set()
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+            self.assertEqual(counts['peak'], 2)
+            self.assertEqual(counts['started'], 2)
+            self.assertEqual(sum(not isinstance(item, BaseException) for item in results), 2)
+            self.assertEqual(storage._reserved_bytes, 0)
+
+    async def test_parallel_quota_claims_do_not_double_count_staged_files(self):
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = threading.Event()
+
+        class Pipeline:
+            def process(self, _path, _filename):
+                loop.call_soon_threadsafe(started.set)
+                if not release.wait(5):
+                    raise TimeoutError('scan was not released')
+                return FileSecurityResult('clean', 'clean', 'disabled', 1)
+
+        with tempfile.TemporaryDirectory() as raw:
+            storage = LocalFileStorage(raw, total_quota_bytes=5500, security_pipeline=Pipeline())
+            first = asyncio.create_task(storage.save(Upload(b'a' * 1500, 'first.txt')))
+            try:
+                await asyncio.wait_for(started.wait(), 5)
+                second = asyncio.create_task(storage.save(Upload(b'b' * 1500, 'second.txt')))
+                await asyncio.sleep(0)
+            finally:
+                release.set()
+            results = await asyncio.gather(first, second)
+            self.assertEqual(len(results), 2)
+            self.assertLessEqual(storage._storage_usage(), storage.total_quota_bytes)
+            self.assertEqual(storage._reserved_bytes, 0)
+
+    async def test_in_flight_quota_cannot_be_claimed_twice(self):
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = threading.Event()
+
+        class Pipeline:
+            def process(self, _path, _filename):
+                loop.call_soon_threadsafe(started.set)
+                if not release.wait(5):
+                    raise TimeoutError('scan was not released')
+                return FileSecurityResult('clean', 'clean', 'disabled', 1)
+
+        with tempfile.TemporaryDirectory() as raw:
+            storage = LocalFileStorage(raw, total_quota_bytes=4000, security_pipeline=Pipeline())
+            first = asyncio.create_task(storage.save(Upload(b'a' * 1500, 'first.txt')))
+            try:
+                await asyncio.wait_for(started.wait(), 5)
+                with self.assertRaisesRegex(ValueError, 'quota'):
+                    await storage.save(Upload(b'b' * 1500, 'second.txt'))
+            finally:
+                release.set()
+                await first
+            small = await storage.save(Upload(b'small', 'small.txt'))
+            self.assertEqual(small.path.read_bytes(), b'small')
+            self.assertLessEqual(storage._storage_usage(), storage.total_quota_bytes)
+            self.assertEqual(storage._reserved_bytes, 0)
+
+    async def test_reader_cancellation_cleans_up_and_releases_quota(self):
+        reading = asyncio.Event()
+
+        class SlowUpload(Upload):
+            async def read(self, _size):
+                reading.set()
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as raw:
+            storage = LocalFileStorage(raw, total_quota_bytes=1400)
+            task = asyncio.create_task(storage.save(SlowUpload(b'content', 'slow.txt')))
+            await asyncio.wait_for(reading.wait(), 5)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(list(storage.root.iterdir()), [])
+            stored = await storage.save(Upload(b'retry', 'retry.txt'))
+            self.assertEqual(stored.path.read_bytes(), b'retry')
+            self.assertEqual(storage._reserved_bytes, 0)
+
+    async def test_repeated_cancellation_waits_for_scan_before_cleanup(self):
+        for fail_scan in (False, True):
+            with self.subTest(fail_scan=fail_scan), tempfile.TemporaryDirectory() as raw:
+                loop = asyncio.get_running_loop()
+                started = asyncio.Event()
+                release = threading.Event()
+
+                class Pipeline:
+                    def process(self, path, _filename):
+                        loop.call_soon_threadsafe(started.set)
+                        if not release.wait(5):
+                            raise TimeoutError('scan was not released')
+                        Path(path).write_bytes(b'late rewrite')
+                        if fail_scan:
+                            raise FileSecurityError('late failure')
+                        return FileSecurityResult('clean', 'clean', 'reconstructed', 2)
+
+                storage = LocalFileStorage(raw, security_pipeline=Pipeline())
+                task = asyncio.create_task(storage.save(Upload(b'content', 'sample.txt')))
+                try:
+                    await asyncio.wait_for(started.wait(), 5)
+                    for _ in range(2):
+                        task.cancel()
+                        await asyncio.sleep(0)
+                        self.assertFalse(task.done())
+                        self.assertGreater(storage._reserved_bytes, 0)
+                        self.assertTrue(list(storage.root.iterdir()))
+                finally:
+                    release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertEqual(list(storage.root.iterdir()), [])
+                self.assertEqual(storage._reserved_bytes, 0)
+                retry = await storage.save(Upload(b'retry', 'retry.txt')) if not fail_scan else None
+                if retry is not None:
+                    self.assertEqual(retry.sha256, hashlib.sha256(b'late rewrite').hexdigest())
+
+    async def test_cdr_growth_rechecks_size_and_quota(self):
+        class Pipeline:
+            def process(self, path, _filename):
+                Path(path).write_bytes(b'x' * 2000)
+                return FileSecurityResult('clean', 'clean', 'reconstructed', 2)
+
+        for maximum, quota, error in ((1000, 10000, 'maximum'), (3000, 1800, 'quota')):
+            with self.subTest(maximum=maximum), tempfile.TemporaryDirectory() as raw:
+                storage = LocalFileStorage(raw, max_bytes=maximum, total_quota_bytes=quota, security_pipeline=Pipeline())
+                with self.assertRaisesRegex(ValueError, error):
+                    await storage.save(Upload(b'small', 'sample.txt'))
+                self.assertEqual(list(storage.root.iterdir()), [])
+                self.assertEqual(storage._reserved_bytes, 0)
+
+    async def test_commit_rechecks_external_disk_growth(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+
+            class Pipeline:
+                def process(self, _path, _filename):
+                    (root / 'external.txt').write_bytes(b'x' * 1900)
+                    return FileSecurityResult('clean', 'clean', 'disabled', 1)
+
+            storage = LocalFileStorage(root, total_quota_bytes=2200, security_pipeline=Pipeline())
+            with self.assertRaisesRegex(ValueError, 'quota'):
+                await storage.save(Upload(b'a' * 100, 'sample.txt'))
+            self.assertEqual(list(root.iterdir()), [root / 'external.txt'])
+            self.assertEqual(storage._reserved_bytes, 0)
+
+    async def test_duplicate_id_preserves_another_in_flight_upload(self):
+        reading = asyncio.Event()
+        release = asyncio.Event()
+
+        class SlowUpload(Upload):
+            async def read(self, size):
+                reading.set()
+                await release.wait()
+                return await super().read(size)
+
+        with tempfile.TemporaryDirectory() as raw:
+            storage = LocalFileStorage(raw)
+            file_id = 'a' * 32
+            first = asyncio.create_task(storage.save(SlowUpload(b'first', 'first.txt'), file_id))
+            try:
+                await asyncio.wait_for(reading.wait(), 5)
+                with self.assertRaises(FileExistsError):
+                    await storage.save(Upload(b'second', 'second.txt'), file_id)
+            finally:
+                release.set()
+            stored = await first
+            self.assertEqual(stored.path.read_bytes(), b'first')
+            self.assertEqual(storage._reserved_bytes, 0)
+
+    async def test_metadata_failure_cleans_up_and_releases_quota(self):
+        write_bytes = Path.write_bytes
+
+        def fail_metadata(path, payload):
+            if path.name == 'metadata.json':
+                write_bytes(path, payload[:4])
+                raise OSError('metadata disk failure')
+            return write_bytes(path, payload)
+
+        with tempfile.TemporaryDirectory() as raw:
+            storage = LocalFileStorage(raw, total_quota_bytes=1400)
+            with mock.patch.object(Path, 'write_bytes', fail_metadata):
+                with self.assertRaisesRegex(OSError, 'metadata disk failure'):
+                    await storage.save(Upload(b'content', 'sample.txt'))
+            self.assertEqual(list(storage.root.iterdir()), [])
+            stored = await storage.save(Upload(b'retry', 'retry.txt'))
+            self.assertEqual(stored.path.read_bytes(), b'retry')
+            self.assertEqual(storage._reserved_bytes, 0)
+
+    async def test_parallel_scans_keep_each_upload_context(self):
+        subject = ContextVar('upload-test-subject', default='missing')
+
+        class Pipeline:
+            def process(self, path, _filename):
+                Path(path).write_bytes(subject.get().encode('utf-8'))
+                return FileSecurityResult('clean', 'clean', 'reconstructed', 2)
+
+        with tempfile.TemporaryDirectory() as raw:
+            storage = LocalFileStorage(raw, security_pipeline=Pipeline())
+
+            async def save(name):
+                token = subject.set(name)
+                try:
+                    return await storage.save(Upload(b'content', f'{name}.txt'))
+                finally:
+                    subject.reset(token)
+
+            results = await asyncio.gather(save('alice'), save('bob'))
+            self.assertEqual([stored.path.read_bytes() for stored in results], [b'alice', b'bob'])
+            self.assertEqual(subject.get(), 'missing')
+
+    async def test_failed_cleanup_accounts_for_remaining_disk_bytes(self):
+        class Pipeline:
+            def process(self, _path, _filename):
+                raise FileSecurityError('scan failure')
+
+        unlink = Path.unlink
+
+        def blocked_unlink(path, *args, **kwargs):
+            if path.name == 'sample.txt':
+                raise OSError('cleanup failure')
+            return unlink(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as raw:
+            storage = LocalFileStorage(raw, total_quota_bytes=2200, security_pipeline=Pipeline())
+            with mock.patch.object(Path, 'unlink', blocked_unlink):
+                with self.assertRaisesRegex(OSError, 'cleanup failure'):
+                    await storage.save(Upload(b'x' * 1000, 'sample.txt'))
+            self.assertEqual(storage._storage_usage(), 1000)
+            self.assertEqual(storage._reserved_bytes, 0)
+            self.assertEqual(storage._upload_reservations, {})
+            with self.assertRaisesRegex(ValueError, 'quota'):
+                await storage.save(Upload(b'x' * 1000, 'retry.txt'))
 
 
 if __name__ == '__main__':

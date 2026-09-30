@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+from contextvars import copy_context
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ FILE_ID_PATTERN = re.compile(r'^[a-f0-9]{32}$')
 CHUNK_SIZE = 1024 * 1024
 SNIFF_BYTES = 64 * 1024
 METADATA_RESERVE_BYTES = 1024
+MAX_CONCURRENT_SCANS = 2
 ARCHIVE_SIGNATURES = (
     b'PK\x03\x04', b'PK\x05\x06', b'PK\x07\x08', b'Rar!\x1a\x07',
     b'7z\xbc\xaf\x27\x1c',
@@ -97,6 +99,10 @@ class LocalFileStorage:
         self.security_pipeline = security_pipeline
         self.root.mkdir(parents=True, exist_ok=True)
         self._quota_lock = asyncio.Lock()
+        self._upload_reservations = {}
+        self._reserved_bytes = 0
+        self._quota_usage_bytes = 0
+        self._scan_slots = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
 
     def ping(self):
         if not self.root.is_dir() or not os.access(self.root, os.R_OK | os.W_OK):
@@ -120,15 +126,95 @@ class LocalFileStorage:
             raise ValueError('stored file is outside storage root') from exc
         return path
 
-    def _storage_usage(self) -> int:
+    def _storage_usage(self, exclude_uploads=()) -> int:
         total = 0
-        for directory, _names, filenames in os.walk(self.root):
+        for directory, names, filenames in os.walk(self.root):
+            if Path(directory) == self.root:
+                names[:] = [name for name in names if name not in exclude_uploads]
             for filename in filenames:
                 try:
                     total += (Path(directory) / filename).stat().st_size
                 except OSError:
                     continue
         return total
+
+    async def _begin_upload(self, file_id):
+        async with self._quota_lock:
+            self._quota_usage_bytes = self._storage_usage(self._upload_reservations)
+            if (
+                self._quota_usage_bytes + self._reserved_bytes + METADATA_RESERVE_BYTES
+                > self.total_quota_bytes
+            ):
+                raise ValueError('upload storage quota exceeded')
+            directory = self.root / file_id
+            directory.mkdir(parents=False, exist_ok=False)
+            self._upload_reservations[file_id] = METADATA_RESERVE_BYTES
+            self._reserved_bytes += METADATA_RESERVE_BYTES
+        return directory
+
+    async def _reserve_upload_bytes(self, file_id, size_bytes, message):
+        async with self._quota_lock:
+            previous = self._upload_reservations[file_id]
+            reserved = size_bytes + METADATA_RESERVE_BYTES
+            if (
+                self._quota_usage_bytes + self._reserved_bytes - previous + reserved
+                > self.total_quota_bytes
+            ):
+                raise ValueError(message)
+            self._upload_reservations[file_id] = reserved
+            self._reserved_bytes += reserved - previous
+
+    async def _commit_upload(self, stored):
+        metadata = json.dumps({
+            'file_id': stored.file_id,
+            'filename': stored.filename,
+            'content_type': stored.content_type,
+            'size_bytes': stored.size_bytes,
+            'sha256': stored.sha256,
+            'storage_key': stored.storage_key,
+            'version_id': stored.version_id,
+            'security': stored.security,
+        }, ensure_ascii=False).encode('utf-8')
+        async with self._quota_lock:
+            current_usage = self._storage_usage(self._upload_reservations)
+            remaining = self._reserved_bytes - self._upload_reservations[stored.file_id]
+            committed = stored.size_bytes + len(metadata)
+            if current_usage + remaining + committed > self.total_quota_bytes:
+                raise ValueError('upload storage quota exceeded')
+            (stored.path.parent / 'metadata.json').write_bytes(metadata)
+            self._quota_usage_bytes = current_usage + committed
+            self._reserved_bytes -= self._upload_reservations.pop(stored.file_id)
+
+    async def _abort_upload(self, file_id, directory):
+        async with self._quota_lock:
+            try:
+                if directory.exists():
+                    for child in directory.iterdir():
+                        child.unlink(missing_ok=True)
+                    directory.rmdir()
+            finally:
+                self._reserved_bytes -= self._upload_reservations.pop(file_id)
+                self._quota_usage_bytes = self._storage_usage(self._upload_reservations)
+
+    async def _scan_upload(self, target, filename):
+        async with self._scan_slots:
+            context = copy_context()
+            pending = asyncio.get_running_loop().run_in_executor(
+                None, context.run, self.security_pipeline.process, target, filename,
+            )
+            try:
+                return await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                while not pending.done():
+                    try:
+                        await asyncio.shield(pending)
+                    except asyncio.CancelledError:
+                        continue
+                    except BaseException:
+                        break
+                if not pending.cancelled():
+                    pending.exception()
+                raise
 
     @staticmethod
     def _validate_text(content: bytes) -> str:
@@ -205,95 +291,73 @@ class LocalFileStorage:
             allowed = ', '.join(sorted(self.allowed_extensions | {'.vcf.gz'}))
             raise ValueError(f'unsupported file type: {extension or "none"}; allowed: {allowed}')
 
-        async with self._quota_lock:
-            current_usage = self._storage_usage()
-            file_id = str(file_id or uuid4().hex)
-            if not FILE_ID_PATTERN.fullmatch(file_id):
-                raise ValueError('invalid stored file id')
-            directory = self.root / file_id
-            directory.mkdir(parents=False, exist_ok=False)
-            target = directory / filename
-            metadata_path = directory / 'metadata.json'
-            size_bytes = 0
-            digest = hashlib.sha256()
-            scan_tail = b''
+        file_id = str(file_id or uuid4().hex)
+        if not FILE_ID_PATTERN.fullmatch(file_id):
+            raise ValueError('invalid stored file id')
+        directory = await self._begin_upload(file_id)
+        target = directory / filename
+        size_bytes = 0
+        digest = hashlib.sha256()
+        scan_tail = b''
 
-            try:
-                with target.open('wb') as output:
-                    while True:
-                        chunk = await upload.read(CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        size_bytes += len(chunk)
-                        if size_bytes > self.max_bytes:
-                            raise ValueError(
-                                f'file exceeds maximum size of {self.max_bytes} bytes'
-                            )
-                        if (
-                            current_usage + size_bytes + METADATA_RESERVE_BYTES
-                            > self.total_quota_bytes
-                        ):
-                            raise ValueError('upload storage quota exceeded')
-                        scanned = scan_tail + chunk
-                        if any(marker in scanned for marker in MALWARE_MARKERS):
-                            raise ValueError('known malicious test signature detected')
-                        scan_tail = scanned[-64:]
-                        output.write(chunk)
-                        digest.update(chunk)
-                if size_bytes == 0:
-                    raise ValueError('empty files are not allowed')
+        try:
+            with target.open('wb') as output:
+                while True:
+                    chunk = await upload.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    size_bytes += len(chunk)
+                    if size_bytes > self.max_bytes:
+                        raise ValueError(
+                            f'file exceeds maximum size of {self.max_bytes} bytes'
+                        )
+                    await self._reserve_upload_bytes(
+                        file_id, size_bytes, 'upload storage quota exceeded',
+                    )
+                    scanned = scan_tail + chunk
+                    if any(marker in scanned for marker in MALWARE_MARKERS):
+                        raise ValueError('known malicious test signature detected')
+                    scan_tail = scanned[-64:]
+                    output.write(chunk)
+                    digest.update(chunk)
+            if size_bytes == 0:
+                raise ValueError('empty files are not allowed')
+            content_type = self._inspect_content(
+                target, filename, size_bytes
+            )
+            security = None
+            if self.security_pipeline is not None:
+                scan_result = await self._scan_upload(target, filename)
+                security = scan_result.as_dict()
+                size_bytes = target.stat().st_size
+                if size_bytes > self.max_bytes:
+                    raise ValueError(
+                        'CDR output exceeds maximum upload size'
+                    )
+                await self._reserve_upload_bytes(
+                    file_id, size_bytes, 'CDR output exceeds upload storage quota',
+                )
                 content_type = self._inspect_content(
                     target, filename, size_bytes
                 )
-                security = None
-                if self.security_pipeline is not None:
-                    scan_result = await asyncio.to_thread(
-                        self.security_pipeline.process, target, filename
-                    )
-                    security = scan_result.as_dict()
-                    size_bytes = target.stat().st_size
-                    if size_bytes > self.max_bytes:
-                        raise ValueError(
-                            'CDR output exceeds maximum upload size'
-                        )
-                    if (
-                        current_usage + size_bytes + METADATA_RESERVE_BYTES
-                        > self.total_quota_bytes
-                    ):
-                        raise ValueError('CDR output exceeds upload storage quota')
-                    content_type = self._inspect_content(
-                        target, filename, size_bytes
-                    )
-                    digest = hashlib.sha256()
-                    with target.open('rb') as source:
-                        for chunk in iter(lambda: source.read(CHUNK_SIZE), b''):
-                            digest.update(chunk)
-                stored = StoredFile(
-                    file_id=file_id,
-                    filename=filename,
-                    content_type=content_type,
-                    size_bytes=size_bytes,
-                    sha256=digest.hexdigest(),
-                    path=target,
-                    security=security,
-                )
-                metadata_path.write_text(json.dumps({
-                    'file_id': stored.file_id,
-                    'filename': stored.filename,
-                    'content_type': stored.content_type,
-                    'size_bytes': stored.size_bytes,
-                    'sha256': stored.sha256,
-                    'storage_key': stored.storage_key,
-                    'version_id': stored.version_id,
-                    'security': stored.security,
-                }, ensure_ascii=False), encoding='utf-8')
-                return stored
-            except Exception:
-                if directory.exists():
-                    for child in directory.iterdir():
-                        child.unlink(missing_ok=True)
-                    directory.rmdir()
-                raise
+                digest = hashlib.sha256()
+                with target.open('rb') as source:
+                    for chunk in iter(lambda: source.read(CHUNK_SIZE), b''):
+                        digest.update(chunk)
+            stored = StoredFile(
+                file_id=file_id,
+                filename=filename,
+                content_type=content_type,
+                size_bytes=size_bytes,
+                sha256=digest.hexdigest(),
+                path=target,
+                security=security,
+            )
+            await self._commit_upload(stored)
+            return stored
+        except BaseException:
+            await self._abort_upload(file_id, directory)
+            raise
 
     def get(self, file_id: str, reference=None) -> StoredFile:
         if reference is not None:

@@ -228,6 +228,12 @@ jobs:
           uv run --no-sync python scripts/configure_tenant_context.py --enable
       - name: Test real PostgreSQL and Redis
         run: uv run --no-sync python -m pytest tests/integration/test_external_services.py -q
+      - name: Compare concurrent upload quota reservations
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_upload_concurrency \
+            --samples 8 --concurrency 2,4,8 --workspace-root output \
+            > output/upload-concurrency-benchmark.json
       - name: Compare committed SSE event delivery
         run: |
           mkdir -p output
@@ -314,6 +320,7 @@ jobs:
             output/ci-fullstack-*.log
             output/ci-fullstack-health.json
             output/job-event-delivery-benchmark.json
+            output/upload-concurrency-benchmark.json
             frontend/playwright-report
             frontend/test-results
           if-no-files-found: ignore
