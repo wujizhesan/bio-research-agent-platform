@@ -25,7 +25,12 @@ _PHRED33_BYTES = bytes(max(0, value - 33) for value in range(256))
 
 def _phred33_sum(quality):
     if quality.isascii():
-        return sum(quality.encode('ascii').translate(_PHRED33_BYTES))
+        if len(quality) <= 65536:
+            return sum(quality.encode('ascii').translate(_PHRED33_BYTES))
+        return sum(
+            sum(quality[offset:offset + 65536].encode('ascii').translate(_PHRED33_BYTES))
+            for offset in range(0, len(quality), 65536)
+        )
     return sum(max(0, ord(char) - 33) for char in quality)
 
 

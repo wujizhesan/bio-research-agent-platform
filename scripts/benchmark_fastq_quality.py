@@ -137,6 +137,34 @@ def compare(phase, path, reads, compressed, unicode, digest, output, executor, s
     }
 
 
+def long_read_memory_probe(root):
+    length = 1024 * 1024
+    encoded = b'@long\n' + b'A' * length + b'\n+\n' + b'I' * length + b'\n'
+    rows = []
+    for compressed in (False, True):
+        path = root / ('long.fastq.gz' if compressed else 'long.fastq')
+        path.write_bytes(gzip.compress(encoded, mtime=0) if compressed else encoded)
+        peaks = {}
+        reference = None
+        for name, parser in (('legacy', legacy_fastq_file_stats), ('translated', omics_fastq_qc._fastq_file_stats)):
+            tracemalloc.start()
+            try:
+                result = parser(path)
+                peaks[name] = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+            if reference is None:
+                reference = result
+            elif result != reference:
+                raise RuntimeError('long FASTQ read changed the statistics')
+        if peaks['translated'] > peaks['legacy'] + 65536:
+            raise RuntimeError('long FASTQ read increased the parser memory peak')
+        normalized = {key: value for key, value in reference.items() if key != 'path'}
+        rows.append({'gzip': compressed, 'python_peak_bytes': peaks,
+                     'statistics_sha256': hashlib.sha256(json.dumps(normalized, sort_keys=True).encode('utf-8')).hexdigest()})
+    return {'read_length': length, 'quality_chunk_bytes': 65536, 'rows': rows}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--samples', type=int, default=5)
@@ -166,6 +194,7 @@ def main():
                             rows.append(compare(phase, path, reads, compressed, unicode, digest, output, executor, arguments.samples, root))
         finally:
             executor.shutdown()
+        long_reads = long_read_memory_probe(root)
     report = {
         'baseline_source_commit': BASELINE_SOURCE_COMMIT,
         'platform': platform.platform(), 'python_version': platform.python_version(),
@@ -179,6 +208,7 @@ def main():
         'fixture_generation_verification_and_memory_measurement_outside_timing': True,
         'isolated_workspace_cleanup_in_timing': True,
         'cross_platform_result_digest_excludes_only_environment_specific_paths': True,
+        'long_read_memory_probe_outside_timing': long_reads,
         'rows': rows,
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))

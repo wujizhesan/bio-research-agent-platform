@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -25,6 +26,39 @@ class FastqQualityTests(unittest.TestCase):
         for quality in ('\u7814', '\U0001f9ec', '\u03a9', '\ufffd', '\ud800', '!I\u7814\U0001f9ec\x00'):
             with self.subTest(quality=quality):
                 self.assertEqual(omics_fastq_qc._phred33_sum(quality), sum(max(0, ord(char) - 33) for char in quality))
+
+    def test_long_quality_chunks_preserve_scores_and_bound_temporary_allocations(self):
+        for length in (65535, 65536, 65537, 1024 * 1024):
+            with self.subTest(length=length):
+                quality = ('\x00 !IJ~\x7f' * ((length + 6) // 7))[:length]
+                expected = sum(max(0, ord(char) - 33) for char in quality)
+                tracemalloc.start()
+                try:
+                    observed = omics_fastq_qc._phred33_sum(quality)
+                    peak = tracemalloc.get_traced_memory()[1]
+                finally:
+                    tracemalloc.stop()
+                self.assertEqual(observed, expected)
+                self.assertLess(peak, 300000)
+
+    def test_long_read_plain_and_gzip_stats_preserve_values_and_memory(self):
+        with tempfile.TemporaryDirectory() as raw:
+            length = 1024 * 1024
+            encoded = b'@long\n' + b'A' * length + b'\n+\n' + b'I' * length + b'\n'
+            for compressed in (False, True):
+                with self.subTest(gzip=compressed):
+                    path = Path(raw) / ('long.fastq.gz' if compressed else 'long.fastq')
+                    path.write_bytes(gzip.compress(encoded, mtime=0) if compressed else encoded)
+                    outputs, peaks = [], []
+                    for parser in (legacy_fastq_file_stats, omics_fastq_qc._fastq_file_stats):
+                        tracemalloc.start()
+                        try:
+                            outputs.append(parser(path))
+                            peaks.append(tracemalloc.get_traced_memory()[1])
+                        finally:
+                            tracemalloc.stop()
+                    self.assertEqual(outputs[0], outputs[1])
+                    self.assertLessEqual(peaks[1], peaks[0] + 65536)
 
     def test_plain_and_gzip_stats_match_for_newlines_encoding_and_empty_files(self):
         cases = (b'', b'@a\nACGT\n+\n!"#I\n@b\nG\n+\n~\n',
