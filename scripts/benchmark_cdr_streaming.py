@@ -71,8 +71,10 @@ def memory_worker(implementation, path, filename):
     tracemalloc.stop()
     rss = None
     if sys.platform.startswith('linux'):
-        import resource
-        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+        # getrusage can retain the parent's peak across exec.
+        status = Path('/proc/self/status').read_text(encoding='ascii')
+        peak = next(line for line in status.splitlines() if line.startswith('VmHWM:'))
+        rss = int(peak.split()[1]) * 1024
     return {'traced_peak_bytes': peak, 'process_peak_rss_bytes': rss}
 
 
@@ -282,6 +284,7 @@ async def benchmark(samples, memory_samples, sizes_mib, upload_sizes_mib, concur
         'scope': 'Complete CDR reconstruction and LocalFileStorage.save with real text/gzip inspection, CDR and two local streaming clean scanner stubs; in-memory upload reads and empty history; excludes HTTP, real ClamAV network and S3',
         'timer_excludes': 'fixture generation, staging reconstruction inputs, memory tracking, output verification and rollback/discard cleanup',
         'memory_scope': 'Separate samples; Python allocations traced after fixtures exist. Reconstruction uses a fresh child per sample; Linux process peak RSS includes interpreter/imports. Upload tracing includes both file workers but excludes preallocated payload/expected bytes; upload RSS is not measured.',
+        'linux_rss_measurement': '/proc/self/status VmHWM in the child after exec; excludes inherited pre-exec getrusage peaks',
         'timed_samples_instrumented': False,
         'warmup_pairs_per_scenario': 1,
         'output_bytes_metadata_and_scan_digests_equal': True,
