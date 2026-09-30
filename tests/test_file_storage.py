@@ -20,7 +20,7 @@ from src.file_security import (
     FileSecurityResult,
     build_file_security_pipeline_from_env,
 )
-from src.file_storage import LocalFileStorage, METADATA_RESERVE_BYTES, S3FileStorage
+from src.file_storage import LocalFileStorage, METADATA_RESERVE_BYTES, S3FileStorage, SNIFF_BYTES
 from src.storage_workspace import StorageIntegrityError, materialize_storage_references
 
 
@@ -433,6 +433,159 @@ class LocalFileStorageSecurityTests(unittest.TestCase):
             bomb = gzip.compress(b'A' * 10000)
             with self.assertRaisesRegex(ValueError, 'compression ratio'):
                 asyncio.run(storage.save(Upload(bomb, 'bomb.vcf.gz')))
+
+
+class UploadTextSamplingTests(unittest.TestCase):
+    def _storage(self, root):
+        class Scanner:
+            def __init__(self):
+                self.samples = []
+
+            def scan(self, path):
+                self.samples.append(Path(path).read_bytes())
+                return 'clean'
+
+        return LocalFileStorage(root, security_pipeline=FileSecurityPipeline(
+            clamav=Scanner(), cdr=ContentDisarmReconstructor(), required=True,
+        ))
+
+    def _assert_saved(self, storage, content, filename):
+        compressed = filename.endswith('.gz')
+        payload = gzip.compress(content, mtime=0) if compressed else content
+        normalized = content.decode('utf-8-sig').replace('\r\n', '\n').replace('\r', '\n').encode()
+        expected = gzip.compress(normalized, compresslevel=6, mtime=0) if compressed else normalized
+        stored = asyncio.run(storage.save(Upload(payload, filename)))
+        self.assertEqual(stored.path.read_bytes(), expected)
+        self.assertEqual(stored.size_bytes, len(expected))
+        self.assertEqual(stored.sha256, hashlib.sha256(expected).hexdigest())
+        self.assertEqual(stored.content_type, 'application/gzip' if compressed else 'text/plain')
+        self.assertEqual(stored.security['scan_count'], 2)
+        self.assertEqual(storage.security_pipeline.clamav.samples, [payload, expected])
+        metadata = json.loads((stored.path.parent / 'metadata.json').read_text(encoding='utf-8'))
+        self.assertEqual(metadata['sha256'], stored.sha256)
+        self.assertEqual(metadata['size_bytes'], len(expected))
+        self.assertEqual(storage.get(stored.file_id), stored)
+        self.assertEqual(storage._reserved_bytes, 0)
+        self.assertEqual(storage._upload_reservations, {})
+
+    def _assert_rejected(self, storage, content, filename):
+        payload = gzip.compress(content, mtime=0) if filename.endswith('.gz') else content
+        with self.assertRaisesRegex(ValueError, 'must be UTF-8 text') as caught:
+            asyncio.run(storage.save(Upload(payload, filename)))
+        self.assertIsInstance(caught.exception.__cause__, UnicodeDecodeError)
+        self.assertEqual(storage.security_pipeline.clamav.samples, [])
+        self.assertEqual(list(storage.root.iterdir()), [])
+        self.assertEqual(storage._reserved_bytes, 0)
+        self.assertEqual(storage._upload_reservations, {})
+
+    def test_valid_utf8_crossing_sample_boundary_and_ending_at_eof(self):
+        padding = random.Random(2345).randbytes(SNIFF_BYTES).hex().encode()
+        for filename in ('sample.txt', 'sample.vcf', 'sample.vcf.gz'):
+            header = b'##fileformat=VCFv4.3\n#CHROM\tPOS\n' if '.vcf' in filename else b''
+            for char in ('¢', '中', '🙂'):
+                encoded = char.encode()
+                for split in range(1, len(encoded)):
+                    for bom in (b'', b'\xef\xbb\xbf'):
+                        for suffix in (b'', b'\r\nnext\r\n'):
+                            with self.subTest(filename=filename, char=char, split=split, bom=bool(bom), eof=not suffix):
+                                content = bom + header + padding[:SNIFF_BYTES - split - len(bom) - len(header)] + encoded + suffix
+                                with tempfile.TemporaryDirectory(prefix='utf8_sample_') as raw:
+                                    self._assert_saved(self._storage(raw), content, filename)
+
+    def test_invalid_continuations_crossing_sample_boundary_are_rejected(self):
+        padding = random.Random(3456).randbytes(SNIFF_BYTES).hex().encode()
+        for filename in ('sample.txt', 'sample.vcf', 'sample.vcf.gz'):
+            header = b'##fileformat=VCFv4.3\n#CHROM\tPOS\n' if '.vcf' in filename else b''
+            for char in ('¢', '中', '🙂'):
+                encoded = char.encode()
+                for split in range(1, len(encoded)):
+                    for invalid in (b'X', b'\xff'):
+                        with self.subTest(filename=filename, char=char, split=split, invalid=invalid):
+                            content = header + padding[:SNIFF_BYTES - split - len(header)] + encoded[:split] + invalid + b'\nrest\n'
+                            with tempfile.TemporaryDirectory(prefix='utf8_invalid_') as raw:
+                                self._assert_rejected(self._storage(raw), content, filename)
+
+    def test_incomplete_boundary_characters_at_real_eof_are_rejected(self):
+        padding = random.Random(4567).randbytes(SNIFF_BYTES).hex().encode()
+        for filename in ('sample.txt', 'sample.vcf', 'sample.vcf.gz'):
+            header = b'##fileformat=VCFv4.3\n#CHROM\tPOS\n' if '.vcf' in filename else b''
+            for char in ('¢', '中', '🙂'):
+                encoded = char.encode()
+                for split in range(1, len(encoded)):
+                    for available in range(len(encoded) - split):
+                        with self.subTest(filename=filename, char=char, split=split, available=available):
+                            content = header + padding[:SNIFF_BYTES - split - len(header)] + encoded[:split + available]
+                            with tempfile.TemporaryDirectory(prefix='utf8_eof_') as raw:
+                                self._assert_rejected(self._storage(raw), content, filename)
+
+    def test_invalid_utf8_within_sample_is_rejected(self):
+        padding = random.Random(7890).randbytes(SNIFF_BYTES).hex().encode()
+        for filename in ('sample.txt', 'sample.vcf', 'sample.vcf.gz'):
+            header = b'##fileformat=VCFv4.3\n#CHROM\tPOS\n' if '.vcf' in filename else b''
+            for invalid in (b'\xff', b'\x80', b'\xc0\xaf', b'\xed\xa0\x80', b'\xf4\x90\x80\x80'):
+                with self.subTest(filename=filename, invalid=invalid):
+                    content = header + invalid + padding
+                    with tempfile.TemporaryDirectory(prefix='utf8_inside_') as raw:
+                        self._assert_rejected(self._storage(raw), content, filename)
+
+    def test_cdr_newline_normalization_moves_valid_utf8_across_sample_boundary(self):
+        rng = random.Random(5678)
+        body = b''.join(('科研🙂\t' + rng.randbytes(8).hex() + 'XYZ\r\n').encode() for _ in range(4096))
+        for filename in ('sample.txt', 'sample.vcf', 'sample.vcf.gz'):
+            header = b''
+            if '.vcf' in filename:
+                header = b'##fileformat=VCFv4.3\n#CHROM\tPOS\n'
+                header += b'##padding=' + b'A' * (992 - len(header) - 11) + b'\n'
+            content = header + body
+            content[:SNIFF_BYTES].decode('utf-8')
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory(prefix='utf8_cdr_') as raw:
+                self._assert_saved(self._storage(raw), content, filename)
+
+    def test_plain_text_sampling_reads_at_most_three_extra_bytes(self):
+        with tempfile.TemporaryDirectory(prefix='utf8_bounded_') as raw:
+            storage = LocalFileStorage(raw)
+            target = Path(raw) / 'sample.txt'
+            target.write_bytes(b'A' * (SNIFF_BYTES * 4))
+            original_open = Path.open
+            reads = []
+
+            class Reader:
+                def __enter__(self):
+                    self.handle = original_open(target, 'rb')
+                    return self
+
+                def __exit__(self, *_args):
+                    self.handle.close()
+
+                def read(self, size=-1):
+                    reads.append(size)
+                    if size < 0 or size > SNIFF_BYTES + 3:
+                        raise AssertionError('text sampling read must remain bounded')
+                    return self.handle.read(size)
+
+            with mock.patch.object(Path, 'open', return_value=Reader()):
+                self.assertEqual(storage._inspect_content(target, target.name, target.stat().st_size), 'text/plain')
+            self.assertEqual(len(reads), 1)
+            self.assertLessEqual(reads[0], SNIFF_BYTES + 3)
+
+    def test_gzip_sampling_stays_bounded_and_checks_the_complete_stream(self):
+        rng = random.Random(6789)
+        content = b'##fileformat=VCFv4.3\n#CHROM\tPOS\n' + rng.randbytes(SNIFF_BYTES * 9).hex().encode()
+        compressed = gzip.compress(content, mtime=0)
+        malware = gzip.compress(content + b'X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR', mtime=0)
+        corrupt = compressed[:-8] + bytes([compressed[-8] ^ 1]) + compressed[-7:]
+        with tempfile.TemporaryDirectory(prefix='utf8_gzip_') as raw:
+            storage = LocalFileStorage(raw)
+            target = Path(raw) / 'sample.vcf.gz'
+            target.write_bytes(compressed)
+            with mock.patch.object(storage, '_validate_text', wraps=storage._validate_text) as validate:
+                self.assertEqual(storage._inspect_content(target, target.name, len(compressed)), 'application/gzip')
+            self.assertLessEqual(len(validate.call_args.args[0]), SNIFF_BYTES + 3)
+            for payload, message in ((malware, 'malicious'), (corrupt, 'invalid gzip'), (compressed[:-8], 'invalid gzip')):
+                with self.subTest(message=message):
+                    target.write_bytes(payload)
+                    with self.assertRaisesRegex(ValueError, message):
+                        storage._inspect_content(target, target.name, len(payload))
 
 
 class ConcurrentUploadTests(unittest.IsolatedAsyncioTestCase):

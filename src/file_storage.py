@@ -1,6 +1,7 @@
 """Secure local storage for uploaded research inputs."""
 
 import asyncio
+import codecs
 import gzip
 import hashlib
 import json
@@ -37,6 +38,7 @@ DEFAULT_ALLOWED_EXTENSIONS = frozenset({
 FILE_ID_PATTERN = re.compile(r'^[a-f0-9]{32}$')
 CHUNK_SIZE = 1024 * 1024
 SNIFF_BYTES = 64 * 1024
+UTF8_SAMPLE_LOOKAHEAD_BYTES = 3
 METADATA_RESERVE_BYTES = 1024
 MAX_CONCURRENT_SCANS = 2
 ARCHIVE_SIGNATURES = (
@@ -235,7 +237,7 @@ class LocalFileStorage:
         )
 
     @staticmethod
-    def _validate_text(content: bytes) -> str:
+    def _validate_text(content: bytes, *, sample_limit: int | None = None) -> str:
         if any(content.startswith(signature) for signature in ARCHIVE_SIGNATURES):
             raise ValueError('archive uploads are not allowed')
         if any(content.startswith(signature) for signature in EXECUTABLE_SIGNATURES):
@@ -245,13 +247,23 @@ class LocalFileStorage:
         if b'\x00' in content:
             raise ValueError('binary content does not match the file extension')
         try:
-            return content.decode('utf-8-sig')
+            if sample_limit is None or len(content) <= sample_limit:
+                return content.decode('utf-8-sig')
+            decoder = codecs.getincrementaldecoder('utf-8-sig')()
+            text = decoder.decode(content[:sample_limit])
+            if decoder.getstate()[0]:
+                for byte in content[sample_limit:sample_limit + UTF8_SAMPLE_LOOKAHEAD_BYTES]:
+                    text += decoder.decode(bytes([byte]))
+                    if not decoder.getstate()[0]:
+                        break
+            return text + decoder.decode(b'', final=True)
         except UnicodeDecodeError as exc:
             raise ValueError('uploaded research files must be UTF-8 text') from exc
 
     def _inspect_gzip(self, target: Path, compressed_size: int) -> str:
         total = 0
         sample = bytearray()
+        sample_bytes = SNIFF_BYTES + UTF8_SAMPLE_LOOKAHEAD_BYTES
         scan_tail = b''
         try:
             with gzip.open(target, 'rb') as handle:
@@ -270,25 +282,25 @@ class LocalFileStorage:
                     if any(marker in scanned for marker in MALWARE_MARKERS):
                         raise ValueError('known malicious test signature detected')
                     scan_tail = scanned[-64:]
-                    if len(sample) < SNIFF_BYTES:
-                        sample.extend(chunk[:SNIFF_BYTES - len(sample)])
+                    if len(sample) < sample_bytes:
+                        sample.extend(chunk[:sample_bytes - len(sample)])
         except (gzip.BadGzipFile, EOFError, OSError) as exc:
             raise ValueError('invalid gzip content') from exc
-        text = self._validate_text(bytes(sample))
+        text = self._validate_text(bytes(sample), sample_limit=SNIFF_BYTES)
         if not text.lstrip().startswith(('##fileformat=VCF', '#CHROM')):
             raise ValueError('gzip content does not match .vcf.gz')
         return 'application/gzip'
 
     def _inspect_content(self, target: Path, filename: str, size_bytes: int) -> str:
         with target.open('rb') as handle:
-            sample = handle.read(SNIFF_BYTES)
+            sample = handle.read(SNIFF_BYTES + UTF8_SAMPLE_LOOKAHEAD_BYTES)
         if filename.lower().endswith('.vcf.gz'):
             if not sample.startswith(b'\x1f\x8b'):
                 raise ValueError('content does not match .vcf.gz')
             return self._inspect_gzip(target, size_bytes)
         if sample.startswith(b'\x1f\x8b'):
             raise ValueError('compressed content does not match the file extension')
-        text = self._validate_text(sample)
+        text = self._validate_text(sample, sample_limit=SNIFF_BYTES)
         extension = Path(filename).suffix.lower()
         if extension == '.vcf' and not text.lstrip().startswith(
             ('##fileformat=VCF', '#CHROM')
