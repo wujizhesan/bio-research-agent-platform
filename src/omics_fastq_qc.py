@@ -20,6 +20,15 @@ except ImportError:
     )
 
 
+_PHRED33_BYTES = bytes(max(0, value - 33) for value in range(256))
+
+
+def _phred33_sum(quality):
+    if quality.isascii():
+        return sum(quality.encode('ascii').translate(_PHRED33_BYTES))
+    return sum(max(0, ord(char) - 33) for char in quality)
+
+
 def _fastq_file_stats(path):
     opener = gzip.open if path.name.lower().endswith('.gz') else open
     reads = 0
@@ -42,7 +51,7 @@ def _fastq_file_stats(path):
             length = len(sequence)
             reads += 1
             bases += length
-            quality_sum += sum(max(0, ord(char) - 33) for char in quality)
+            quality_sum += _phred33_sum(quality)
             min_length = length if min_length is None else min(min_length, length)
             max_length = max(max_length, length)
     return {
