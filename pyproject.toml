@@ -179,6 +179,7 @@ py-modules = [
   "settings",
   "streamlit_chat",
   "storage_workspace",
+  "workspace_transfer",
   "visualize",
   "redis_job_coordinator",
   "redis_job_manager",

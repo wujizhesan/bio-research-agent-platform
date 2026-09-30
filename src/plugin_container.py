@@ -24,6 +24,7 @@ try:
     from .run_context import current_run_context
     from .storage_workspace import materialize_storage_references
     from .sandbox_workload import is_lightweight_tool
+    from .workspace_transfer import WorkspaceTransfer, _rollback_transfer_target
 except ImportError:
     from external_service_policy import retry_deferred_from_payload
     from job_execution import (
@@ -36,6 +37,7 @@ except ImportError:
     from run_context import current_run_context
     from storage_workspace import materialize_storage_references
     from sandbox_workload import is_lightweight_tool
+    from workspace_transfer import WorkspaceTransfer, _rollback_transfer_target
 
 
 _SAFE_SEGMENT = re.compile(r'[^A-Za-z0-9._-]+')
@@ -73,15 +75,6 @@ def _map_paths(value, mapper):
     return value
 
 
-def _reject_symlinks(path):
-    path = Path(path)
-    candidates = [path]
-    if path.is_dir():
-        candidates.extend(path.rglob('*'))
-    if any(candidate.is_symlink() for candidate in candidates):
-        raise JobExecutionError('plugin workspace transfer rejects symbolic links')
-
-
 def _tree_size(path):
     path = Path(path)
     if path.is_file():
@@ -89,17 +82,10 @@ def _tree_size(path):
     return sum(item.stat().st_size for item in path.rglob('*') if item.is_file())
 
 
-def _copy_path(source, target):
+def _copy_path(source, target, *, manifest=None, directory=False):
     source = Path(source)
-    target = Path(target)
-    _reject_symlinks(source)
-    if source.is_dir():
-        shutil.copytree(source, target)
-    elif source.is_file():
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-    else:
-        raise JobExecutionError(f'plugin input path is unavailable: {source.name}')
+    selected = manifest or WorkspaceTransfer.capture(source)
+    return selected.copy(target, directory=directory)
 
 
 def _replace_result_paths(value, replacements):
@@ -316,12 +302,13 @@ class ContainerToolExecutor:
                         parameter.lower().endswith(('_dir', '_directory'))
                     )
                     if parameter in reads and source.exists():
-                        transferred += _tree_size(source)
+                        manifest = WorkspaceTransfer.capture(source)
+                        transferred += manifest.size_bytes
                         if transferred > self.workspace_max_bytes:
                             raise JobExecutionError(
                                 'plugin workspace input quota exceeded'
                             )
-                        _copy_path(source, staged)
+                        _copy_path(source, staged, manifest=manifest)
                     elif directory:
                         staged.mkdir(parents=True)
                     else:
@@ -335,13 +322,14 @@ class ContainerToolExecutor:
                             raise JobExecutionError(
                                 f'plugin input path is outside allowed roots: {parameter}'
                             )
-                        transferred += _tree_size(source)
+                        manifest = WorkspaceTransfer.capture(source)
+                        transferred += manifest.size_bytes
                         if transferred > self.workspace_max_bytes:
                             raise JobExecutionError(
                                 'plugin workspace input quota exceeded'
                             )
                         staged = workspace / 'inputs' / parameter_dir / str(index) / name
-                        _copy_path(source, staged)
+                        _copy_path(source, staged, manifest=manifest)
                 index += 1
                 return str(staged)
 
@@ -358,8 +346,8 @@ class ContainerToolExecutor:
                 target = Path(target_raw)
                 if not staged.exists():
                     continue
-                _reject_symlinks(staged)
-                total += _tree_size(staged)
+                manifest = WorkspaceTransfer.capture(staged)
+                total += manifest.size_bytes
                 if total > self.workspace_max_bytes:
                     raise JobExecutionError('plugin workspace output quota exceeded')
                 if target.exists():
@@ -370,18 +358,11 @@ class ContainerToolExecutor:
                             f'plugin artifact target already exists: {target.name}'
                         )
                 target.parent.mkdir(parents=True, exist_ok=True)
-                if directory or staged.is_dir():
-                    shutil.copytree(staged, target)
-                else:
-                    shutil.copy2(staged, target)
-                published.append(target)
+                published.append(_copy_path(staged, target, manifest=manifest, directory=directory))
                 replacements.append((str(staged), str(target)))
-        except Exception:
-            for target in reversed(published):
-                if target.is_dir():
-                    shutil.rmtree(target, ignore_errors=True)
-                else:
-                    target.unlink(missing_ok=True)
+        except BaseException:
+            for owned in reversed(published):
+                _rollback_transfer_target(*owned)
             raise
         return tuple(replacements)
 

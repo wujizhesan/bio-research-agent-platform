@@ -276,6 +276,12 @@ jobs:
           uv run --no-sync python -m scripts.benchmark_directory_publication \
             --samples 8 --file-counts 32,512,2048 --workspace-root output \
             > output/directory-publication-benchmark.json
+      - name: Compare complete sandbox workspace transfers
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_workspace_transfer \
+            --samples 8 --file-counts 32,512,2048 --workspace-root output \
+            > output/workspace-transfer-benchmark.json
       - name: Compare streaming CDR memory and complete uploads
         run: |
           mkdir -p output
@@ -375,6 +381,7 @@ jobs:
             output/upload-inspection-benchmark.json
             output/gzip-inspection-benchmark.json
             output/directory-publication-benchmark.json
+            output/workspace-transfer-benchmark.json
             output/cdr-streaming-benchmark.json
             output/cdr-text-benchmark.json
             output/vcf-compression-benchmark.json
