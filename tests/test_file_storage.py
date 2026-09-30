@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import random
+import struct
 import sys
 import tempfile
 import threading
@@ -14,6 +15,8 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.benchmark_quota_scan_baseline import WalkQuotaStorage
+from scripts.benchmark_gzip_inspection import raw_read_sample
+from scripts.benchmark_gzip_inspection_baseline import SeparateHashStorage
 from src.file_security import (
     ClamAVScanner,
     ContentDisarmReconstructor,
@@ -588,6 +591,220 @@ class UploadTextSamplingTests(unittest.TestCase):
                     target.write_bytes(payload)
                     with self.assertRaisesRegex(ValueError, message):
                         storage._inspect_content(target, target.name, len(payload))
+
+
+class GzipMergedInspectionTests(unittest.TestCase):
+    def test_hash_covers_members_headers_and_trailing_padding(self):
+        content = gzip_cdr_growth_content()
+        payload = gzip.compress(content, mtime=0)
+        header = payload[:3] + b'\x1e' + payload[4:10]
+        optional_headers = header + struct.pack('<H', 5) + b'extra' + b'file.vcf\0comment\0\0\0' + payload[10:]
+        split = len(content) // 2
+        members = gzip.compress(content[:split]) + gzip.compress(content[split:])
+        variants = [payload, optional_headers, members, members + gzip.compress(b''), members + b'\0' * 32771]
+        with tempfile.TemporaryDirectory(prefix='gzip_merged_') as raw:
+            root = Path(raw).resolve()
+            target = root / 'SAMPLE.VCF.GZ'
+            for index, data in enumerate(variants):
+                with self.subTest(variant=index):
+                    target.write_bytes(data)
+                    for selected in (SeparateHashStorage, LocalFileStorage):
+                        content_type, digest = selected(root)._inspect_and_hash(target, target.name, len(data))
+                        self.assertEqual(content_type, 'application/gzip')
+                        self.assertEqual(digest.hexdigest(), hashlib.sha256(data).hexdigest())
+                    self.assertEqual(target.read_bytes(), data)
+
+    def test_invalid_streams_and_limits_match_separate_inspection(self):
+        content = gzip_cdr_growth_content()
+        payload = gzip.compress(content, mtime=0)
+        corrupt = payload[:-8] + bytes([payload[-8] ^ 1]) + payload[-7:]
+        header = b'##fileformat=VCFv4.3\n#CHROM\tPOS\n'
+        padding = random.Random(9876).randbytes(1024 * 1024).hex().encode()
+        marker = b'X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR'
+        malicious = gzip.compress(header + padding[:1024 * 1024 - len(header) - 4] + marker)
+        cases = [
+            (b'plain', {}, 'does not match'),
+            (b'\x1f\x8b', {}, 'invalid gzip'),
+            (payload[:-8], {}, 'invalid gzip'),
+            (corrupt, {}, 'invalid gzip'),
+            (payload + corrupt, {}, 'invalid gzip'),
+            (payload + b'\0' * 31 + b'garbage', {}, 'invalid gzip'),
+            (gzip.compress(b'plain text'), {}, 'does not match'),
+            (gzip.compress(header + b'\xff'), {}, 'must be UTF-8'),
+            (gzip.compress(header + b'\0'), {}, 'binary content'),
+            (malicious, {}, 'malicious'),
+            (payload, {'max_decompressed_bytes': 1000}, 'decompressed size'),
+            (payload, {'max_compression_ratio': 1}, 'compression ratio'),
+            (gzip.compress(b'\xff')[:-8], {}, 'invalid gzip'),
+        ]
+        with tempfile.TemporaryDirectory(prefix='gzip_merged_invalid_') as raw:
+            root = Path(raw).resolve()
+            target = root / 'sample.vcf.gz'
+            for index, (data, options, message) in enumerate(cases):
+                with self.subTest(case=index):
+                    target.write_bytes(data)
+                    errors = []
+                    for selected in (SeparateHashStorage, LocalFileStorage):
+                        with self.assertRaisesRegex(ValueError, message) as caught:
+                            selected(root, **options)._inspect_and_hash(target, target.name, len(data))
+                        errors.append((type(caught.exception), str(caught.exception), type(caught.exception.__cause__)))
+                    self.assertEqual(errors[0], errors[1])
+                    self.assertEqual(target.read_bytes(), data)
+
+    def test_complete_gzip_is_read_once_and_all_reads_are_bounded(self):
+        payload = gzip.compress(gzip_cdr_growth_content(), mtime=0)
+        self.assertGreater(len(payload), SNIFF_BYTES + 3)
+        with tempfile.TemporaryDirectory(prefix='gzip_merged_reads_') as raw:
+            root = Path(raw).resolve()
+            target = root / 'sample.vcf.gz'
+            target.write_bytes(payload)
+            old = raw_read_sample(SeparateHashStorage(root), target, payload)
+            new = raw_read_sample(LocalFileStorage(root), target, payload)
+            self.assertEqual(old['compressed_or_plain_bytes_read'], len(payload) * 2 + SNIFF_BYTES + 3)
+            self.assertEqual(new['compressed_or_plain_bytes_read'], len(payload) + 2)
+
+    def test_other_file_types_keep_inspection_and_hash_results(self):
+        header = b'##fileformat=VCFv4.3\n#CHROM\tPOS\n'
+        cases = [('sample.tsv', b'\xef\xbb\xbfAA\r\n'), ('sample.vcf', header), ('sample.json', b'{"a": 1}')]
+        with tempfile.TemporaryDirectory(prefix='gzip_merged_plain_') as raw:
+            root = Path(raw).resolve()
+            for filename, payload in cases:
+                with self.subTest(filename=filename):
+                    target = root / filename
+                    target.write_bytes(payload)
+                    results = [selected(root)._inspect_and_hash(target, filename, len(payload)) for selected in (SeparateHashStorage, LocalFileStorage)]
+                    self.assertEqual(results[0][0], results[1][0])
+                    self.assertEqual(results[0][1].hexdigest(), results[1][1].hexdigest())
+
+    def test_raw_read_errors_close_the_file(self):
+        payload = gzip.compress(gzip_cdr_growth_content(), mtime=0)
+        original_open = Path.open
+        with tempfile.TemporaryDirectory(prefix='gzip_merged_failure_') as raw:
+            root = Path(raw).resolve()
+            target = root / 'sample.vcf.gz'
+            target.write_bytes(payload)
+            for failure in (1, 2):
+                with self.subTest(read=failure):
+                    handles = []
+
+                    class Reader:
+                        def __init__(self, handle):
+                            self.handle, self.calls = handle, 0
+                            handles.append(handle)
+
+                        def read(self, size=-1):
+                            self.calls += 1
+                            if self.calls == failure:
+                                raise OSError('raw read failed')
+                            return self.handle.read(size)
+
+                        def __getattr__(self, name):
+                            return getattr(self.handle, name)
+
+                        def __enter__(self):
+                            return self
+
+                        def __exit__(self, *args):
+                            return self.handle.__exit__(*args)
+
+                    def open_file(path, *args, **kwargs):
+                        return Reader(original_open(path, *args, **kwargs))
+
+                    with mock.patch.object(Path, 'open', open_file):
+                        expected = OSError if failure == 1 else ValueError
+                        with self.assertRaisesRegex(expected, 'raw read failed' if failure == 1 else 'invalid gzip'):
+                            LocalFileStorage(root)._inspect_and_hash(target, target.name, len(payload))
+                    self.assertTrue(handles)
+                    self.assertTrue(all(handle.closed for handle in handles))
+                    self.assertEqual(target.read_bytes(), payload)
+
+
+class GzipMergedInspectionAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def _exercise_read(self, cancel, fail):
+        loop = asyncio.get_running_loop()
+        started, release = asyncio.Event(), threading.Event()
+        subject = ContextVar('gzip-merged-subject', default='missing')
+        observations = []
+        state = {'merged': False, 'blocked': False}
+        payload = gzip.compress(gzip_cdr_growth_content(), mtime=0)
+        original_open = Path.open
+
+        class Storage(LocalFileStorage):
+            def _inspect_and_hash(self, *args):
+                state['merged'] = True
+                return super()._inspect_and_hash(*args)
+
+        class Reader:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def read(self, size=-1):
+                if size > 2 and not state['blocked']:
+                    state['blocked'] = True
+                    observations.append((threading.get_ident(), subject.get()))
+                    loop.call_soon_threadsafe(started.set)
+                    if not release.wait(5):
+                        raise TimeoutError('gzip read was not released')
+                    if fail:
+                        raise OSError('gzip raw read failed')
+                return self.handle.read(size)
+
+            def __getattr__(self, name):
+                return getattr(self.handle, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return self.handle.__exit__(*args)
+
+        def open_file(path, mode='r', *args, **kwargs):
+            handle = original_open(path, mode, *args, **kwargs)
+            if path.name == 'sample.vcf.gz' and mode == 'rb' and state['merged']:
+                return Reader(handle)
+            return handle
+
+        with tempfile.TemporaryDirectory(prefix='gzip_merged_cancel_') as raw:
+            storage = Storage(raw, security_pipeline=FileSecurityPipeline(
+                clamav=type('Scanner', (), {'scan': lambda self, path: 'clean'})(),
+                cdr=ContentDisarmReconstructor(), required=True,
+            ))
+            token = subject.set('upload-context')
+            try:
+                with mock.patch.object(Path, 'open', open_file):
+                    task = asyncio.create_task(storage.save(Upload(payload, 'sample.vcf.gz'), 'a' * 32))
+                    try:
+                        await asyncio.wait_for(started.wait(), 5)
+                        if cancel:
+                            for _ in range(3):
+                                task.cancel()
+                                await asyncio.sleep(0)
+                                self.assertFalse(task.done())
+                                self.assertTrue((storage.root / ('a' * 32) / 'sample.vcf.gz').exists())
+                                self.assertFalse((storage.root / ('a' * 32) / 'metadata.json').exists())
+                                self.assertGreater(storage._reserved_bytes, 0)
+                    finally:
+                        release.set()
+                    with self.assertRaises(asyncio.CancelledError if cancel else ValueError):
+                        await task
+            finally:
+                subject.reset(token)
+            self.assertEqual(storage._reserved_bytes, 0)
+            self.assertEqual(storage._upload_reservations, {})
+            self.assertEqual(list(storage.root.iterdir()), [])
+            self.assertEqual(len(observations), 1)
+            self.assertNotEqual(observations[0][0], threading.get_ident())
+            self.assertEqual(observations[0][1], 'upload-context')
+            retry = await storage.save(Upload(b'retry', 'retry.txt'))
+            self.assertEqual(retry.path.read_bytes(), b'retry')
+
+    async def test_repeated_cancellation_waits_for_raw_reader(self):
+        for fail in (False, True):
+            with self.subTest(worker_fails=fail):
+                await self._exercise_read(cancel=True, fail=fail)
+
+    async def test_raw_read_failure_releases_quota_and_allows_retry(self):
+        await self._exercise_read(cancel=False, fail=True)
 
 
 class ConcurrentUploadTests(unittest.IsolatedAsyncioTestCase):

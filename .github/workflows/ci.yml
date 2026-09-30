@@ -264,6 +264,12 @@ jobs:
           uv run --no-sync python -m scripts.benchmark_upload_inspection \
             --samples 8 --sizes-mib 1,16 --concurrency 1,2 --workspace-root output \
             > output/upload-inspection-benchmark.json
+      - name: Compare merged gzip validation and complete uploads
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_gzip_inspection \
+            --samples 8 --sizes-mib 1,16 --concurrency 1,2 --workspace-root output \
+            > output/gzip-inspection-benchmark.json
       - name: Compare directory publication manifest reuse
         run: |
           mkdir -p output
@@ -367,6 +373,7 @@ jobs:
             output/upload-usage-benchmark.json
             output/quota-scan-benchmark.json
             output/upload-inspection-benchmark.json
+            output/gzip-inspection-benchmark.json
             output/directory-publication-benchmark.json
             output/cdr-streaming-benchmark.json
             output/cdr-text-benchmark.json

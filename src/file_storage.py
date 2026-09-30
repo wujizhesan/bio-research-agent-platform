@@ -64,6 +64,17 @@ CONTENT_TYPES = {
 }
 
 
+class _HashingReader:
+    def __init__(self, source, digest):
+        self.source = source
+        self.digest = digest
+
+    def read(self, size=-1):
+        chunk = self.source.read(size)
+        self.digest.update(chunk)
+        return chunk
+
+
 @dataclass(frozen=True)
 class StoredFile:
     file_id: str
@@ -280,7 +291,7 @@ class LocalFileStorage:
         except UnicodeDecodeError as exc:
             raise ValueError('uploaded research files must be UTF-8 text') from exc
 
-    def _inspect_gzip(self, target: Path, compressed_size: int) -> str:
+    def _inspect_gzip(self, target, compressed_size: int) -> str:
         total = 0
         sample = bytearray()
         sample_bytes = SNIFF_BYTES + UTF8_SAMPLE_LOOKAHEAD_BYTES
@@ -329,6 +340,16 @@ class LocalFileStorage:
         return CONTENT_TYPES.get(extension, 'text/plain')
 
     def _inspect_and_hash(self, target, filename, size_bytes):
+        if filename.lower().endswith('.vcf.gz'):
+            digest = hashlib.sha256()
+            with target.open('rb') as source:
+                if source.read(2) != b'\x1f\x8b':
+                    raise ValueError('content does not match .vcf.gz')
+                source.seek(0)
+                content_type = self._inspect_gzip(
+                    _HashingReader(source, digest), size_bytes,
+                )
+            return content_type, digest
         content_type = self._inspect_content(target, filename, size_bytes)
         digest = hashlib.sha256()
         with target.open('rb') as source:

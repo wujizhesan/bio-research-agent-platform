@@ -15,12 +15,13 @@ from time import perf_counter
 import tracemalloc
 
 from scripts.benchmark_cdr_baseline import BASELINE_SOURCE_COMMIT, WholeFileReconstructor
+from scripts.benchmark_gzip_inspection_baseline import SeparateHashStorage as LocalFileStorage
 from scripts.benchmark_vcf_compression import vcf_for
 from src.file_security import (
     ContentDisarmReconstructor, FileSecurityPipeline,
     TEXT_RECONSTRUCTION_CHUNK_BYTES, VCF_GZIP_COMPRESSION_LEVEL,
 )
-from src.file_storage import CHUNK_SIZE, LocalFileStorage
+from src.file_storage import CHUNK_SIZE
 
 
 HEARTBEAT_SECONDS = 0.001

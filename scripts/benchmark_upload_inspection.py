@@ -14,13 +14,14 @@ from typing import Any
 from uuid import uuid4
 
 from scripts.benchmark_vcf_compression import vcf_for
+from scripts.benchmark_gzip_inspection_baseline import SeparateHashStorage
 from src.file_security import (
     FileSecurityPipeline, VCF_GZIP_COMPRESSION_LEVEL,
 )
 from scripts.benchmark_cdr_baseline import WholeFileReconstructor as ContentDisarmReconstructor
 from src.file_storage import (
     CHUNK_SIZE, FILE_ID_PATTERN, MALWARE_MARKERS, MAX_CONCURRENT_SCANS,
-    LocalFileStorage, StoredFile,
+    StoredFile,
 )
 
 
@@ -43,7 +44,7 @@ class StreamingCleanScanner:
         return 'clean'
 
 
-class ProfiledInspectionStorage(LocalFileStorage):
+class ProfiledInspectionStorage(SeparateHashStorage):
     def __init__(self, root):
         self.scanner = StreamingCleanScanner()
         super().__init__(root, security_pipeline=FileSecurityPipeline(
