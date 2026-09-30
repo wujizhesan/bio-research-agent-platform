@@ -228,6 +228,12 @@ jobs:
           uv run --no-sync python scripts/configure_tenant_context.py --enable
       - name: Test real PostgreSQL and Redis
         run: uv run --no-sync python -m pytest tests/integration/test_external_services.py -q
+      - name: Compare batched CDR text validation
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_cdr_text \
+            --samples 8 --sizes-mib 1,16 --workspace-root output \
+            > output/cdr-text-benchmark.json
       - name: Compare concurrent upload quota reservations
         run: |
           mkdir -p output
@@ -321,6 +327,7 @@ jobs:
             output/ci-fullstack-health.json
             output/job-event-delivery-benchmark.json
             output/upload-concurrency-benchmark.json
+            output/cdr-text-benchmark.json
             frontend/playwright-report
             frontend/test-results
           if-no-files-found: ignore

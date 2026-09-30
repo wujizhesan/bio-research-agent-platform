@@ -6,6 +6,7 @@ from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import struct
 
@@ -14,7 +15,7 @@ import yaml
 
 SCAN_CHUNK_SIZE = 1024 * 1024
 MAX_SCAN_REPLY_BYTES = 16 * 1024
-ALLOWED_TEXT_CONTROLS = frozenset({'\t', '\n', '\r'})
+UNSAFE_TEXT_CONTROL_PATTERN = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
 
 
 class FileSecurityError(ValueError):
@@ -110,10 +111,7 @@ class ContentDisarmReconstructor:
             text = content.decode('utf-8-sig')
         except UnicodeDecodeError as exc:
             raise FileSecurityError('CDR requires UTF-8 text content') from exc
-        if any(
-            ord(character) < 32 and character not in ALLOWED_TEXT_CONTROLS
-            for character in text
-        ):
+        if UNSAFE_TEXT_CONTROL_PATTERN.search(text):
             raise FileSecurityError('CDR rejected unsafe control characters')
         return text.replace('\r\n', '\n').replace('\r', '\n')
 
