@@ -15,6 +15,7 @@ import yaml
 
 SCAN_CHUNK_SIZE = 1024 * 1024
 MAX_SCAN_REPLY_BYTES = 16 * 1024
+TEXT_CONTROL_BATCH_CHARS = 64 * 1024
 UNSAFE_TEXT_CONTROL_PATTERN = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
 
 
@@ -111,8 +112,12 @@ class ContentDisarmReconstructor:
             text = content.decode('utf-8-sig')
         except UnicodeDecodeError as exc:
             raise FileSecurityError('CDR requires UTF-8 text content') from exc
-        if UNSAFE_TEXT_CONTROL_PATTERN.search(text):
-            raise FileSecurityError('CDR rejected unsafe control characters')
+        # Short regex calls let Python yield the GIL between batches.
+        for offset in range(0, len(text), TEXT_CONTROL_BATCH_CHARS):
+            if UNSAFE_TEXT_CONTROL_PATTERN.search(
+                text, offset, offset + TEXT_CONTROL_BATCH_CHARS,
+            ):
+                raise FileSecurityError('CDR rejected unsafe control characters')
         return text.replace('\r\n', '\n').replace('\r', '\n')
 
     def _reconstruct_text(self, content, extension):

@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import gzip
 import hashlib
 import json
@@ -7,7 +8,9 @@ from statistics import median
 import tempfile
 from time import perf_counter
 
-from src.file_security import ContentDisarmReconstructor, FileSecurityError
+from src.file_security import (
+    ContentDisarmReconstructor, FileSecurityError, TEXT_CONTROL_BATCH_CHARS,
+)
 
 
 ALLOWED_TEXT_CONTROLS = frozenset({'\t', '\n', '\r'})
@@ -59,6 +62,74 @@ def measure(reconstructor, scenario, payload, expected, path):
         assert path.read_bytes() == expected
         assert not path.with_name(f'.{path.name}.cdr').exists()
     return {'elapsed_seconds': elapsed}
+
+
+async def measure_responsiveness(reconstructor, payload, expected):
+    done = asyncio.Event()
+    gaps = []
+
+    async def heartbeat():
+        previous = perf_counter()
+        while not done.is_set():
+            await asyncio.sleep(0.001)
+            now = perf_counter()
+            gaps.append(now - previous)
+            previous = now
+
+    ticker = asyncio.create_task(heartbeat())
+    await asyncio.sleep(0.001)
+    started = perf_counter()
+    try:
+        for _ in range(2):
+            rebuilt = await asyncio.to_thread(reconstructor._safe_text, payload)
+        elapsed = perf_counter() - started
+    finally:
+        done.set()
+        await ticker
+    assert rebuilt == expected
+    return {
+        'elapsed_seconds': elapsed,
+        'heartbeat_count': len(gaps),
+        'maximum_heartbeat_gap_seconds': max(gaps),
+        'median_heartbeat_gap_seconds': median(gaps),
+    }
+
+
+async def benchmark_responsiveness(samples, size_mib):
+    payload = payload_for('safe_text_ascii', size_mib * 1024 * 1024)
+    implementations = {
+        'character_loop': CharacterLoopReconstructor(),
+        'batched': ContentDisarmReconstructor(),
+    }
+    expected = implementations['character_loop']._safe_text(payload)
+    for implementation in implementations.values():
+        await measure_responsiveness(implementation, payload, expected)
+    pairs = []
+    for sample in range(samples):
+        order = list(implementations)
+        if sample % 2:
+            order.reverse()
+        pair = {'sample': sample, 'order': order}
+        for name in order:
+            pair[name] = await measure_responsiveness(
+                implementations[name], payload, expected,
+            )
+        pairs.append(pair)
+    return {
+        'scope': 'Event-loop heartbeat gaps while text normalization runs in the default executor; excludes input generation and output verification',
+        'source_size_mib': size_mib,
+        'normalizations_per_measurement': 2,
+        'heartbeat_interval_seconds': 0.001,
+        'warmup_pairs': 1,
+        'paired_samples': samples,
+        'character_loop_median_maximum_gap_seconds': median(
+            pair['character_loop']['maximum_heartbeat_gap_seconds'] for pair in pairs
+        ),
+        'batched_median_maximum_gap_seconds': median(
+            pair['batched']['maximum_heartbeat_gap_seconds'] for pair in pairs
+        ),
+        'pairs': pairs,
+    }
 
 
 def benchmark(samples, sizes_mib, workspace_root=None):
@@ -135,10 +206,14 @@ def benchmark(samples, sizes_mib, workspace_root=None):
                 })
     return {
         'baseline_source_commit': BASELINE_SOURCE_COMMIT,
+        'text_control_batch_chars': TEXT_CONTROL_BATCH_CHARS,
         'scope': 'Text normalization and complete CDR reconstruction on synthetic local files; excludes ClamAV, HTTP, S3, queues and research tools',
         'timer_excludes': 'input generation, input staging, output verification and hashing',
         'output_bytes_equal': True,
         'warmup_pairs_per_scenario': 1,
+        'event_loop_responsiveness': asyncio.run(
+            benchmark_responsiveness(samples, max(sizes_mib)),
+        ),
         'rows': rows,
     }
 

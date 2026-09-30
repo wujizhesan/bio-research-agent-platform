@@ -59,10 +59,17 @@ class ContentDisarmTextTests(unittest.TestCase):
 
     def test_reconstruction_rejects_controls_beyond_the_sniff_and_chunk_boundaries(self):
         cdr = ContentDisarmReconstructor()
-        for offset in (64 * 1024, 1024 * 1024 - 1, 1024 * 1024 + 1):
+        for offset in (
+            64 * 1024 - 1, 64 * 1024, 64 * 1024 + 1,
+            1024 * 1024 - 1, 1024 * 1024 + 1,
+        ):
             with self.subTest(offset=offset):
                 with self.assertRaisesRegex(FileSecurityError, 'unsafe control'):
                     cdr._reconstruct_text(b'A' * offset + b'\x1f' + b'end', '.fastq')
+        for prefix in ('中文' * (32 * 1024), '🙂' * (64 * 1024)):
+            with self.subTest(prefix_character=prefix[0]):
+                with self.assertRaisesRegex(FileSecurityError, 'unsafe control'):
+                    cdr._reconstruct_text((prefix + '\x00' + 'end').encode(), '.fastq')
 
     def test_structured_formats_use_the_same_text_rules(self):
         cdr = ContentDisarmReconstructor()
