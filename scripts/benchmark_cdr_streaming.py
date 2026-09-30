@@ -73,8 +73,8 @@ def memory_worker(implementation, path, filename):
     if sys.platform.startswith('linux'):
         # getrusage can retain the parent's peak across exec.
         status = Path('/proc/self/status').read_text(encoding='ascii')
-        peak = next(line for line in status.splitlines() if line.startswith('VmHWM:'))
-        rss = int(peak.split()[1]) * 1024
+        peak_line = next(line for line in status.splitlines() if line.startswith('VmHWM:'))
+        rss = int(peak_line.split()[1]) * 1024
     return {'traced_peak_bytes': peak, 'process_peak_rss_bytes': rss}
 
 
@@ -88,6 +88,7 @@ def reconstruction_sample(root, implementation, filename, payload, expected, mem
             '--filename', filename,
         ], check=True, stdout=subprocess.PIPE)
         report = json.loads(result.stdout)
+        assert isinstance(report['traced_peak_bytes'], int) and report['traced_peak_bytes'] > 0
     else:
         selected = reconstructor(implementation)
         started = perf_counter()
