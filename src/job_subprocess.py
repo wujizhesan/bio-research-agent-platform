@@ -42,6 +42,23 @@ def _apply_posix_limits(limits):
         resource.setrlimit(resource.RLIMIT_CPU, (soft, soft + 1))
 
 
+def _write_process_response(payload, request, response_path, exit_code):
+    encoded = json.dumps(payload, ensure_ascii=False, default=str)
+    max_result_bytes = int(request.get('limits', {}).get('max_result_bytes') or 0)
+    if max_result_bytes:
+        encoded = encoded.encode('utf-8')
+        if len(encoded) > max_result_bytes:
+            encoded = json.dumps({
+                'ok': False,
+                'error': f'job result exceeded {max_result_bytes} byte limit',
+            }).encode('utf-8')
+            exit_code = 1
+        response_path.write_bytes(encoded)
+    else:
+        response_path.write_text(encoded, encoding='utf-8')
+    return exit_code
+
+
 def main(argv=None):
     args = list(argv or sys.argv[1:])
     if len(args) != 2:
@@ -129,16 +146,7 @@ def main(argv=None):
             'execution_finished': finished_ns,
         },
     }
-    encoded = json.dumps(payload, ensure_ascii=False, default=str)
-    max_result_bytes = int(request.get('limits', {}).get('max_result_bytes') or 0)
-    if max_result_bytes and len(encoded.encode('utf-8')) > max_result_bytes:
-        encoded = json.dumps({
-            'ok': False,
-            'error': f'job result exceeded {max_result_bytes} byte limit',
-        })
-        exit_code = 1
-    response_path.write_text(encoded, encoding='utf-8')
-    return exit_code
+    return _write_process_response(payload, request, response_path, exit_code)
 
 
 if __name__ == '__main__':

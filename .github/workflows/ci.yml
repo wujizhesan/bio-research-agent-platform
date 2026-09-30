@@ -300,6 +300,12 @@ jobs:
           uv run --no-sync python -m scripts.benchmark_process_response \
             --samples 8 --workspace-root output \
             > output/process-response-benchmark.json
+      - name: Compare isolated worker UTF-8 response writes
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_response_write \
+            --samples 8 --workspace-root output \
+            > output/response-write-benchmark.json
       - name: Compare streaming CDR memory and complete uploads
         run: |
           mkdir -p output
@@ -403,6 +409,7 @@ jobs:
             output/materialization-quota-benchmark.json
             output/stderr-tail-benchmark.json
             output/process-response-benchmark.json
+            output/response-write-benchmark.json
             output/cdr-streaming-benchmark.json
             output/cdr-text-benchmark.json
             output/vcf-compression-benchmark.json
