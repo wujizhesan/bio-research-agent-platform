@@ -312,6 +312,12 @@ jobs:
           uv run --no-sync python -m scripts.benchmark_fastq_quality \
             --samples 8 --workspace-root output \
             > output/fastq-quality-benchmark.json
+      - name: Compare complete variant annotation with interval indexes
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_variant_interval \
+            --samples 8 --workspace-root output \
+            > output/variant-interval-benchmark.json
       - name: Compare streaming CDR memory and complete uploads
         run: |
           mkdir -p output
@@ -417,6 +423,7 @@ jobs:
             output/process-response-benchmark.json
             output/response-write-benchmark.json
             output/fastq-quality-benchmark.json
+            output/variant-interval-benchmark.json
             output/cdr-streaming-benchmark.json
             output/cdr-text-benchmark.json
             output/vcf-compression-benchmark.json
