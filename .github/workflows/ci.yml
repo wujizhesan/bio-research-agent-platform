@@ -264,6 +264,13 @@ jobs:
           uv run --no-sync python -m scripts.benchmark_directory_publication \
             --samples 8 --file-counts 32,512,2048 --workspace-root output \
             > output/directory-publication-benchmark.json
+      - name: Compare streaming CDR memory and complete uploads
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_cdr_streaming \
+            --samples 8 --memory-samples 3 --sizes-mib 1,32 \
+            --upload-sizes-mib 1,16 --concurrency 1,2 --workspace-root output \
+            > output/cdr-streaming-benchmark.json
       - name: Compare committed SSE event delivery
         run: |
           mkdir -p output
@@ -354,6 +361,7 @@ jobs:
             output/upload-usage-benchmark.json
             output/upload-inspection-benchmark.json
             output/directory-publication-benchmark.json
+            output/cdr-streaming-benchmark.json
             output/cdr-text-benchmark.json
             output/vcf-compression-benchmark.json
             frontend/playwright-report

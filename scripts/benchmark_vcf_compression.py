@@ -10,9 +10,8 @@ import tempfile
 from time import perf_counter
 from unittest import mock
 
-from src.file_security import (
-    ContentDisarmReconstructor, FileSecurityError, VCF_GZIP_COMPRESSION_LEVEL,
-)
+from src.file_security import FileSecurityError, VCF_GZIP_COMPRESSION_LEVEL
+from scripts.benchmark_cdr_baseline import WholeFileReconstructor as ContentDisarmReconstructor
 
 
 BASELINE_SOURCE_COMMIT = 'be43b929542e89f2f5a4b99acaf25a2d40a47a1d'
@@ -75,7 +74,7 @@ def vcf_for(scenario, requested_bytes):
 
 def measure(reconstructor, level, path, payload, normalized, expected_output):
     path.write_bytes(payload)
-    with mock.patch('src.file_security.VCF_GZIP_COMPRESSION_LEVEL', level):
+    with mock.patch('scripts.benchmark_cdr_baseline.VCF_GZIP_COMPRESSION_LEVEL', level):
         started = perf_counter()
         status = reconstructor.reconstruct(path, path.name)
         elapsed = perf_counter() - started

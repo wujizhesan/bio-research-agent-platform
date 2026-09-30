@@ -9,9 +9,8 @@ import tempfile
 from time import perf_counter
 from unittest import mock
 
-from src.file_security import (
-    ContentDisarmReconstructor, FileSecurityError, TEXT_CONTROL_BATCH_CHARS,
-)
+from src.file_security import FileSecurityError, TEXT_CONTROL_BATCH_CHARS
+from scripts.benchmark_cdr_baseline import WholeFileReconstructor as ContentDisarmReconstructor
 
 
 ALLOWED_TEXT_CONTROLS = frozenset({'\t', '\n', '\r'})
@@ -58,7 +57,7 @@ def measure(reconstructor, scenario, payload, expected, path):
     else:
         path.write_bytes(payload)
         with mock.patch(
-            'src.file_security.VCF_GZIP_COMPRESSION_LEVEL', VCF_GZIP_COMPARISON_LEVEL,
+            'scripts.benchmark_cdr_baseline.VCF_GZIP_COMPRESSION_LEVEL', VCF_GZIP_COMPARISON_LEVEL,
         ):
             started = perf_counter()
             result = reconstructor.reconstruct(path, path.name)

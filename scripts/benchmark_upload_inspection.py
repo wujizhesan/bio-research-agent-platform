@@ -15,8 +15,9 @@ from uuid import uuid4
 
 from scripts.benchmark_vcf_compression import vcf_for
 from src.file_security import (
-    ContentDisarmReconstructor, FileSecurityPipeline, VCF_GZIP_COMPRESSION_LEVEL,
+    FileSecurityPipeline, VCF_GZIP_COMPRESSION_LEVEL,
 )
+from scripts.benchmark_cdr_baseline import WholeFileReconstructor as ContentDisarmReconstructor
 from src.file_storage import (
     CHUNK_SIZE, FILE_ID_PATTERN, MALWARE_MARKERS, MAX_CONCURRENT_SCANS,
     LocalFileStorage, StoredFile,
