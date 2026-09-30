@@ -17,6 +17,16 @@ class StorageIntegrityError(RuntimeError):
     pass
 
 
+class StorageQuotaExceededError(StorageIntegrityError):
+    pass
+
+
+def _quota_limit(value):
+    if value is not None and (type(value) is not int or value < 0):
+        raise ValueError('materialization quota must be a non-negative integer')
+    return value
+
+
 class _ChecksumWriter:
     def __init__(self, handle, expected_size):
         self._handle = handle
@@ -111,7 +121,9 @@ def _verified_s3_download(
     configured_bucket=None,
     configured_prefix=None,
     expected_owner=None,
+    max_bytes=None,
 ):
+    max_bytes = _quota_limit(max_bytes)
     configured_bucket = (
         os.environ.get('S3_BUCKET', '').strip()
         if configured_bucket is None else str(configured_bucket).strip()
@@ -148,6 +160,8 @@ def _verified_s3_download(
         raise StorageIntegrityError('input object metadata checksum does not match its reference')
     if remote_size != reference.size_bytes:
         raise StorageIntegrityError('input object size does not match its reference')
+    if max_bytes is not None and remote_size > max_bytes:
+        raise StorageQuotaExceededError('materialized input quota exceeded')
     target.parent.mkdir(parents=True, exist_ok=False)
     extra_args = {'VersionId': reference.version_id}
     if expected_owner:
@@ -193,12 +207,15 @@ def materialize_storage_references(
     configured_bucket=None,
     configured_prefix=None,
     expected_owner=None,
+    max_bytes=None,
 ):
     workspace = Path(workspace)
+    remaining = _quota_limit(max_bytes)
     client_holder = [client]
     materialized = {}
 
     def materialize(item):
+        nonlocal remaining
         if isinstance(item, str):
             reference = S3ObjectReference.parse(item)
             if reference is None:
@@ -217,7 +234,10 @@ def materialize_storage_references(
                 configured_bucket=configured_bucket,
                 configured_prefix=configured_prefix,
                 expected_owner=expected_owner,
+                max_bytes=remaining,
             ))
+            if remaining is not None:
+                remaining -= reference.size_bytes
             return materialized[item]
         if isinstance(item, dict):
             return {key: materialize(child) for key, child in item.items()}

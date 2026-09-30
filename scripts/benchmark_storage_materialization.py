@@ -14,7 +14,8 @@ from botocore.response import StreamingBody
 from s3transfer.manager import TransferManager
 
 from scripts.benchmark_secure_jobs import percentile
-from src.storage_workspace import S3ObjectReference, _verified_s3_download
+from src.storage_workspace import S3ObjectReference
+from scripts.benchmark_materialization_quota_baseline import _verified_s3_download
 
 
 class SimulatedS3Client:

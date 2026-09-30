@@ -282,6 +282,12 @@ jobs:
           uv run --no-sync python -m scripts.benchmark_workspace_transfer \
             --samples 8 --file-counts 32,512,2048 --workspace-root output \
             > output/workspace-transfer-benchmark.json
+      - name: Compare bounded S3 input materialization
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_materialization_quota \
+            --samples 8 --workspace-root output \
+            > output/materialization-quota-benchmark.json
       - name: Compare streaming CDR memory and complete uploads
         run: |
           mkdir -p output
@@ -382,6 +388,7 @@ jobs:
             output/gzip-inspection-benchmark.json
             output/directory-publication-benchmark.json
             output/workspace-transfer-benchmark.json
+            output/materialization-quota-benchmark.json
             output/cdr-streaming-benchmark.json
             output/cdr-text-benchmark.json
             output/vcf-compression-benchmark.json

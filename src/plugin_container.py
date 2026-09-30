@@ -22,7 +22,7 @@ try:
     )
     from .observability import current_context, log_event
     from .run_context import current_run_context
-    from .storage_workspace import materialize_storage_references
+    from .storage_workspace import StorageQuotaExceededError, materialize_storage_references
     from .sandbox_workload import is_lightweight_tool
     from .workspace_transfer import WorkspaceTransfer, _rollback_transfer_target
 except ImportError:
@@ -35,7 +35,7 @@ except ImportError:
     )
     from observability import current_context, log_event
     from run_context import current_run_context
-    from storage_workspace import materialize_storage_references
+    from storage_workspace import StorageQuotaExceededError, materialize_storage_references
     from sandbox_workload import is_lightweight_tool
     from workspace_transfer import WorkspaceTransfer, _rollback_transfer_target
 
@@ -255,11 +255,15 @@ class ContainerToolExecutor:
         workspace = self.input_workspace_root / request_id
         workspace.mkdir(mode=0o700)
         try:
-            resolved_arguments = materialize_storage_references(
-                arguments,
-                workspace / 'materialized',
-                client=self.storage_client,
-            )
+            try:
+                resolved_arguments = materialize_storage_references(
+                    arguments,
+                    workspace / 'materialized',
+                    client=self.storage_client,
+                    max_bytes=self.workspace_max_bytes,
+                )
+            except StorageQuotaExceededError as exc:
+                raise JobExecutionError('plugin workspace input quota exceeded') from exc
             if _tree_size(workspace) > self.workspace_max_bytes:
                 raise JobExecutionError('plugin workspace input quota exceeded')
             resolved_arguments, outputs = self._stage_workspace(
