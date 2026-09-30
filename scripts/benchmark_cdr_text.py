@@ -7,6 +7,7 @@ from pathlib import Path
 from statistics import median
 import tempfile
 from time import perf_counter
+from unittest import mock
 
 from src.file_security import (
     ContentDisarmReconstructor, FileSecurityError, TEXT_CONTROL_BATCH_CHARS,
@@ -15,6 +16,7 @@ from src.file_security import (
 
 ALLOWED_TEXT_CONTROLS = frozenset({'\t', '\n', '\r'})
 BASELINE_SOURCE_COMMIT = '35f4a3a34dbb0ec0b9b984ea0c237f84d2ef3fdf'
+VCF_GZIP_COMPARISON_LEVEL = 9
 
 
 class CharacterLoopReconstructor(ContentDisarmReconstructor):
@@ -55,9 +57,12 @@ def measure(reconstructor, scenario, payload, expected, path):
         assert rebuilt == expected
     else:
         path.write_bytes(payload)
-        started = perf_counter()
-        result = reconstructor.reconstruct(path, path.name)
-        elapsed = perf_counter() - started
+        with mock.patch(
+            'src.file_security.VCF_GZIP_COMPRESSION_LEVEL', VCF_GZIP_COMPARISON_LEVEL,
+        ):
+            started = perf_counter()
+            result = reconstructor.reconstruct(path, path.name)
+            elapsed = perf_counter() - started
         assert result == 'reconstructed'
         assert path.read_bytes() == expected
         assert not path.with_name(f'.{path.name}.cdr').exists()
@@ -157,8 +162,12 @@ def benchmark(samples, sizes_mib, workspace_root=None):
                     expected = normalized
                 elif scenario == 'reconstruct_vcf_gzip':
                     filename = 'variants.vcf.gz'
-                    payload = gzip.compress(content, mtime=0)
-                    expected = gzip.compress(normalized, mtime=0)
+                    payload = gzip.compress(
+                        content, compresslevel=VCF_GZIP_COMPARISON_LEVEL, mtime=0,
+                    )
+                    expected = gzip.compress(
+                        normalized, compresslevel=VCF_GZIP_COMPARISON_LEVEL, mtime=0,
+                    )
                 paths = {}
                 for name in ('character_loop', 'batched'):
                     directory = root / name
@@ -207,7 +216,8 @@ def benchmark(samples, sizes_mib, workspace_root=None):
     return {
         'baseline_source_commit': BASELINE_SOURCE_COMMIT,
         'text_control_batch_chars': TEXT_CONTROL_BATCH_CHARS,
-        'scope': 'Text normalization and complete CDR reconstruction on synthetic local files; excludes ClamAV, HTTP, S3, queues and research tools',
+        'vcf_gzip_comparison_level': VCF_GZIP_COMPARISON_LEVEL,
+        'scope': 'Text normalization and complete CDR reconstruction on synthetic local files, with gzip level fixed at 9 to isolate text validation; excludes ClamAV, HTTP, S3, queues and research tools',
         'timer_excludes': 'input generation, input staging, output verification and hashing',
         'output_bytes_equal': True,
         'warmup_pairs_per_scenario': 1,

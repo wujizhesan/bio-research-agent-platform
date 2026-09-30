@@ -140,3 +140,34 @@ class ContentDisarmTextTests(unittest.TestCase):
                     self.assertEqual(path.read_bytes(), content)
                     self.assertEqual(scanner.calls, 1)
                     self.assertFalse(path.with_name(f'.{name}.cdr').exists())
+
+    def test_vcf_gzip_output_is_deterministic_after_normalization(self):
+        content = b'\xef\xbb\xbf##fileformat=VCFv4.2\r\n#CHROM\tPOS\r\n'
+        content += b'1\t10\t.\tA\tC\t30\tPASS\tTAG=sample\r\n' * 4096
+        normalized = content.decode('utf-8-sig').replace('\r\n', '\n').encode()
+        outputs = []
+        with tempfile.TemporaryDirectory(prefix='cdr_deterministic_') as raw:
+            root = Path(raw).resolve()
+            self.assertEqual(root.parent, Path(tempfile.gettempdir()).resolve())
+            for filename in ('first.vcf.gz', 'SECOND.VCF.GZ'):
+                path = root / filename
+                path.write_bytes(gzip.compress(content, compresslevel=9, mtime=123456789))
+                ContentDisarmReconstructor().reconstruct(path, filename)
+                output = path.read_bytes()
+                self.assertEqual(gzip.decompress(output), normalized)
+                self.assertEqual(output[4:8], b'\0' * 4)
+                self.assertEqual(output, gzip.compress(normalized, compresslevel=6, mtime=0))
+                outputs.append(output)
+            self.assertEqual(outputs[0], outputs[1])
+
+    def test_invalid_gzip_does_not_replace_original_file(self):
+        with tempfile.TemporaryDirectory(prefix='cdr_invalid_gzip_') as raw:
+            root = Path(raw).resolve()
+            self.assertEqual(root.parent, Path(tempfile.gettempdir()).resolve())
+            path = root / 'variants.vcf.gz'
+            original = gzip.compress(b'##fileformat=VCFv4.2\n#CHROM\tPOS\n', mtime=0)[:-8]
+            path.write_bytes(original)
+            with self.assertRaisesRegex(FileSecurityError, '^CDR reconstruction failed$'):
+                ContentDisarmReconstructor().reconstruct(path, path.name)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(root.iterdir()), [path])

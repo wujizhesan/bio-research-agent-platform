@@ -17,6 +17,7 @@ SCAN_CHUNK_SIZE = 1024 * 1024
 MAX_SCAN_REPLY_BYTES = 16 * 1024
 TEXT_CONTROL_BATCH_CHARS = 64 * 1024
 UNSAFE_TEXT_CONTROL_PATTERN = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+VCF_GZIP_COMPRESSION_LEVEL = 6
 
 
 class FileSecurityError(ValueError):
@@ -153,7 +154,8 @@ class ContentDisarmReconstructor:
                 with gzip.open(target, 'rb') as source:
                     content = source.read()
                 rebuilt = gzip.compress(
-                    self._reconstruct_text(content, '.vcf'), mtime=0
+                    self._reconstruct_text(content, '.vcf'),
+                    compresslevel=VCF_GZIP_COMPRESSION_LEVEL, mtime=0,
                 )
             else:
                 rebuilt = self._reconstruct_text(

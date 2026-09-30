@@ -1,6 +1,8 @@
 import asyncio
 import gzip
 import hashlib
+import json
+import random
 import sys
 import tempfile
 import threading
@@ -18,8 +20,17 @@ from src.file_security import (
     FileSecurityResult,
     build_file_security_pipeline_from_env,
 )
-from src.file_storage import LocalFileStorage, S3FileStorage
+from src.file_storage import LocalFileStorage, METADATA_RESERVE_BYTES, S3FileStorage
 from src.storage_workspace import StorageIntegrityError, materialize_storage_references
+
+
+def gzip_cdr_growth_content():
+    rng = random.Random(13579)
+    content = b'##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n'
+    return content + b''.join(
+        f'1\t{index + 1}\t.\tA\tC\t30\tPASS\tTAG={rng.randbytes(64).hex()}\n'.encode()
+        for index in range(1000)
+    )
 
 
 class Upload:
@@ -99,6 +110,39 @@ class FakeS3Client:
 
 
 class S3FileStorageTests(unittest.TestCase):
+    def test_gzip_cdr_publishes_rebuilt_checksum_and_size(self):
+        class Scanner:
+            def scan(self, _path):
+                return 'clean'
+
+        content = gzip_cdr_growth_content()
+        original = gzip.compress(content, compresslevel=9, mtime=0)
+        client = FakeS3Client()
+        fake_boto3 = types.ModuleType('boto3')
+        fake_boto3.client = lambda *_args, **_kwargs: client
+        with tempfile.TemporaryDirectory(prefix='s3_gzip_cdr_') as raw:
+            with mock.patch.dict(sys.modules, {'boto3': fake_boto3}):
+                storage = S3FileStorage(
+                    Path(raw) / 'uploads', bucket='bio-test',
+                    security_pipeline=FileSecurityPipeline(
+                        clamav=Scanner(), cdr=ContentDisarmReconstructor(), required=True,
+                    ),
+                )
+                stored = asyncio.run(storage.save(Upload(original, 'variants.vcf.gz')))
+                remote = client.objects[('bio-test', stored.storage_key)]
+                rebuilt = remote['content']
+                self.assertNotEqual(rebuilt, original)
+                self.assertEqual(gzip.decompress(rebuilt), content)
+                self.assertEqual(stored.size_bytes, len(rebuilt))
+                self.assertEqual(stored.sha256, hashlib.sha256(rebuilt).hexdigest())
+                self.assertEqual(remote['metadata']['sha256'], stored.sha256)
+                self.assertEqual(remote['metadata']['security-status'], 'clean')
+                metadata = json.loads((stored.path.parent / 'metadata.json').read_text())
+                self.assertEqual(metadata['sha256'], stored.sha256)
+                self.assertEqual(metadata['size_bytes'], stored.size_bytes)
+                self.assertEqual(metadata['version_id'], stored.version_id)
+                self.assertFalse(stored.path.exists())
+
     def test_discard_removes_exact_uploaded_version_and_local_metadata(self):
         client = FakeS3Client()
         fake_boto3 = types.ModuleType('boto3')
@@ -197,6 +241,65 @@ class S3FileStorageTests(unittest.TestCase):
 
 
 class LocalFileStorageSecurityTests(unittest.TestCase):
+    def test_gzip_cdr_commits_rebuilt_size_and_checksum(self):
+        class Scanner:
+            def __init__(self):
+                self.samples = []
+
+            def scan(self, path):
+                self.samples.append(Path(path).read_bytes())
+                return 'clean'
+
+        content = gzip_cdr_growth_content()
+        original = gzip.compress(content, compresslevel=9, mtime=0)
+        scanner = Scanner()
+        with tempfile.TemporaryDirectory(prefix='gzip_cdr_commit_') as raw:
+            storage = LocalFileStorage(raw, security_pipeline=FileSecurityPipeline(
+                clamav=scanner, cdr=ContentDisarmReconstructor(), required=True,
+            ))
+            stored = asyncio.run(storage.save(Upload(original, 'variants.vcf.gz')))
+            rebuilt = stored.path.read_bytes()
+            self.assertNotEqual(rebuilt, original)
+            self.assertEqual(gzip.decompress(rebuilt), content)
+            self.assertEqual(stored.content_type, 'application/gzip')
+            self.assertEqual(stored.size_bytes, len(rebuilt))
+            self.assertEqual(stored.sha256, hashlib.sha256(rebuilt).hexdigest())
+            metadata = json.loads((stored.path.parent / 'metadata.json').read_text())
+            self.assertEqual(metadata['sha256'], stored.sha256)
+            self.assertEqual(metadata['size_bytes'], stored.size_bytes)
+            self.assertEqual(storage.get(stored.file_id), stored)
+            self.assertEqual(scanner.samples, [original, rebuilt])
+            self.assertEqual(stored.security['scan_count'], 2)
+            self.assertEqual(storage._reserved_bytes, 0)
+
+    def test_gzip_cdr_growth_rechecks_maximum_and_quota(self):
+        class Scanner:
+            def scan(self, _path):
+                return 'clean'
+
+        content = gzip_cdr_growth_content()
+        original = gzip.compress(content, compresslevel=9, mtime=0)
+        rebuilt = gzip.compress(content, compresslevel=6, mtime=0)
+        self.assertGreater(len(rebuilt), len(original))
+        for maximum, quota, message in (
+            (len(original), len(rebuilt) + 4096, 'CDR output exceeds maximum upload size'),
+            (len(rebuilt), len(original) + METADATA_RESERVE_BYTES, 'CDR output exceeds upload storage quota'),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory(prefix='gzip_cdr_growth_') as raw:
+                storage = LocalFileStorage(
+                    raw, max_bytes=maximum, total_quota_bytes=quota,
+                    security_pipeline=FileSecurityPipeline(
+                        clamav=Scanner(), cdr=ContentDisarmReconstructor(), required=True,
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    asyncio.run(storage.save(Upload(original, 'variants.vcf.gz')))
+                self.assertEqual(list(storage.root.iterdir()), [])
+                self.assertEqual(storage._reserved_bytes, 0)
+                self.assertEqual(storage._upload_reservations, {})
+                retry = asyncio.run(storage.save(Upload(b'retry', 'retry.txt')))
+                self.assertEqual(retry.path.read_bytes(), b'retry')
+
     def test_clamav_and_cdr_run_before_file_is_committed(self):
         class Scanner:
             def __init__(self):

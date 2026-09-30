@@ -234,6 +234,12 @@ jobs:
           uv run --no-sync python -m scripts.benchmark_cdr_text \
             --samples 8 --sizes-mib 1,16 --workspace-root output \
             > output/cdr-text-benchmark.json
+      - name: Compare complete VCF CDR compression levels
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_vcf_compression \
+            --samples 8 --sizes-mib 1,16 --workspace-root output \
+            > output/vcf-compression-benchmark.json
       - name: Compare concurrent upload quota reservations
         run: |
           mkdir -p output
@@ -335,6 +341,7 @@ jobs:
             output/upload-concurrency-benchmark.json
             output/upload-usage-benchmark.json
             output/cdr-text-benchmark.json
+            output/vcf-compression-benchmark.json
             frontend/playwright-report
             frontend/test-results
           if-no-files-found: ignore
