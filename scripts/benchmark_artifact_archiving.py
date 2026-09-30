@@ -10,7 +10,7 @@ import tempfile
 from time import perf_counter
 
 from scripts.benchmark_secure_jobs import percentile
-from src.artifact_store import _archive_directory, _sha256
+from src.artifact_store import _archive_directory, _reservation_size, _sha256
 
 
 def archive_with_reread(source, target, root_name):
@@ -134,6 +134,61 @@ def compare(root, size_mib, profile, samples):
     }
 
 
+def compare_compression_levels(root, size_mib, profile, samples):
+    source = root / 'source'
+    expected = make_dataset(source, size_mib, profile)
+    reserved_bytes = _reservation_size(source, archive=True)
+    levels = (1, 6, 9)
+    timings = {level: [] for level in levels}
+    references = {}
+    for index in range(-1, samples):
+        offset = index % len(levels)
+        for level in levels[offset:] + levels[:offset]:
+            target = root / f'{index}-{level}.tar.gz'
+            started = perf_counter()
+            result = _archive_directory(source, target, 'dataset', compresslevel=level)
+            elapsed = perf_counter() - started
+            verify_archive(target, expected, result)
+            if result[1] > reserved_bytes:
+                raise AssertionError('archive exceeded its publication reservation')
+            if level in references and result != references[level]:
+                raise AssertionError('compression level produced inconsistent archive bytes')
+            references[level] = result
+            target.unlink()
+            if index >= 0:
+                timings[level].append(elapsed)
+    baseline = median(timings[9])
+    level_medians = {level: median(timings[level]) for level in levels}
+    level_sizes = {level: references[level][1] for level in levels}
+    return {
+        'source_size_mib': size_mib,
+        'profile': profile,
+        'source_file_count': len(expected),
+        'reserved_bytes': reserved_bytes,
+        'paired_samples_per_level': samples,
+        'levels': {
+            str(level): {
+                'median_seconds': round(level_medians[level], 6),
+                'p95_seconds': round(percentile(timings[level], 95), 6),
+                'archive_size_bytes': level_sizes[level],
+                'median_improvement_vs_level_9_percent': round(
+                    100 * (1 - level_medians[level] / baseline), 1
+                ),
+                'extra_bytes_vs_level_9': level_sizes[level] - level_sizes[9],
+                'break_even_transfer_mib_per_second': round(
+                    (level_sizes[level] - level_sizes[9])
+                    / (baseline - level_medians[level]) / (1024 * 1024), 3
+                ) if level_sizes[level] > level_sizes[9] and level_medians[level] < baseline else None,
+                'wins_vs_level_9': sum(
+                    faster < slower
+                    for faster, slower in zip(timings[level], timings[9])
+                ) if level != 9 else None,
+                'seconds': [round(value, 6) for value in timings[level]],
+            } for level in levels
+        },
+    }
+
+
 def benchmark(samples, sizes, workspace_root=None):
     rows = []
     with tempfile.TemporaryDirectory(prefix='artifact_archive_benchmark_', dir=workspace_root) as raw:
@@ -153,11 +208,34 @@ def benchmark(samples, sizes, workspace_root=None):
     }
 
 
+def benchmark_compression_levels(samples, sizes, workspace_root=None):
+    rows = []
+    with tempfile.TemporaryDirectory(prefix='artifact_compression_benchmark_', dir=workspace_root) as raw:
+        for size in sizes:
+            for profile in ('synthetic_fastq', 'incompressible'):
+                rows.append(compare_compression_levels(
+                    Path(raw) / f'{size}-{profile}', size, profile, samples,
+                ))
+    return {
+        'scope': 'local deterministic directory packing and SHA-256 generation; '
+        'uses synthetic FASTQ-shaped text and incompressible bytes; '
+        'excludes S3 upload, network, queue, API and tool execution',
+        'break_even_model': 'additional archive bytes divided by median packing time saved; '
+        'assumes equal fixed upload overhead and ignores retries and network variation',
+        'verification': 'every archive is independently reread, SHA-256/length checked, '
+        'and every decompressed member and its metadata verified outside the timed interval',
+        'workspace_root': str(Path(workspace_root or tempfile.gettempdir()).resolve()),
+        'warmup_per_level_per_dataset': 1,
+        'datasets': rows,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description='Compare artifact archive verification strategies')
     parser.add_argument('--samples', type=int, default=16)
     parser.add_argument('--sizes-mib', default='1,16')
     parser.add_argument('--workspace-root')
+    parser.add_argument('--compression-levels', action='store_true')
     args = parser.parse_args()
     try:
         sizes = [int(value) for value in args.sizes_mib.split(',')]
@@ -167,7 +245,8 @@ def main():
         parser.error('samples must be at least two and sizes must be positive')
     if args.workspace_root is not None and not Path(args.workspace_root).is_dir():
         parser.error('workspace-root must be an existing directory')
-    print(json.dumps(benchmark(args.samples, sizes, args.workspace_root), sort_keys=True))
+    run = benchmark_compression_levels if args.compression_levels else benchmark
+    print(json.dumps(run(args.samples, sizes, args.workspace_root), sort_keys=True))
 
 
 if __name__ == '__main__':

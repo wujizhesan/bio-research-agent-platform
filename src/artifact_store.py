@@ -90,13 +90,16 @@ class _ArchiveChecksumWriter:
         self.handle.flush()
 
 
-def _archive_directory(source, target, root_name):
+def _archive_directory(source, target, root_name, compresslevel=9):
     source = Path(source)
     raw = target.open('wb')
     try:
         with raw:
             writer = _ArchiveChecksumWriter(raw)
-            with gzip.GzipFile(fileobj=writer, mode='wb', filename='', mtime=0) as compressed:
+            with gzip.GzipFile(
+                fileobj=writer, mode='wb', filename='', mtime=0,
+                compresslevel=compresslevel,
+            ) as compressed:
                 with tarfile.open(
                     fileobj=compressed,
                     mode='w',
@@ -311,7 +314,9 @@ class S3ArtifactStore:
         content_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
         if staged.is_dir():
             packaged = staged.parent / f'.{artifact_id}.tar.gz'
-            sha256, size = _archive_directory(staged, packaged, target.name)
+            sha256, size = _archive_directory(
+                staged, packaged, target.name, compresslevel=1,
+            )
             upload_path = packaged
             content_type = 'application/gzip'
         else:

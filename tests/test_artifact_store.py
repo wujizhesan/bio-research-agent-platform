@@ -182,6 +182,29 @@ class ArtifactStoreTests(unittest.TestCase):
             self.assertEqual(list(root.glob('*.tar.gz')), [])
             self.assertEqual(client.deleted[0][2], 'version-1')
 
+    def test_s3_directory_uses_fast_compression_with_valid_reservation(self):
+        with tempfile.TemporaryDirectory(prefix='artifact_fast_gzip_') as raw:
+            root = Path(raw)
+            source = root / 'source'
+            source.mkdir()
+            payload = (b'@read\n' + b'ACGT' * 25 + b'\n+\n' + b'I' * 100 + b'\n') * 4096
+            (source / 'reads.fastq').write_bytes(payload)
+            original = root / 'original.tar.gz'
+            archive_with_reread(source, original, 'dataset')
+            client = FakeS3Client()
+            handle = S3ArtifactStore('research-results', client=client).publish(
+                source, root / 'dataset', 'output_dir', 'directory',
+                {'job_id': 'job-fast', 'execution_key': 'execution-fast'}, 0,
+            )
+            body = client.objects[('research-results', handle.record['storage_key'])]['body']
+            self.assertNotEqual(body, original.read_bytes())
+            self.assertLessEqual(len(body), handle.record['reserved_bytes'])
+            self.assertEqual(handle.record['sha256'], hashlib.sha256(body).hexdigest())
+            with tarfile.open(fileobj=BytesIO(body), mode='r:gz') as archive:
+                self.assertEqual(archive.extractfile('dataset/reads.fastq').read(), payload)
+            handle.finalize()
+            self.assertFalse(source.exists())
+
     def test_archive_writer_rejects_short_write(self):
         class ShortWriter(BytesIO):
             def write(self, data):

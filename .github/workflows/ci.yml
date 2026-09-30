@@ -455,6 +455,13 @@ jobs:
             exec -T plugin-sandbox python -m scripts.benchmark_artifact_archiving \
             --samples 16 --sizes-mib 1,16 --workspace-root /run/bioagent/plugin-exchange \
             > output/artifact-archiving-benchmark.json
+      - name: Compare gzip levels for directory artifact archives
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml \
+            exec -T plugin-sandbox python -m scripts.benchmark_artifact_archiving \
+            --compression-levels --samples 8 --sizes-mib 1,16 \
+            --workspace-root /run/bioagent/plugin-exchange \
+            > output/artifact-compression-benchmark.json
       - name: Capture secure job latency baseline
         run: |
           python -m scripts.benchmark_secure_jobs \
@@ -626,6 +633,7 @@ jobs:
             output/contract-validation-benchmark.json
             output/storage-materialization-benchmark.json
             output/artifact-archiving-benchmark.json
+            output/artifact-compression-benchmark.json
             output/secure-fullstack-e2e
             output/monitoring-smoke
           if-no-files-found: ignore
