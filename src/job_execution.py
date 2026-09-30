@@ -367,6 +367,18 @@ def _complete_process(process, completion):
         completion.set_exception(exc)
 
 
+def _read_stderr_tail(path):
+    max_chars = 2000
+    # Four bytes per character also covers universal newline translation.
+    max_bytes = max_chars * 4
+    with path.open('rb') as source:
+        end = source.seek(0, os.SEEK_END)
+        source.seek(max(end - max_bytes, 0))
+        raw = source.read(max_bytes)
+    text = raw.decode('utf-8', errors='replace')
+    return text.replace('\r\n', '\n').replace('\r', '\n')[-max_chars:].strip()
+
+
 class ProcessToolExecutor:
     mode = 'process'
 
@@ -537,7 +549,7 @@ class ProcessToolExecutor:
                 process_end_ns - spawn_started_ns
             ) / 1_000_000_000
             if not response_path.exists():
-                detail = error_path.read_text(encoding='utf-8', errors='replace')[-2000:].strip()
+                detail = _read_stderr_tail(error_path)
                 suffix = f': {detail}' if detail else ''
                 raise JobExecutionError(f'isolated worker exited with code {process.returncode}{suffix}')
             if response_path.stat().st_size > self.limits.max_result_bytes:
