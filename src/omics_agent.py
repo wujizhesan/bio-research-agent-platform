@@ -295,12 +295,6 @@ def run_pathway_enrichment(de_csv, gene_sets_csv, output_csv,
         overlap = pathway_genes & selected
         if not pathway_genes:
             continue
-        p_value = float(hypergeom.sf(
-            len(overlap) - 1,
-            len(background),
-            len(pathway_genes),
-            len(selected),
-        )) if selected else 1.0
         rows.append({
             'pathway_id': pathway_id,
             'pathway_name': pathway['pathway_name'],
@@ -308,8 +302,19 @@ def run_pathway_enrichment(de_csv, gene_sets_csv, output_csv,
             'overlap_count': len(overlap),
             'selected_count': len(selected),
             'overlap_genes': '|'.join(sorted(overlap)),
-            'p_value': p_value,
+            'p_value': 1.0,
         })
+    if selected:
+        for offset in range(0, len(rows), 1024):
+            batch = rows[offset:offset + 1024]
+            probabilities = hypergeom.sf(
+                [row['overlap_count'] - 1 for row in batch],
+                len(background),
+                [row['pathway_size'] for row in batch],
+                len(selected),
+            )
+            for row, probability in zip(batch, probabilities):
+                row['p_value'] = float(probability)
     result = pd.DataFrame(rows, columns=[
         'pathway_id', 'pathway_name', 'pathway_size', 'overlap_count',
         'selected_count', 'overlap_genes', 'p_value',
