@@ -318,6 +318,12 @@ jobs:
           uv run --no-sync python -m scripts.benchmark_variant_interval \
             --samples 8 --workspace-root output \
             > output/variant-interval-benchmark.json
+      - name: Compare complete 10x QC with bounded count validation
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_tenx_counts \
+            --samples 8 --workspace-root output \
+            > output/tenx-counts-benchmark.json
       - name: Compare streaming CDR memory and complete uploads
         run: |
           mkdir -p output
@@ -424,6 +430,7 @@ jobs:
             output/response-write-benchmark.json
             output/fastq-quality-benchmark.json
             output/variant-interval-benchmark.json
+            output/tenx-counts-benchmark.json
             output/cdr-streaming-benchmark.json
             output/cdr-text-benchmark.json
             output/vcf-compression-benchmark.json
