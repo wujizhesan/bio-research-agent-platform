@@ -268,13 +268,25 @@ def _load_gene_sets(gene_sets_csv):
     gene_sets = pd.read_csv(gene_sets_csv)
     _require_columns(gene_sets, {'pathway_id', 'pathway_name', 'gene_id'}, 'gene set table')
     gene_sets = gene_sets.dropna(subset=['pathway_id', 'gene_id']).copy()
-    return {
-        str(pathway_id): {
-            'pathway_name': str(group['pathway_name'].iloc[0]),
-            'genes': set(group['gene_id'].astype(str)),
+    gene_ids = gene_sets['gene_id']
+    gene_array = gene_ids.array
+    names = gene_sets['pathway_name'].array
+    string_ids = isinstance(gene_ids.dtype, pd.StringDtype)
+    result = {}
+    for pathway_id, positions in gene_sets.groupby('pathway_id').indices.items():
+        genes = set()
+        if string_ids:
+            for offset in range(0, len(positions), 16384):
+                genes.update(gene_array.take(positions[offset:offset + 16384]).to_numpy())
+        else:
+            values = gene_ids.iloc[positions].astype(str)
+            for offset in range(0, len(values), 16384):
+                genes.update(values.iloc[offset:offset + 16384].to_numpy())
+        result[str(pathway_id)] = {
+            'pathway_name': str(names[positions[0]]),
+            'genes': genes,
         }
-        for pathway_id, group in gene_sets.groupby('pathway_id')
-    }
+    return result
 
 
 def run_pathway_enrichment(de_csv, gene_sets_csv, output_csv,

@@ -336,6 +336,12 @@ jobs:
           uv run --no-sync python -m scripts.benchmark_pathway_batches \
             --samples 8 --workspace-root output \
             > output/pathway-batches-benchmark.json
+      - name: Compare complete pathway enrichment with bounded gene arrays
+        run: |
+          mkdir -p output
+          uv run --no-sync python -m scripts.benchmark_pathway_grouping \
+            --samples 8 --workspace-root output \
+            > output/pathway-grouping-benchmark.json
       - name: Compare streaming CDR memory and complete uploads
         run: |
           mkdir -p output
@@ -444,6 +450,7 @@ jobs:
             output/variant-interval-benchmark.json
             output/tenx-counts-benchmark.json
             output/pathway-batches-benchmark.json
+            output/pathway-grouping-benchmark.json
             output/cdr-streaming-benchmark.json
             output/cdr-text-benchmark.json
             output/vcf-compression-benchmark.json
