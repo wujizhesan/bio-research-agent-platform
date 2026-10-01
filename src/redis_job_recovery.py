@@ -2,7 +2,6 @@
 
 from contextlib import nullcontext
 from datetime import datetime, timezone
-from time import time
 
 try:
     from .job_manager import TERMINAL_STATUSES
@@ -28,23 +27,34 @@ class RedisLeaseRecovery:
         if lease_until is None:
             return False
         try:
-            return float(lease_until) > (now or time())
+            if now is None:
+                raise ValueError('lease comparison requires server time')
+            return float(lease_until) > now
         except (TypeError, ValueError):
             return False
 
     def dead_letter(self, record, reason):
         job_id = str(record['job_id'])
-        record.update({
-            'status': 'failed',
-            'finished_at': _now(),
-            'dead_lettered_at': _now(),
-            'dead_letter_reason': reason,
-            'error': record.get('error') or reason,
-        })
-        record.pop('_worker_id', None)
-        record.pop('_lease_until', None)
-        record.pop('_started_epoch', None)
-        self.store.save(record)
+
+        def transition(current, _server_now):
+            if current.get('status') in TERMINAL_STATUSES:
+                return None
+            current.update({
+                'status': 'failed',
+                'finished_at': _now(),
+                'dead_lettered_at': _now(),
+                'dead_letter_reason': reason,
+                'error': current.get('error') or reason,
+            })
+            current.pop('_worker_id', None)
+            current.pop('_lease_until', None)
+            current.pop('_fencing_token', None)
+            current.pop('_started_epoch', None)
+            return current
+
+        record, changed = self.store.atomic_update(job_id, transition)
+        if not changed:
+            return self.store.public_record(record)
         self.store.move_to_dead_letter(job_id)
         self.store.acknowledge(job_id)
         self.metrics.dead_lettered(record, reason, self.worker_id)
@@ -58,7 +68,7 @@ class RedisLeaseRecovery:
             -1,
         )
         recovered = []
-        now = time()
+        now = self.store.server_time()
         for raw_job_id in processing_ids:
             job_id = (
                 raw_job_id.decode('utf-8')
@@ -82,14 +92,31 @@ class RedisLeaseRecovery:
                         self.store.acknowledge(job_id)
                         continue
                     if record.get('status') == 'queued':
+                        if float(record.get('_retry_not_before') or 0) > now:
+                            self.store.acknowledge(job_id)
+                            continue
                         if not self.store.queue_contains(job_id):
-                            record['recovered_at'] = _now()
-                            self.store.save(record)
-                            self.store.enqueue(
+                            def mark_recovered(current, _server_now):
+                                if current.get('status') != 'queued':
+                                    return None
+                                current['recovered_at'] = _now()
+                                return current
+
+                            record, changed = self.store.atomic_update(
                                 job_id,
-                                int(record.get('priority', 0)),
+                                mark_recovered,
                             )
-                            recovered.append(job_id)
+                            if changed:
+                                self.store.enqueue(
+                                    job_id,
+                                    int(record.get('priority', 0)),
+                                    route_id=(
+                                        self.store.register_route(record)
+                                        if record.get('_capability_routing')
+                                        else None
+                                    ),
+                                )
+                                recovered.append(job_id)
                         self.store.acknowledge(job_id)
                         continue
                     if self.lease_active(record, now):
@@ -98,19 +125,38 @@ class RedisLeaseRecovery:
                         self.dead_letter(record, 'max_attempts_exceeded')
                         recovered.append(job_id)
                         continue
-                    record.pop('started_at', None)
-                    record.pop('error', None)
-                    record.pop('_worker_id', None)
-                    record.pop('_lease_until', None)
-                    record.pop('_started_epoch', None)
-                    record.update({
-                        'status': 'queued',
-                        'recovered_at': _now(),
-                    })
-                    self.store.save(record)
+                    expected_token = record.get('_fencing_token')
+
+                    def requeue(current, server_now):
+                        if current.get('status') != 'running':
+                            return None
+                        if self.lease_active(current, server_now):
+                            return None
+                        if current.get('_fencing_token') != expected_token:
+                            return None
+                        current.pop('started_at', None)
+                        current.pop('error', None)
+                        current.pop('_worker_id', None)
+                        current.pop('_lease_until', None)
+                        current.pop('_fencing_token', None)
+                        current.pop('_started_epoch', None)
+                        current.update({
+                            'status': 'queued',
+                            'recovered_at': _now(),
+                        })
+                        return current
+
+                    record, changed = self.store.atomic_update(job_id, requeue)
+                    if not changed:
+                        continue
                     self.store.enqueue(
                         job_id,
                         int(record.get('priority', 0)),
+                        route_id=(
+                            self.store.register_route(record)
+                            if record.get('_capability_routing')
+                            else None
+                        ),
                     )
                     self.store.acknowledge(job_id)
                     recovered.append(job_id)

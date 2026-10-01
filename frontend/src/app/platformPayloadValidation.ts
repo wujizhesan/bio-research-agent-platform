@@ -1,11 +1,12 @@
-import type { Capabilities, CapabilityInterface, Job, Plugin, Project } from './types'
+import type { Capabilities, CapabilityInterface, Job, JobArtifact, Plugin, Project } from './types'
 
 export type ValidationResult<T> = {
   value: T
   issues: string[]
 }
 
-const jobStatuses = new Set<Job['status']>(['queued', 'running', 'completed', 'failed', 'cancelled'])
+const jobStatuses = new Set<Job['status']>(['queued', 'running', 'completed', 'failed', 'cancelled', 'indeterminate'])
+const resolutionDecisions = new Set(['confirm_succeeded', 'confirm_failed', 'approve_retry'])
 const interfaceStringFields = ['docs', 'openapi', 'endpoint', 'transport', 'entrypoint'] as const
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -56,7 +57,47 @@ export function parsePlugin(value: unknown): Plugin | null {
   }
 }
 
+function parseJobArtifact(value: unknown): JobArtifact | null {
+  if (!isRecord(value)
+    || !/^[a-f0-9]{32}$/.test(String(value.artifact_id || ''))
+    || !isNonEmptyString(value.filename)
+    || !isNonEmptyString(value.content_type)
+    || !isNonNegativeInteger(value.size_bytes)
+    || !/^[a-f0-9]{64}$/.test(String(value.sha256 || ''))
+    || !['local', 's3'].includes(String(value.storage_backend || ''))
+    || !optionalStringIsValid(value.parameter)
+    || !optionalStringIsValid(value.kind)
+    || !optionalStringIsValid(value.path)
+    || !optionalStringIsValid(value.storage_key)
+    || !optionalStringIsValid(value.version_id)
+    || !optionalStringIsValid(value.reference)) return null
+  if (value.storage_backend === 'local' && !isNonEmptyString(value.path)) return null
+  if (value.storage_backend === 's3' && (
+    !isNonEmptyString(value.storage_key)
+    || !isNonEmptyString(value.version_id)
+    || !isNonEmptyString(value.reference)
+  )) return null
+  return {
+    artifact_id: String(value.artifact_id),
+    filename: value.filename,
+    content_type: value.content_type,
+    size_bytes: value.size_bytes,
+    sha256: String(value.sha256),
+    storage_backend: value.storage_backend as JobArtifact['storage_backend'],
+    ...(typeof value.parameter === 'string' ? { parameter: value.parameter } : {}),
+    ...(typeof value.kind === 'string' ? { kind: value.kind } : {}),
+    ...(typeof value.path === 'string' ? { path: value.path } : {}),
+    ...(typeof value.storage_key === 'string' ? { storage_key: value.storage_key } : {}),
+    ...(typeof value.version_id === 'string' ? { version_id: value.version_id } : {}),
+    ...(typeof value.reference === 'string' ? { reference: value.reference } : {}),
+  }
+}
+
 export function parseJob(value: unknown): Job | null {
+  const resolution = isRecord(value) ? value.resolution : undefined
+  const artifacts = isRecord(value) && Array.isArray(value.artifacts)
+    ? value.artifacts.map(parseJobArtifact)
+    : undefined
   if (!isRecord(value)
     || !isNonEmptyString(value.job_id)
     || !isNonEmptyString(value.tool)
@@ -68,6 +109,21 @@ export function parseJob(value: unknown): Job | null {
     || !optionalStringIsValid(value.trace_id)
     || !optionalStringIsValid(value.request_id)
     || (value.result !== undefined && value.result !== null && !isRecord(value.result))
+    || (value.artifacts !== undefined && !Array.isArray(value.artifacts))
+    || (artifacts !== undefined && artifacts.some((artifact) => artifact === null))
+    || (value.execution_identity !== undefined && value.execution_identity !== null && !isRecord(value.execution_identity))
+    || (value.routing !== undefined && value.routing !== null && !isRecord(value.routing))
+    || (value.execution !== undefined && value.execution !== null && !isRecord(value.execution))
+    || (value.scheduling !== undefined && value.scheduling !== null && !isRecord(value.scheduling))
+    || (value.indeterminate !== undefined && value.indeterminate !== null && !isRecord(value.indeterminate))
+    || (resolution !== undefined && resolution !== null && (
+      !isRecord(resolution)
+      || !resolutionDecisions.has(resolution.decision as string)
+      || !isNonEmptyString(resolution.reason)
+      || !isNonEmptyString(resolution.reviewer)
+      || !isNonEmptyString(resolution.resolved_at)
+      || (resolution.evidence !== undefined && !isRecord(resolution.evidence))
+    ))
     || (value.cancel_requested !== undefined && typeof value.cancel_requested !== 'boolean')) return null
   return {
     job_id: value.job_id,
@@ -77,10 +133,17 @@ export function parseJob(value: unknown): Job | null {
     ...(typeof value.started_at === 'string' ? { started_at: value.started_at } : {}),
     ...(typeof value.finished_at === 'string' ? { finished_at: value.finished_at } : {}),
     ...(isRecord(value.result) ? { result: value.result } : {}),
+    ...(artifacts !== undefined ? { artifacts: artifacts as JobArtifact[] } : {}),
     ...(typeof value.error === 'string' ? { error: value.error } : {}),
     ...(typeof value.cancel_requested === 'boolean' ? { cancel_requested: value.cancel_requested } : {}),
     ...(typeof value.trace_id === 'string' ? { trace_id: value.trace_id } : {}),
     ...(typeof value.request_id === 'string' ? { request_id: value.request_id } : {}),
+    ...(isRecord(value.execution_identity) ? { execution_identity: value.execution_identity } : {}),
+    ...(isRecord(value.routing) ? { routing: value.routing } : {}),
+    ...(isRecord(value.execution) ? { execution: value.execution } : {}),
+    ...(isRecord(value.scheduling) ? { scheduling: value.scheduling } : {}),
+    ...(isRecord(value.indeterminate) ? { indeterminate: value.indeterminate } : {}),
+    ...(isRecord(resolution) ? { resolution: resolution as Job['resolution'] } : {}),
   }
 }
 

@@ -128,6 +128,41 @@ def redis_client(args):
     )
 
 
+async def ensure_database_roles(args):
+    connection = await asyncpg.connect(database_url(args))
+    try:
+        await connection.execute(
+            """
+            DO $roles$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_roles WHERE rolname = 'bioagent_api'
+                ) THEN
+                    CREATE ROLE bioagent_api NOLOGIN;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_roles WHERE rolname = 'bioagent_dispatcher'
+                ) THEN
+                    CREATE ROLE bioagent_dispatcher NOLOGIN;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_roles WHERE rolname = 'bioagent_worker'
+                ) THEN
+                    CREATE ROLE bioagent_worker NOLOGIN;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_roles WHERE rolname = 'bioagent_maintenance'
+                ) THEN
+                    CREATE ROLE bioagent_maintenance NOLOGIN;
+                END IF;
+            END
+            $roles$;
+            """
+        )
+    finally:
+        await connection.close()
+
+
 async def seed_database(args):
     connection = await asyncpg.connect(database_url(args))
     try:
@@ -433,6 +468,8 @@ def execute(args):
         stage_started = time.monotonic()
         run(compose_command(args.project, "up", "--detach", "--wait"), env=environment)
         metrics["service_start_seconds"] = rounded_seconds(stage_started)
+        stage = "role_bootstrap"
+        asyncio.run(ensure_database_roles(args))
         stage = "seed"
         stage_started = time.monotonic()
         run(

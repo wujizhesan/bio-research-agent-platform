@@ -152,6 +152,7 @@ def _plugin_snapshot(spec):
         'returns': spec.get('returns') or spec.get('result_schema') or {},
         'permissions': spec.get('permissions') or {},
         'resources': spec.get('resources') or {},
+        'execution_semantics': spec.get('execution_semantics') or 'pure',
     }
     return {
         'name': str(spec.get('domain') or 'unknown'),
@@ -160,6 +161,7 @@ def _plugin_snapshot(spec):
         'contract_sha256': str(
             spec.get('plugin_contract_digest') or _digest(contract)
         ),
+        'execution_semantics': str(spec.get('execution_semantics') or 'pure'),
     }
 
 
@@ -182,6 +184,7 @@ class RunContext:
     configuration: Mapping[str, Any] = field(default_factory=dict)
     configuration_sha256: str = ''
     random_seeds: Mapping[str, Any] = field(default_factory=dict)
+    execution: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.schema_version != RUN_CONTEXT_VERSION:
@@ -190,7 +193,8 @@ class RunContext:
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f'run context {name} is required')
         frozen_fields = (
-            'actor', 'plugin', 'resources', 'input_hashes', 'configuration', 'random_seeds'
+            'actor', 'plugin', 'resources', 'input_hashes', 'configuration',
+            'random_seeds', 'execution',
         )
         for name in frozen_fields:
             object.__setattr__(self, name, _freeze(dict(getattr(self, name))))
@@ -214,6 +218,7 @@ class RunContext:
             'configuration': _thaw(self.configuration),
             'configuration_sha256': self.configuration_sha256,
             'random_seeds': _thaw(self.random_seeds),
+            'execution': _thaw(self.execution),
         }
 
     @classmethod
@@ -228,7 +233,7 @@ class RunContext:
 
 def build_run_context(tool, arguments, spec=None, resources=None, priority=0,
                       job_id=None, retry_of=None, parent=None, run_id=None,
-                      trace_id=None, request_id=None):
+                      trace_id=None, request_id=None, execution=None):
     parent = RunContext.from_dict(parent) if parent is not None else None
     observable = current_context()
     sanitized_arguments = _sanitize(arguments)
@@ -289,6 +294,11 @@ def build_run_context(tool, arguments, spec=None, resources=None, priority=0,
         configuration=configuration,
         configuration_sha256=_digest(configuration_digest_input),
         random_seeds=_random_seeds(arguments),
+        execution=(
+            execution
+            if execution is not None
+            else (parent.execution if parent else {})
+        ),
     )
 
 

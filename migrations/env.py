@@ -7,13 +7,14 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from src.database import Base, normalize_database_url
+from src.settings import _secret_text
 
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-configured_url = normalize_database_url(os.environ.get('DATABASE_URL'))
+configured_url = normalize_database_url(_secret_text(os.environ, 'DATABASE_URL'))
 config.set_main_option('sqlalchemy.url', configured_url.replace('%', '%%'))
 target_metadata = Base.metadata
 

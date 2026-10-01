@@ -4,6 +4,7 @@ services:
       clamav:
         condition: service_healthy
     environment:
+      WORKER_LIGHT_RESERVED_SLOTS: ${SECURE_WORKER_LIGHT_RESERVED_SLOTS:-3}
       RUN_MIGRATIONS: "false"
       FILE_SECURITY_MODE: required
       FILE_CDR_MODE: normalize
@@ -19,31 +20,51 @@ services:
     depends_on:
       plugin-sandbox:
         condition: service_healthy
+      plugin-sandbox-heavy:
+        condition: service_healthy
     environment:
       JOB_EXECUTION_MODE: container
+      WORKER_MAX_CONCURRENCY: ${SECURE_WORKER_MAX_CONCURRENCY:-4}
+      WORKER_LIGHT_RESERVED_SLOTS: ${SECURE_WORKER_LIGHT_RESERVED_SLOTS:-3}
+      JOB_TOTAL_CPU_CORES: ${SECURE_WORKER_TOTAL_CPU_CORES:-4}
       PLUGIN_SANDBOX_URL: http://plugin-sandbox:8081
+      PLUGIN_SANDBOX_HEAVY_URL: http://plugin-sandbox-heavy:8081
       PLUGIN_SANDBOX_TOKEN_FILE: /run/secrets/plugin_sandbox_token
-      PLUGIN_SANDBOX_CLIENT_CONCURRENCY: ${PLUGIN_SANDBOX_CLIENT_CONCURRENCY:-8}
-      JOB_INPUT_WORKSPACE_ROOT: /app/output/.job-inputs
+      PLUGIN_SANDBOX_CLIENT_CONCURRENCY: ${SECURE_PLUGIN_SANDBOX_CLIENT_CONCURRENCY:-4}
+      JOB_INPUT_WORKSPACE_ROOT: /run/bioagent/plugin-exchange
+      PLUGIN_ARTIFACT_ROOT: /app/output
+      PLUGIN_INPUT_ROOTS: /app/output,/app/data
+      PLUGIN_SANDBOX_WORKSPACE_MAX_BYTES: ${PLUGIN_SANDBOX_WORKSPACE_MAX_BYTES:-10737418240}
     secrets:
       - plugin_sandbox_token
     networks:
       - default
       - plugin_control
+    volumes:
+      - plugin_exchange:/run/bioagent/plugin-exchange
 
-  plugin-sandbox:
+  artifact-maintenance:
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+
+  plugin-sandbox: &plugin_sandbox_service
     build:
       context: .
       dockerfile: Dockerfile
       args:
         APP_UID: ${APP_UID:-1000}
         APP_GID: ${APP_GID:-1000}
-    environment:
+    environment: &plugin_sandbox_environment
       RUN_MIGRATIONS: "false"
       PLUGIN_SANDBOX_TOKEN_FILE: /run/secrets/plugin_sandbox_token
       PLUGIN_SANDBOX_HOST: 0.0.0.0
       PLUGIN_SANDBOX_PORT: "8081"
-      PLUGIN_SANDBOX_MAX_CONCURRENCY: ${PLUGIN_SANDBOX_MAX_CONCURRENCY:-2}
+      PLUGIN_SANDBOX_POOL: light
+      PLUGIN_SANDBOX_MAX_CONCURRENCY: ${PLUGIN_SANDBOX_MAX_CONCURRENCY:-4}
+      PLUGIN_SANDBOX_LIGHT_MEMORY_LIMIT_MB: ${PLUGIN_SANDBOX_LIGHT_MEMORY_LIMIT_MB:-1024}
+      PLUGIN_SANDBOX_MEMORY_BUDGET_MB: ${PLUGIN_SANDBOX_MEMORY_BUDGET_MB:-4096}
+      PLUGIN_SANDBOX_WORKSPACE_ROOT: /run/bioagent/plugin-exchange
       PLUGIN_SANDBOX_MAX_REQUEST_BYTES: ${PLUGIN_SANDBOX_MAX_REQUEST_BYTES:-16777216}
       JOB_EXECUTION_MODE: process
       JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-3600}
@@ -74,7 +95,7 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=256m
     volumes:
-      - ./output:/app/output:rw
+      - plugin_exchange:/run/bioagent/plugin-exchange:rw
       - ./data:/app/data:ro
     networks:
       - plugin_control
@@ -83,6 +104,15 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  plugin-sandbox-heavy:
+    <<: *plugin_sandbox_service
+    environment:
+      <<: *plugin_sandbox_environment
+      PLUGIN_SANDBOX_POOL: heavy
+      PLUGIN_SANDBOX_MAX_CONCURRENCY: "1"
+    mem_limit: ${PLUGIN_SANDBOX_HEAVY_CONTAINER_MEMORY:-6g}
+    cpus: ${PLUGIN_SANDBOX_HEAVY_CPUS:-2.0}
 
   clamav:
     image: clamav/clamav:1.5@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422
@@ -112,7 +142,8 @@ networks:
 
 volumes:
   clamav_signatures:
+  plugin_exchange:
 
 secrets:
   plugin_sandbox_token:
-    environment: PLUGIN_SANDBOX_TOKEN
+    file: ${PLUGIN_SANDBOX_TOKEN_FILE:?required}

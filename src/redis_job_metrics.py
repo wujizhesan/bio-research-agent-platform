@@ -1,12 +1,15 @@
 """Metrics and structured lifecycle events for Redis jobs."""
 
 from datetime import datetime, timezone
+import logging
+from prometheus_client import Counter, Histogram
 
 try:
     from .observability import (
         JOB_ACTIVE,
         JOB_DURATION,
         JOB_EXECUTIONS,
+        JOB_QUEUE_PHASE_DURATION,
         JOB_QUEUE_DURATION,
         JOB_TRANSITIONS,
         REDIS_DEAD_LETTER_DEPTH,
@@ -21,11 +24,13 @@ try:
         REDIS_WORKER_DRAINING,
         log_event,
     )
+    from .queue_timing import queue_phase_seconds
 except ImportError:
     from observability import (
         JOB_ACTIVE,
         JOB_DURATION,
         JOB_EXECUTIONS,
+        JOB_QUEUE_PHASE_DURATION,
         JOB_QUEUE_DURATION,
         JOB_TRANSITIONS,
         REDIS_DEAD_LETTER_DEPTH,
@@ -40,6 +45,29 @@ except ImportError:
         REDIS_WORKER_DRAINING,
         log_event,
     )
+    from queue_timing import queue_phase_seconds
+
+
+REDIS_DEFERRED_CACHE_SYNC_FAILURES = Counter(
+    'bio_agent_redis_deferred_cache_sync_failures_total',
+    'Durable deferrals committed in PostgreSQL but not synchronized to Redis.',
+    ['namespace'],
+)
+REDIS_DEFERRED_RECONCILIATIONS = Counter(
+    'bio_agent_redis_deferred_reconciliations_total',
+    'Deferred jobs reconciled from the durable outbox.',
+    ['namespace', 'mode'],
+)
+REDIS_DEFERRED_RECONCILE_LAG = Histogram(
+    'bio_agent_redis_deferred_reconcile_lag_seconds',
+    'Seconds elapsed after a deferred retry became due before Redis reconciliation.',
+    ['namespace', 'mode'],
+)
+REDIS_WORKER_CAPACITY_REJECTIONS = Counter(
+    'bio_agent_redis_worker_capacity_rejections_total',
+    'Jobs rejected by a worker because its advertised resources are occupied.',
+    ['namespace', 'tool'],
+)
 
 
 class RedisJobMetrics:
@@ -69,6 +97,28 @@ class RedisJobMetrics:
             priority=record.get('priority', 0),
         )
 
+    def capacity_rejected(self, record):
+        REDIS_WORKER_CAPACITY_REJECTIONS.labels(
+            self.namespace, record.get('tool') or 'unknown'
+        ).inc()
+
+    def deferred_cache_sync_failed(self, job_id, error):
+        REDIS_DEFERRED_CACHE_SYNC_FAILURES.labels(self.namespace).inc()
+        log_event(
+            'job.external_retry_cache_sync_failed',
+            level=logging.ERROR,
+            backend=self.backend,
+            job_id=job_id,
+            error_type=type(error).__name__,
+        )
+
+    def deferred_reconciled(self, record, mode, now):
+        REDIS_DEFERRED_RECONCILIATIONS.labels(self.namespace, mode).inc()
+        retry_at = float(record.get('_retry_not_before') or 0)
+        REDIS_DEFERRED_RECONCILE_LAG.labels(self.namespace, mode).observe(
+            max(float(now) - retry_at, 0)
+        )
+
     @staticmethod
     def result_cache(tool, outcome):
         REDIS_RESULT_CACHE.labels(tool, outcome).inc()
@@ -91,6 +141,12 @@ class RedisJobMetrics:
 
     def claimed(self, record, worker_id):
         tool = record['tool']
+        phases = queue_phase_seconds(record)
+        if phases is not None:
+            for phase, duration in phases.items():
+                JOB_QUEUE_PHASE_DURATION.labels(
+                    self.backend, tool, phase
+                ).observe(duration)
         if record.get('_attempts', 0) > 1 or record.get('retry_of'):
             REDIS_JOB_RETRIES.labels(tool).inc()
         REDIS_WORKER_ACTIVE.labels(self.namespace).inc()

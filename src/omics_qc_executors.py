@@ -4,13 +4,12 @@ import gzip
 import json
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-
-
 def run_single_cell_qc(matrix_csv, output_dir, cell_id_column='cell_id',
                        min_genes=0, max_genes=None, min_counts=0,
                        max_mito_percent=100, mitochondrial_prefix='MT-'):
+    import numpy as np
+    import pandas as pd
+
     matrix_csv = Path(matrix_csv)
     if not matrix_csv.is_file():
         raise ValueError(f'single-cell matrix does not exist: {matrix_csv}')
@@ -98,9 +97,20 @@ def _read_10x_table(path):
         return [line.rstrip('\r\n').split('\t') for line in handle if line.rstrip('\r\n')]
 
 
+def _validate_10x_counts(data):
+    import numpy as np
+
+    for offset in range(0, len(data), 65536):
+        values = data[offset:offset + 65536]
+        if not np.isfinite(values).all() or (values < 0).any():
+            raise ValueError('10x counts must be finite and non-negative')
+
+
 def run_single_cell_10x_qc(matrix_mtx, barcodes_tsv, features_tsv, output_dir,
                            min_genes=0, max_genes=None, min_counts=0,
                            max_mito_percent=100, mitochondrial_prefix='MT-'):
+    import numpy as np
+    import pandas as pd
     from scipy.io import mmread, mmwrite
     from scipy.sparse import csr_matrix
 
@@ -122,8 +132,7 @@ def run_single_cell_10x_qc(matrix_mtx, barcodes_tsv, features_tsv, output_dir,
         raise ValueError(f'10x matrix/feature mismatch: {matrix.shape[0]} != {len(features)}')
     if len(set(barcodes)) != len(barcodes):
         raise ValueError('10x barcodes must be unique')
-    if any(value < 0 or not np.isfinite(value) for value in matrix.data):
-        raise ValueError('10x counts must be finite and non-negative')
+    _validate_10x_counts(matrix.data)
     feature_ids = [row[0].strip() for row in features]
     feature_names = [row[1].strip() if len(row) > 1 and row[1].strip() else row[0].strip() for row in features]
     feature_types = [row[2].strip() if len(row) > 2 else '' for row in features]
@@ -206,6 +215,9 @@ def run_single_cell_10x_qc(matrix_mtx, barcodes_tsv, features_tsv, output_dir,
 
 def run_metagenomics_qc(abundance_csv, output_dir, taxon_id_column='taxon_id',
                         min_total_counts=0, min_prevalence=0):
+    import numpy as np
+    import pandas as pd
+
     abundance_csv = Path(abundance_csv)
     if not abundance_csv.is_file():
         raise ValueError(f'metagenomics abundance table does not exist: {abundance_csv}')

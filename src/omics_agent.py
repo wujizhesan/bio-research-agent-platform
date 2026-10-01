@@ -7,10 +7,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-from scipy.stats import hypergeom, ttest_ind
-
 try:
     from .omics_results import (
         build_omics_manifest,
@@ -22,9 +18,7 @@ try:
     from .omics_validation import (
         GENOMICS_QC_TYPES,
         condition_pair as _condition_pair,
-        infer_qc_type as _infer_qc_type,
         load_expression_matrix,
-        normalize_alignment_paths as _normalize_alignment_paths,
         require_columns as _require_columns,
     )
     from .omics_protocol import build_omics_tools
@@ -59,9 +53,7 @@ except ImportError:
     from omics_validation import (
         GENOMICS_QC_TYPES,
         condition_pair as _condition_pair,
-        infer_qc_type as _infer_qc_type,
         load_expression_matrix,
-        normalize_alignment_paths as _normalize_alignment_paths,
         require_columns as _require_columns,
     )
     from omics_protocol import build_omics_tools
@@ -122,6 +114,8 @@ TOOLCHAIN_EXECUTABLES = {
 DESEQ2_RUNNER = Path(__file__).resolve().parents[1] / 'tools' / 'deseq2_runner.R'
 
 def _bh_adjust(values):
+    import numpy as np
+
     values = np.asarray(values, dtype=float)
     if values.size == 0:
         return values
@@ -176,6 +170,8 @@ def _resolve_statistics_backend(requested):
 
 
 def _run_deseq2_backend(expression_csv, metadata_csv, output_csv, condition_a, condition_b):
+    import pandas as pd
+
     status = _deseq2_runtime()
     if not status['available']:
         raise RuntimeError(status['reason'])
@@ -210,6 +206,9 @@ def _run_deseq2_backend(expression_csv, metadata_csv, output_csv, condition_a, c
 def run_differential_expression(expression_csv, metadata_csv, output_csv,
                                 condition_a=None, condition_b=None,
                                 statistics_backend='scipy'):
+    import numpy as np
+    import pandas as pd
+
     expression, metadata = load_expression_matrix(expression_csv, metadata_csv)
     condition_a, condition_b, samples_a, samples_b = _condition_pair(metadata, condition_a, condition_b)
     backend = _resolve_statistics_backend(statistics_backend)
@@ -236,6 +235,8 @@ def run_differential_expression(expression_csv, metadata_csv, output_csv,
     values_b = expression[samples_b].to_numpy(dtype=float)
     means_a = values_a.mean(axis=1)
     means_b = values_b.mean(axis=1)
+    from scipy.stats import ttest_ind
+
     test = ttest_ind(values_a, values_b, axis=1, equal_var=False, nan_policy='raise')
     result = pd.DataFrame({
         'gene_id': expression['gene_id'].astype(str),
@@ -262,20 +263,37 @@ def run_differential_expression(expression_csv, metadata_csv, output_csv,
 
 
 def _load_gene_sets(gene_sets_csv):
+    import pandas as pd
+
     gene_sets = pd.read_csv(gene_sets_csv)
     _require_columns(gene_sets, {'pathway_id', 'pathway_name', 'gene_id'}, 'gene set table')
     gene_sets = gene_sets.dropna(subset=['pathway_id', 'gene_id']).copy()
-    return {
-        str(pathway_id): {
-            'pathway_name': str(group['pathway_name'].iloc[0]),
-            'genes': set(group['gene_id'].astype(str)),
+    gene_ids = gene_sets['gene_id']
+    gene_array = gene_ids.array
+    names = gene_sets['pathway_name'].array
+    string_ids = isinstance(gene_ids.dtype, pd.StringDtype)
+    result = {}
+    for pathway_id, positions in gene_sets.groupby('pathway_id').indices.items():
+        genes = set()
+        if string_ids:
+            for offset in range(0, len(positions), 16384):
+                genes.update(gene_array.take(positions[offset:offset + 16384]).to_numpy())
+        else:
+            values = gene_ids.iloc[positions].astype(str)
+            for offset in range(0, len(values), 16384):
+                genes.update(values.iloc[offset:offset + 16384].to_numpy())
+        result[str(pathway_id)] = {
+            'pathway_name': str(names[positions[0]]),
+            'genes': genes,
         }
-        for pathway_id, group in gene_sets.groupby('pathway_id')
-    }
+    return result
 
 
 def run_pathway_enrichment(de_csv, gene_sets_csv, output_csv,
                            padj_cutoff=0.05, abs_log2_fc_cutoff=1.0):
+    import pandas as pd
+    from scipy.stats import hypergeom
+
     de = pd.read_csv(de_csv)
     _require_columns(de, {'gene_id', 'padj', 'log2_fc'}, 'differential expression result')
     de['gene_id'] = de['gene_id'].astype(str)
@@ -289,12 +307,6 @@ def run_pathway_enrichment(de_csv, gene_sets_csv, output_csv,
         overlap = pathway_genes & selected
         if not pathway_genes:
             continue
-        p_value = float(hypergeom.sf(
-            len(overlap) - 1,
-            len(background),
-            len(pathway_genes),
-            len(selected),
-        )) if selected else 1.0
         rows.append({
             'pathway_id': pathway_id,
             'pathway_name': pathway['pathway_name'],
@@ -302,8 +314,19 @@ def run_pathway_enrichment(de_csv, gene_sets_csv, output_csv,
             'overlap_count': len(overlap),
             'selected_count': len(selected),
             'overlap_genes': '|'.join(sorted(overlap)),
-            'p_value': p_value,
+            'p_value': 1.0,
         })
+    if selected:
+        for offset in range(0, len(rows), 1024):
+            batch = rows[offset:offset + 1024]
+            probabilities = hypergeom.sf(
+                [row['overlap_count'] - 1 for row in batch],
+                len(background),
+                [row['pathway_size'] for row in batch],
+                len(selected),
+            )
+            for row, probability in zip(batch, probabilities):
+                row['p_value'] = float(probability)
     result = pd.DataFrame(rows, columns=[
         'pathway_id', 'pathway_name', 'pathway_size', 'overlap_count',
         'selected_count', 'overlap_genes', 'p_value',
@@ -555,6 +578,8 @@ def search_gene_evidence(gene_ids, evidence_csv=None, provider='local',
     ).search(gene_ids)
 
 def generate_omics_report(de_csv, pathway_csv, output_md, evidence=None):
+    import pandas as pd
+
     de = pd.read_csv(de_csv)
     pathways = pd.read_csv(pathway_csv)
     return write_omics_report(
@@ -572,6 +597,8 @@ def run_omics_analysis(expression_csv, metadata_csv, gene_sets_csv, output_dir,
                        evidence_provider='local', evidence_cache_dir=None,
                        evidence_timeout=15, statistics_backend='auto',
                        genome='hg38', gencode_gtf=None):
+    import pandas as pd
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     de_csv = output_dir / 'differential_expression.csv'

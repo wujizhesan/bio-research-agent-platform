@@ -5,9 +5,20 @@ test.describe.configure({ timeout: 120_000 })
 test('@fullstack 真实服务完成确定性研究规划并持久化任务', async ({ page }) => {
   const expectedJobBackend = process.env.FULLSTACK_JOB_BACKEND || 'redis'
   const apiToken = process.env.FULLSTACK_API_TOKEN
-  if (apiToken) {
-    await page.addInitScript((token) => localStorage.setItem('bio-agent-token', token), apiToken)
-  }
+  expect(apiToken).toBeTruthy()
+  const sessionResponse = await page.request.post(
+    'http://127.0.0.1:8000/api/v1/auth/session',
+    { headers: { Authorization: `Bearer ${apiToken}` } },
+  )
+  expect(sessionResponse.ok()).toBe(true)
+  const projectResponse = await page.request.post(
+    'http://127.0.0.1:8000/api/v1/projects',
+    {
+      headers: { Authorization: `Bearer ${apiToken}` },
+      data: { name: `Full-stack smoke ${Date.now()}` },
+    },
+  )
+  expect(projectResponse.status()).toBe(201)
   const healthResponse = await page.request.get('http://127.0.0.1:8000/health')
   expect(healthResponse.ok()).toBe(true)
   await expect(healthResponse.json()).resolves.toMatchObject({
@@ -35,10 +46,9 @@ test('@fullstack 真实服务完成确定性研究规划并持久化任务', asy
   await expect(page.getByText('规划器：Deterministic')).toBeVisible({ timeout: 60_000 })
   await expect(page.getByText('输入已满足，可执行')).toBeVisible({ timeout: 60_000 })
 
-  const token = await page.getByLabel('访问令牌').inputValue()
   await expect.poll(async () => {
     const response = await page.request.get('http://127.0.0.1:8000/api/v1/jobs?limit=100', {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { Authorization: `Bearer ${apiToken}` },
     })
     if (!response.ok()) return 'unavailable'
     const payload = await response.json() as { jobs: Array<{ job_id: string; status: string }> }
@@ -51,7 +61,7 @@ test('@fullstack 真实服务完成确定性研究规划并持久化任务', asy
   await expect(persistedRow).toBeVisible({ timeout: 15_000 })
 
   const persistedResponse = await page.request.get(`http://127.0.0.1:8000/api/v1/jobs/${submitted.job.job_id}`, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: { Authorization: `Bearer ${apiToken}` },
   })
   expect(persistedResponse.ok()).toBe(true)
   await expect(persistedResponse.json()).resolves.toMatchObject({

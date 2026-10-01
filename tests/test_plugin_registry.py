@@ -131,6 +131,32 @@ class DomainRegistryTests(unittest.TestCase):
         self.assertEqual(invalid_output['error_type'], 'output_contract')
         failure.assert_called_once()
 
+    def test_runtime_rechecks_modified_contracts(self):
+        registry = DomainRegistry()
+        spec = {
+            'description': 'Run plugin',
+            'parameters': {
+                'type': 'object', 'properties': {'value': {'type': 'integer'}},
+            },
+            'returns': {'type': 'object', 'properties': {'value': {'type': 'integer'}}},
+            'function': lambda value: {'value': value},
+        }
+        registry.register('demo', plugin('demo'), {'run': spec}, kind='external')
+        with patch.object(domain_registry, 'REGISTRY', registry):
+            self.assertEqual(domain_registry.run_tool('demo_run', {'value': 1}), {'value': 1})
+            spec['parameters']['properties']['value']['minimum'] = 2
+            self.assertEqual(
+                domain_registry.run_tool('demo_run', {'value': 1})['error_type'],
+                'input_contract',
+            )
+            spec['returns']['properties']['value']['minimum'] = 3
+            with patch('src.plugin_manager.PluginManager.record_contract_failure') as failure:
+                self.assertEqual(
+                    domain_registry.run_tool('demo_run', {'value': 2})['error_type'],
+                    'output_contract',
+                )
+            failure.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

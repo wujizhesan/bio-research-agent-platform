@@ -1,45 +1,171 @@
 """Isolated execution for research tools."""
 
 import json
+import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import Future, wait
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event, Lock
-from time import monotonic, sleep
+from threading import Event, Lock, Thread
+from time import monotonic, monotonic_ns
 
 try:
+    from .external_service_policy import (
+        ServiceRetryDeferredError,
+        retry_deferred_from_payload,
+    )
     from .observability import (
         TOOL_DURATION,
         TOOL_EXECUTIONS,
+        TOOL_PHASE_DURATION,
         current_context,
         log_event,
     )
     from .run_context import current_run_context
     from .storage_workspace import materialize_storage_references
+    from .tool_contracts import validate_contract
 except ImportError:
+    from external_service_policy import (
+        ServiceRetryDeferredError,
+        retry_deferred_from_payload,
+    )
     from observability import (
         TOOL_DURATION,
         TOOL_EXECUTIONS,
+        TOOL_PHASE_DURATION,
         current_context,
         log_event,
     )
     from run_context import current_run_context
     from storage_workspace import materialize_storage_references
+    from tool_contracts import validate_contract
+
+
+_PUBLIC_EXECUTION_MESSAGES = {
+    'execution_failed': 'job execution failed',
+    'execution_indeterminate': 'job outcome requires manual review',
+    'external_retry_deferred': 'external service requested retry later',
+    'job_execution_cancelled': 'job execution was cancelled',
+    'job_execution_timed_out': 'job execution timed out',
+    'sandbox_authentication_required': 'plugin sandbox authentication failed',
+    'sandbox_execution_failed': 'plugin execution failed',
+    'sandbox_invalid_request': 'plugin sandbox rejected the request',
+    'sandbox_unavailable': 'plugin sandbox is unavailable',
+    'tool_execution_failed': 'tool execution failed',
+}
+_ERROR_CODE_PATTERN = re.compile(r'^[a-z][a-z0-9_]{2,63}$')
 
 
 class JobExecutionError(RuntimeError):
-    pass
+    error_code = 'execution_failed'
+
+    def __init__(self, message=None, *, error_code=None):
+        super().__init__(message or _PUBLIC_EXECUTION_MESSAGES[self.error_code])
+        selected = str(error_code or self.error_code)
+        self.error_code = (
+            selected
+            if _ERROR_CODE_PATTERN.fullmatch(selected)
+            and selected in _PUBLIC_EXECUTION_MESSAGES
+            else 'execution_failed'
+        )
 
 
 class JobExecutionCancelled(JobExecutionError):
-    pass
+    error_code = 'job_execution_cancelled'
 
 
 class JobExecutionTimedOut(JobExecutionError):
-    pass
+    error_code = 'job_execution_timed_out'
+
+
+def public_execution_failure(exc):
+    if isinstance(exc, ServiceRetryDeferredError):
+        return {
+            'status': 'error',
+            'error_code': 'external_retry_deferred',
+            'error': _PUBLIC_EXECUTION_MESSAGES['external_retry_deferred'],
+            'retry_after_seconds': exc.retry_after_seconds,
+        }
+    code = (
+        exc.error_code
+        if isinstance(exc, JobExecutionError)
+        else 'execution_failed'
+    )
+    return {
+        'status': 'error',
+        'error_code': code,
+        'error': _PUBLIC_EXECUTION_MESSAGES[code],
+    }
+
+
+def public_tool_failure(_result):
+    return {
+        'status': 'error',
+        'error_code': 'tool_execution_failed',
+        'error': _PUBLIC_EXECUTION_MESSAGES['tool_execution_failed'],
+    }
+
+
+def _nonnegative_duration(value):
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return None
+    return duration if math.isfinite(duration) and duration >= 0 else None
+
+
+def _tool_spec(tool):
+    try:
+        from .domain_registry import active_tool_specs
+    except ImportError:
+        from domain_registry import active_tool_specs
+    return next(
+        (item for item in active_tool_specs() if item['name'] == tool),
+        None,
+    )
+
+
+def _scoped_builtin_descriptor(spec):
+    if (
+        spec is None
+        or spec.get('domain') not in {'knowledge', 'literature', 'omics'}
+        or not str(spec.get('name') or '').startswith(f"{spec.get('domain')}_")
+        or (spec.get('plugin_security') or {}).get('trust') != 'trusted'
+    ):
+        return None
+    return {
+        'domain': spec['domain'],
+        'spec': {key: value for key, value in spec.items() if key != 'function'},
+    }
+
+
+def _validate_scoped_result(tool, result, spec):
+    from jsonschema import ValidationError
+
+    try:
+        validate_contract(instance=result, schema=spec.get('returns') or {})
+    except ValidationError as exc:
+        reason = f'output contract violation for {tool}: {exc.message}'
+        try:
+            from .plugin_manager import PluginManager
+        except ImportError:
+            from plugin_manager import PluginManager
+        try:
+            PluginManager().record_contract_failure(spec['domain'], reason)
+        except Exception:
+            pass
+        return {
+            'status': 'error',
+            'domain': spec['domain'],
+            'tool': tool[len(spec['domain']) + 1:],
+            'error_type': 'output_contract',
+            'error': reason,
+        }
+    return result
 
 
 def _env_int(name, default, minimum=0):
@@ -68,17 +194,12 @@ def _env_float(name, default, minimum=0.01):
     return value
 
 
-def _sandbox_environment(tool, temporary_root):
+def _sandbox_environment(tool, temporary_root, spec=None):
     try:
-        from .domain_registry import active_tool_specs
         from .plugin_security import sandbox_environment
     except ImportError:
-        from domain_registry import active_tool_specs
         from plugin_security import sandbox_environment
-    spec = next(
-        (item for item in active_tool_specs() if item['name'] == tool),
-        None,
-    )
+    spec = spec if spec is not None else _tool_spec(tool)
     if spec is None:
         return None
     environment = sandbox_environment(
@@ -95,6 +216,18 @@ def _sandbox_environment(tool, temporary_root):
             'TMPDIR': str(plugin_temp),
         })
         environment['PLUGIN_SANDBOX_DOMAIN'] = spec['domain']
+        context = current_run_context(as_dict=True) or {}
+        execution = context.get('execution') or {}
+        environment['BIO_AGENT_JOB_ID'] = str(context.get('job_id') or '')
+        environment['BIO_AGENT_EXECUTION_KEY'] = str(
+            execution.get('execution_key') or ''
+        )
+        environment['BIO_AGENT_IDEMPOTENCY_KEY'] = str(
+            execution.get('idempotency_key') or ''
+        )
+        environment['BIO_AGENT_EXECUTION_SEMANTICS'] = str(
+            execution.get('semantics') or spec.get('execution_semantics') or 'pure'
+        )
     return environment
 
 
@@ -227,6 +360,55 @@ class _WindowsJob:
             self.handle = None
 
 
+def _complete_process(process, completion):
+    try:
+        completion.set_result(process.wait())
+    except BaseException as exc:
+        completion.set_exception(exc)
+
+
+def _read_stderr_tail(path):
+    max_chars = 2000
+    # Four bytes per character also covers universal newline translation.
+    max_bytes = max_chars * 4
+    with path.open('rb') as source:
+        end = source.seek(0, os.SEEK_END)
+        source.seek(max(end - max_bytes, 0))
+        raw = source.read(max_bytes)
+    text = raw.decode('utf-8', errors='replace')
+    return text.replace('\r\n', '\n').replace('\r', '\n')[-max_chars:].strip()
+
+
+def _read_process_response(path, max_bytes):
+    try:
+        with path.open('rb') as source:
+            size = os.fstat(source.fileno()).st_size
+            if size > max_bytes:
+                raise JobExecutionError(f'job result exceeded {max_bytes} byte limit')
+            encoded = source.read(min(size + 1, max_bytes + 1))
+            if len(encoded) > size:
+                chunks = [encoded]
+                remaining = max_bytes + 1 - len(encoded)
+                while remaining:
+                    chunk = source.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                encoded = b''.join(chunks)
+                del chunks
+        if len(encoded) > max_bytes:
+            raise JobExecutionError(f'job result exceeded {max_bytes} byte limit')
+        text = encoded.decode('utf-8')
+        del encoded
+        payload = json.loads(text)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise JobExecutionError('isolated worker returned an invalid response') from exc
+    if not isinstance(payload, dict):
+        raise JobExecutionError('isolated worker returned an invalid response')
+    return payload
+
+
 class ProcessToolExecutor:
     mode = 'process'
 
@@ -267,16 +449,58 @@ class ProcessToolExecutor:
             request_path = root / 'request.json'
             response_path = root / 'response.json'
             error_path = root / 'stderr.log'
-            child_environment = _sandbox_environment(tool, root)
+            spec = _tool_spec(tool)
+            descriptor = (
+                _scoped_builtin_descriptor(spec)
+                if self.runner_path.resolve()
+                == Path(__file__).with_name('job_subprocess.py').resolve()
+                else None
+            )
+            child_environment = _sandbox_environment(tool, root, spec)
+            sandboxed = child_environment is not None
+            child_environment = dict(
+                child_environment if sandboxed else os.environ
+            )
+            child_environment['BIO_AGENT_ISOLATED_TOOL_CHILD'] = '1'
             resolved_arguments = materialize_storage_references(
                 arguments,
                 root / 'inputs',
                 client=self.storage_client,
             )
+            if descriptor is not None:
+                from jsonschema import ValidationError
+
+                resolved_arguments = json.loads(json.dumps(
+                    resolved_arguments, ensure_ascii=False, default=str
+                ))
+                if not isinstance(resolved_arguments, dict):
+                    return {
+                        'status': 'error',
+                        'error': 'tool arguments must be an object',
+                    }
+                try:
+                    validate_contract(
+                        instance=resolved_arguments,
+                        schema=spec['parameters'],
+                    )
+                except ValidationError as exc:
+                    return {
+                        'status': 'error',
+                        'domain': spec['domain'],
+                        'tool': tool[len(spec['domain']) + 1:],
+                        'error_type': 'input_contract',
+                        'error': exc.message,
+                    }
             request_path.write_text(
                 json.dumps(
                     {
                         'tool': tool,
+                        'scoped_tool': descriptor,
+                        'execution_domain': (
+                            spec['domain']
+                            if spec and spec['domain'] in {'knowledge', 'literature', 'omics'}
+                            else None
+                        ),
                         'arguments': resolved_arguments,
                         'limits': self.limits.as_dict(),
                         'observability': current_context(),
@@ -288,6 +512,7 @@ class ProcessToolExecutor:
                 encoding='utf-8',
             )
             started = monotonic()
+            spawn_started_ns = monotonic_ns()
             windows_job = None
             with error_path.open('wb') as error_stream:
                 process = self.popen_factory(
@@ -296,17 +521,26 @@ class ProcessToolExecutor:
                     stdout=subprocess.DEVNULL,
                     stderr=error_stream,
                     env=child_environment,
-                    cwd=str(root) if child_environment is not None else None,
+                    cwd=str(root) if sandboxed else None,
                 )
                 with self._process_lock:
                     if self._shutdown.is_set():
                         self._stop(process)
                         raise JobExecutionCancelled('tool executor is shutting down')
                     self._active_processes.add(process)
+                process_waiter = None
                 try:
                     if process.poll() is None:
                         windows_job = _WindowsJob(process, self.limits)
-                    while process.poll() is None:
+                    completion = Future()
+                    process_waiter = Thread(
+                        target=_complete_process,
+                        args=(process, completion),
+                        name='tool-process-wait',
+                        daemon=True,
+                    )
+                    process_waiter.start()
+                    while not completion.done():
                         now = monotonic()
                         if cancelled and cancelled():
                             self._stop(process)
@@ -321,7 +555,13 @@ class ProcessToolExecutor:
                             )
                         if heartbeat:
                             heartbeat()
-                        sleep(self.limits.poll_interval_seconds)
+                        wait_seconds = self.limits.poll_interval_seconds
+                        if self.limits.timeout_seconds:
+                            wait_seconds = min(wait_seconds, max(
+                                self.limits.timeout_seconds - (monotonic() - started), 0
+                            ))
+                        wait((completion,), timeout=wait_seconds)
+                    completion.result()
                     if self._shutdown.is_set():
                         raise JobExecutionCancelled('tool executor is shutting down')
                 except Exception:
@@ -332,39 +572,94 @@ class ProcessToolExecutor:
                         self._active_processes.discard(process)
                     if windows_job is not None:
                         windows_job.close()
+                    if process_waiter is not None and process_waiter.ident is not None:
+                        process_waiter.join(timeout=self.limits.terminate_grace_seconds)
+            process_end_ns = monotonic_ns()
+            process_elapsed_seconds = (
+                process_end_ns - spawn_started_ns
+            ) / 1_000_000_000
             if not response_path.exists():
-                detail = error_path.read_text(encoding='utf-8', errors='replace')[-2000:].strip()
+                detail = _read_stderr_tail(error_path)
                 suffix = f': {detail}' if detail else ''
                 raise JobExecutionError(f'isolated worker exited with code {process.returncode}{suffix}')
-            if response_path.stat().st_size > self.limits.max_result_bytes:
-                raise JobExecutionError(
-                    f'job result exceeded {self.limits.max_result_bytes} byte limit'
+            payload = _read_process_response(response_path, self.limits.max_result_bytes)
+            if descriptor is not None and payload.get('ok'):
+                payload['result'] = _validate_scoped_result(
+                    tool, payload.get('result'), spec
                 )
-            try:
-                payload = json.loads(response_path.read_text(encoding='utf-8'))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise JobExecutionError('isolated worker returned an invalid response') from exc
+                if (
+                    isinstance(payload.get('result'), dict)
+                    and payload['result'].get('error_type') == 'output_contract'
+                    and isinstance(payload.get('telemetry'), dict)
+                ):
+                    payload['telemetry']['status'] = 'error'
             telemetry = payload.get('telemetry')
             if isinstance(telemetry, dict):
                 domain = str(telemetry.get('domain') or 'unknown')[:128]
                 metric_tool = str(telemetry.get('tool') or tool)[:200]
                 outcome = str(telemetry.get('status') or 'unknown')[:32]
                 TOOL_EXECUTIONS.labels(domain, metric_tool, outcome).inc()
-                try:
-                    duration = max(float(telemetry.get('duration_seconds')), 0)
-                except (TypeError, ValueError):
-                    duration = None
+                duration = _nonnegative_duration(telemetry.get('duration_seconds'))
                 if duration is not None:
                     TOOL_DURATION.labels(domain, metric_tool).observe(duration)
+                phases = {
+                    'registry_import': _nonnegative_duration(
+                        telemetry.get('registry_import_seconds')
+                    ),
+                    'tool_run': _nonnegative_duration(
+                        telemetry.get('tool_run_seconds')
+                    ),
+                }
+                if duration is not None:
+                    measured = sum(value for value in phases.values() if value is not None)
+                    phases['child_other'] = max(duration - measured, 0)
+                    phases['process_boundary'] = max(
+                        process_elapsed_seconds - duration, 0
+                    )
+                boundary_seconds = {}
+                process_clock = telemetry.get('process_clock_ns')
+                if isinstance(process_clock, dict):
+                    entry_ns = process_clock.get('module_entry')
+                    child_start_ns = process_clock.get('execution_start')
+                    child_end_ns = process_clock.get('execution_finished')
+                    if (
+                        all(isinstance(value, int) for value in (
+                            entry_ns, child_start_ns, child_end_ns
+                        ))
+                        and spawn_started_ns <= entry_ns <= child_start_ns
+                        <= child_end_ns <= process_end_ns
+                    ):
+                        boundary_seconds = {
+                            'launch_to_entry': (
+                                entry_ns - spawn_started_ns
+                            ) / 1_000_000_000,
+                            'module_import': (
+                                child_start_ns - entry_ns
+                            ) / 1_000_000_000,
+                            'result_handoff': (
+                                process_end_ns - child_end_ns
+                            ) / 1_000_000_000,
+                        }
+                phases = {
+                    phase: seconds for phase, seconds in phases.items()
+                    if seconds is not None
+                }
+                for phase, seconds in phases.items():
+                    TOOL_PHASE_DURATION.labels(domain, metric_tool, phase).observe(seconds)
                 log_event(
                     'tool.execution.completed',
                     domain=domain,
                     tool=metric_tool,
                     status=outcome,
                     duration_seconds=duration,
+                    phase_seconds=phases,
+                    boundary_seconds=boundary_seconds,
                     execution_mode='process',
                 )
             if not payload.get('ok'):
+                deferred = retry_deferred_from_payload(payload)
+                if deferred is not None:
+                    raise deferred
                 raise JobExecutionError(payload.get('error') or 'isolated worker failed')
             return payload.get('result')
 

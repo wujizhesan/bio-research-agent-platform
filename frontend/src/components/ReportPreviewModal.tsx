@@ -60,7 +60,7 @@ export function ReportPreviewModal({ preview, onClose }: { preview: { url: strin
         <div><h2 id="report-preview-title" className="eyebrow text-[#8faecb]">HTML 报告预览</h2><div className="mt-1 truncate font-mono text-xs text-[#c8e3dc]">{preview.filename}</div></div>
         <button ref={closeButtonRef} type="button" onClick={onClose} className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-2 text-xs text-[#b7d1c9] transition hover:border-[#ec9b87] hover:text-white"><XCircle size={14} />关闭预览</button>
       </div>
-      <iframe tabIndex={0} title={`HTML report preview ${preview.filename}`} src={preview.url} className="min-h-0 flex-1 bg-white" />
+      <iframe tabIndex={0} title={`HTML report preview ${preview.filename}`} src={preview.url} sandbox="" referrerPolicy="no-referrer" className="min-h-0 flex-1 bg-white" />
       <div className="border-t border-white/10 px-5 py-3 text-[10px] leading-5 text-[#73928a]">报告来自当前任务 artifact，并通过同一鉴权接口读取；预览内容不改变原始文件。</div>
     </div>
   </div>

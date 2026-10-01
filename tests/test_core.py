@@ -21,6 +21,7 @@ from src.compare_benchmarks import compare_benchmarks, compare_benchmark_replica
 from src.run_benchmark_replicates import _normalize_id, _validate_control, _validate_hard_benchmark
 from src.omics_agent import TOOLS as OMICS_TOOLS, _external_tool_version, _resolve_statistics_backend, annotate_variants, normalize_variants, run_fastq_qc, run_feature_counts, run_genomics_qc, run_metagenomics_qc, run_omics_analysis, run_rnaseq_alignment, run_single_cell_10x_qc, run_single_cell_qc, run_tool as run_omics_tool, run_variant_calling, search_gene_evidence, statistics_backend_status, toolchain_status
 from src.domain_registry import run_tool as run_domain_tool, tool_specs, validate_tool_map
+from src.evidence_providers import _read_cache, _write_cache
 from src.workflow_runner import run_workflow
 from src.resplit_external import joint_split_indices
 from src.plugin_loader import CADD_BACKEND_CONTRACTS, load_contract, load_plugin, plugin_info, require_callable, validate_plugin
@@ -31,6 +32,48 @@ import src.qa_verify as qa_verify
 
 
 class CoreTests(unittest.TestCase):
+    def test_evidence_cache_records_freshness_and_detects_tampering(self):
+        with tempfile.TemporaryDirectory(prefix='evidence_cache_metadata_') as raw:
+            path = Path(raw) / 'record.json'
+            payload = {'results': [{'id': 'P04637'}]}
+            _write_cache(
+                path,
+                payload,
+                provider='uniprot',
+                request={'gene_id': 'TP53'},
+                response_headers={
+                    'ETag': 'release-etag',
+                    'X-UniProt-Release': '2026_04',
+                },
+            )
+            document = json.loads(path.read_text(encoding='utf-8'))
+            self.assertEqual(document['_cache']['schema_version'], 1)
+            self.assertEqual(document['_cache']['source_release'], '2026_04')
+            self.assertEqual(_read_cache(path), payload)
+            document['payload']['results'][0]['id'] = 'tampered'
+            path.write_text(json.dumps(document), encoding='utf-8')
+            self.assertIsNone(_read_cache(path))
+
+    def test_evidence_cache_supports_refresh_and_frozen_snapshot_modes(self):
+        with tempfile.TemporaryDirectory(prefix='evidence_cache_modes_') as raw:
+            path = Path(raw) / 'record.json'
+            payload = {'results': [{'id': 'P04637'}]}
+            _write_cache(
+                path,
+                payload,
+                provider='uniprot',
+                request={'gene_id': 'TP53'},
+            )
+            with patch.dict('os.environ', {'EVIDENCE_CACHE_MODE': 'refresh'}):
+                self.assertIsNone(_read_cache(path))
+            document = json.loads(path.read_text(encoding='utf-8'))
+            document['_cache']['expires_at'] = '2020-01-01T00:00:00+00:00'
+            path.write_text(json.dumps(document), encoding='utf-8')
+            with patch.dict('os.environ', {'EVIDENCE_CACHE_MODE': 'frozen'}):
+                self.assertEqual(_read_cache(path), payload)
+                with self.assertRaisesRegex(RuntimeError, 'unavailable'):
+                    _read_cache(Path(raw) / 'missing.json')
+
     def test_config_and_paths(self):
         config = load_config()
         self.assertEqual(config['receptor']['pdb_id'], '4hjo')

@@ -4,11 +4,12 @@ from importlib.metadata import PackageNotFoundError, version as package_version
 import json
 import re
 
-from jsonschema.validators import validator_for
 from packaging.requirements import InvalidRequirement, Requirement
 
 try:
+    from .execution_semantics import normalize_artifact_contracts, normalize_execution_semantics
     from .resource_scheduling import ResourceRequest
+    from .tool_contracts import contract_validator
     from .plugin_security import (
         normalize_permissions,
         permission_grant_report,
@@ -16,7 +17,9 @@ try:
         validate_security_profile,
     )
 except ImportError:
+    from execution_semantics import normalize_artifact_contracts, normalize_execution_semantics
     from resource_scheduling import ResourceRequest
+    from tool_contracts import contract_validator
     from plugin_security import (
         normalize_permissions,
         permission_grant_report,
@@ -49,7 +52,7 @@ def validate_json_schema(schema, label):
     if not isinstance(schema, dict):
         raise ValueError(f'{label} must be a JSON Schema mapping')
     try:
-        validator_for(schema).check_schema(schema)
+        contract_validator(schema)
     except Exception as exc:
         raise ValueError(f'invalid {label}: {exc}') from exc
     return schema
@@ -156,6 +159,13 @@ def validate_manifest(manifest):
         validate_json_schema(contract.get('output'), f'{name} output schema')
         ResourceRequest.from_mapping(contract.get('resources'))
         normalize_permissions(contract.get('permissions'), contract.get('input'))
+        normalize_artifact_contracts(contract.get('artifacts'), contract.get('input'))
+        normalize_execution_semantics(
+            contract.get('execution_semantics'),
+            contract.get('input'),
+            contract.get('permissions'),
+            contract.get('artifacts'),
+        )
     digest = manifest.get('contract_digest')
     if not isinstance(digest, str) or digest != _contract_digest(manifest):
         raise ValueError('plugin manifest contract_digest is invalid')
@@ -184,6 +194,19 @@ def build_manifest(key, plugin, tools, kind, status='available', domains=None,
             'permissions': normalize_permissions(
                 spec.get('permissions'),
                 spec.get('parameters'),
+            ),
+            'artifacts': list(normalize_artifact_contracts(
+                spec.get('artifacts'),
+                spec.get('parameters'),
+            )),
+            'execution_semantics': normalize_execution_semantics(
+                spec.get('execution_semantics'),
+                spec.get('parameters'),
+                normalize_permissions(
+                    spec.get('permissions'),
+                    spec.get('parameters'),
+                ),
+                spec.get('artifacts'),
             ),
         }
         for name, spec in tools.items()

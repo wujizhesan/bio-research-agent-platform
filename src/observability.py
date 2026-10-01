@@ -10,7 +10,10 @@ import sys
 from time import perf_counter
 from uuid import uuid4
 
-from prometheus_client import Counter, Gauge, Histogram
+try:
+    from .metrics_backend import Counter, Gauge, Histogram
+except ImportError:
+    from metrics_backend import Counter, Gauge, Histogram
 
 
 REQUEST_ID = ContextVar('bio_agent_request_id', default=None)
@@ -246,6 +249,11 @@ JOB_QUEUE_DURATION = Histogram(
     'Time jobs spend queued before execution.',
     ['backend', 'tool'],
 )
+JOB_QUEUE_PHASE_DURATION = Histogram(
+    'bio_agent_job_queue_phase_duration_seconds',
+    'Duration of each durable job queue phase before first execution.',
+    ['backend', 'tool', 'phase'],
+)
 JOB_ACTIVE = Gauge(
     'bio_agent_job_active',
     'Jobs currently executing.',
@@ -260,6 +268,11 @@ TOOL_DURATION = Histogram(
     'bio_agent_tool_duration_seconds',
     'Scientific tool execution duration.',
     ['domain', 'tool'],
+)
+TOOL_PHASE_DURATION = Histogram(
+    'bio_agent_tool_phase_duration_seconds',
+    'Isolated tool execution phase duration.',
+    ['domain', 'tool', 'phase'],
 )
 TOOL_ACTIVE = Gauge(
     'bio_agent_tool_active',
@@ -359,4 +372,19 @@ FILE_UPLOAD_BYTES = Counter(
     'bio_agent_file_upload_bytes_total',
     'Total bytes accepted by the file storage layer.',
     ['backend'],
+)
+STORAGE_DELETION_BACKLOG = Gauge(
+    'bio_agent_storage_deletion_backlog',
+    'Current durable deletion backlog by resource type and lifecycle status.',
+    ['resource_type', 'status'],
+)
+STORAGE_DELETION_OLDEST_AGE = Gauge(
+    'bio_agent_storage_deletion_oldest_age_seconds',
+    'Age of the oldest durable deletion request by resource type and status.',
+    ['resource_type', 'status'],
+)
+STORAGE_DELETION_EVENTS = Gauge(
+    'bio_agent_storage_deletion_event_count',
+    'Durable deletion retry and dead-letter events recorded in PostgreSQL.',
+    ['resource_type', 'status'],
 )

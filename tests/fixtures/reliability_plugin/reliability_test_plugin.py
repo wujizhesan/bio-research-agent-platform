@@ -82,6 +82,7 @@ TOOLS = {
     },
     'fail_once': {
         'description': 'Fail once and then succeed with the same durable state path.',
+        'execution_semantics': 'idempotent',
         'parameters': _parameters({
             'state_path': {'type': 'string', 'minLength': 1},
         }, ['state_path']),
@@ -91,6 +92,7 @@ TOOLS = {
     },
     'resume_once': {
         'description': 'Persist a start marker and complete quickly after worker recovery.',
+        'execution_semantics': 'idempotent',
         'parameters': _parameters({
             'state_path': {'type': 'string', 'minLength': 1},
             'duration_seconds': {

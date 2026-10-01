@@ -14,7 +14,7 @@ function violationReport(violations: Awaited<ReturnType<AxeBuilder['analyze']>>[
 }
 
 async function expectAccessible(page: Page, include?: string) {
-  let builder = new AxeBuilder({ page }).withTags(wcagTags)
+  let builder = new AxeBuilder({ page }).withTags(wcagTags).exclude('iframe')
   if (include) builder = builder.include(include)
   const results = await builder.analyze()
   expect(results.violations, JSON.stringify(violationReport(results.violations), null, 2)).toEqual([])

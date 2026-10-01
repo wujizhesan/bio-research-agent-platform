@@ -3,8 +3,6 @@
 import gzip
 from pathlib import Path
 
-import pandas as pd
-
 try:
     from .omics_results import variant_annotation_result
     from .omics_validation import require_columns
@@ -76,6 +74,8 @@ def _normalize_chrom(value):
 
 
 def _load_variant_annotations(annotation_csv):
+    import pandas as pd
+
     if not annotation_csv:
         return None
     annotation = pd.read_csv(annotation_csv)
@@ -121,6 +121,8 @@ def _parse_gtf_attributes(text):
 
 
 def _load_gencode_annotations(annotation_gtf):
+    import pandas as pd
+
     annotation_gtf = Path(annotation_gtf)
     if not annotation_gtf.is_file():
         raise ValueError(f'GTF annotation does not exist: {annotation_gtf}')
@@ -192,9 +194,55 @@ def _load_gencode_annotations(annotation_gtf):
     return annotation
 
 
+class _VariantIntervalIndex:
+    def __init__(self, annotation):
+        self.annotation = annotation
+        self.groups = None
+        self.trees = {}
+
+    @staticmethod
+    def _build(entries, lower, upper):
+        if lower == upper:
+            return None
+        middle = (lower + upper) // 2
+        start, end, row = entries[middle]
+        left = _VariantIntervalIndex._build(entries, lower, middle)
+        right = _VariantIntervalIndex._build(entries, middle + 1, upper)
+        return (start, end, row, left, right, max(end, left[5] if left else end, right[5] if right else end))
+
+    @staticmethod
+    def _query(node, position, rows):
+        if node is None or node[5] < position:
+            return
+        _VariantIntervalIndex._query(node[3], position, rows)
+        if node[0] <= position:
+            if node[1] >= position:
+                rows.append(node[2])
+            _VariantIntervalIndex._query(node[4], position, rows)
+
+    def matches(self, chrom, position):
+        normalized = _normalize_chrom(chrom)
+        if self.groups is None:
+            self.groups = self.annotation.groupby('chrom', sort=False).indices
+        if normalized not in self.groups:
+            return []
+        if normalized not in self.trees:
+            records = self.annotation.iloc[self.groups[normalized]].to_dict('records')
+            entries = sorted((int(record['start']), int(record['end']), row) for row, record in enumerate(records))
+            fields = tuple(records[0]) if records else ()
+            values = [tuple(record[field] for field in fields) for record in records]
+            self.trees[normalized] = self._build(entries, 0, len(entries)), fields, values
+        tree, fields, records = self.trees[normalized]
+        rows = []
+        self._query(tree, position, rows)
+        return [dict(zip(fields, records[row])) for row in sorted(rows)]
+
+
 def _local_variant_matches(annotation, chrom, position):
     if annotation is None:
         return []
+    if isinstance(annotation, _VariantIntervalIndex):
+        return annotation.matches(chrom, position)
     matches = annotation.loc[
         (annotation['chrom'] == _normalize_chrom(chrom))
         & (annotation['start'] <= position)
@@ -297,6 +345,8 @@ def execute_variant_annotation(
     *,
     toolchain,
 ):
+    import pandas as pd
+
     requested = str(annotation_backend or 'auto').lower()
     if requested not in VARIANT_ANNOTATION_BACKENDS:
         raise ValueError(f'unknown variant annotation backend: {requested}')
@@ -305,6 +355,8 @@ def execute_variant_annotation(
         annotation_gtf,
         requested,
     )
+    if annotation is not None:
+        annotation = _VariantIntervalIndex(annotation)
     rows = []
     n_variants = 0
     n_alleles = 0

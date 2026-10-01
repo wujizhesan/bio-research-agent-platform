@@ -2,9 +2,6 @@
 
 from pathlib import Path
 
-import pandas as pd
-
-
 GENOMICS_QC_TYPES = ('auto', 'fastq', 'bam', 'vcf')
 
 
@@ -15,6 +12,8 @@ def require_columns(frame, columns, label):
 
 
 def load_expression_matrix(expression_csv, metadata_csv):
+    import pandas as pd
+
     expression = pd.read_csv(expression_csv)
     metadata = pd.read_csv(metadata_csv)
     if expression.empty:

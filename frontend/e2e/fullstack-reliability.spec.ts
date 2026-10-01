@@ -15,6 +15,7 @@ type FullStackJob = {
 const apiBase = 'http://127.0.0.1:8000'
 const workspaceRoot = process.env.GITHUB_WORKSPACE || path.resolve('..')
 const controlDir = path.join(workspaceRoot, 'output', 'fullstack-reliability')
+let projectId = ''
 
 function headers() {
   const token = process.env.FULLSTACK_API_TOKEN
@@ -22,10 +23,23 @@ function headers() {
   return { Authorization: `Bearer ${token}` }
 }
 
+async function ensureProject(request: APIRequestContext) {
+  if (projectId) return projectId
+  const response = await request.post(`${apiBase}/api/v1/projects`, {
+    headers: headers(),
+    data: { name: `Full-stack reliability ${Date.now()}` },
+  })
+  const body = await response.json()
+  expect(response.status(), JSON.stringify(body)).toBe(201)
+  projectId = body.project.project_id as string
+  return projectId
+}
+
 async function submitJob(request: APIRequestContext, tool: string, args: Record<string, unknown>) {
+  const selectedProjectId = await ensureProject(request)
   const response = await request.post(`${apiBase}/api/v1/jobs`, {
     headers: headers(),
-    data: { tool, arguments: args },
+    data: { tool, arguments: args, project_id: selectedProjectId },
   })
   const body = await response.json()
   expect(response.status(), JSON.stringify(body)).toBe(202)
@@ -69,6 +83,8 @@ async function restartWorker() {
     windowsHide: true,
     env: {
       ...process.env,
+      DATABASE_URL: process.env.WORKER_DATABASE_URL || process.env.DATABASE_URL,
+      DATABASE_ROLE: 'worker',
       JOB_EXECUTION_MODE: 'process',
       JOB_LEASE_SECONDS: '2',
       WORKER_METRICS_PORT: '0',

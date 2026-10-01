@@ -134,13 +134,21 @@ def _parameters(properties, required=()):
 TOOLS = {
     'run_screening': {
         'description': 'Run the configured CADD screening pipeline.',
+        'execution_semantics': 'side_effecting',
+        'artifacts': [{
+            'argument': 'out',
+            'kind': 'directory',
+            'publish': 'atomic',
+            'overwrite': 'deny',
+            'required': True,
+        }],
         'parameters': _parameters({
             'receptor': {'type': 'string'},
             'out': {'type': 'string'},
             'external_dataset': {'type': 'string'},
             'exhaustiveness': {'type': 'integer', 'minimum': 1},
             'max_ligands': {'type': 'integer', 'minimum': 1},
-        }),
+        }, required=('out',)),
         'function': tool_run_screening,
     },
     'read_results': {

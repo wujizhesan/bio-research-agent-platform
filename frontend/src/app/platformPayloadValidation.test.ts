@@ -7,7 +7,16 @@ import {
   parseProjectListPayload,
 } from './platformPayloadValidation'
 
-const validJob = { job_id: 'job-1', tool: 'research_plan', status: 'completed', created_at: '2026-09-07T00:00:00Z', result: { status: 'ok' } }
+const validJob = {
+  job_id: 'job-1',
+  tool: 'research_plan',
+  status: 'completed',
+  created_at: '2026-09-07T00:00:00Z',
+  result: { status: 'ok' },
+  execution_identity: { fingerprint: 'implementation-v1' },
+  routing: { route_id: 'route-v1' },
+  execution: { worker_id: 'worker-1' },
+}
 
 describe('platformPayloadValidation', () => {
   it('将错误的集合结构安全降级为空', () => {

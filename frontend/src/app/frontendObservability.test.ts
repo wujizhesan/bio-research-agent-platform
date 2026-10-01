@@ -45,12 +45,12 @@ describe('frontendObservability', () => {
     expect(fetchMock).toHaveBeenCalledWith('https://api.example.test/api/v1/telemetry/frontend-errors', expect.objectContaining({
       method: 'POST',
       keepalive: true,
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: 'Bearer jwt-secret',
-        'X-Trace-ID': 'trace-job-1',
-      },
+      credentials: 'include',
     }))
+    const headers = new Headers(fetchMock.mock.calls[0][1].headers)
+    expect(headers.get('Content-Type')).toBe('application/json')
+    expect(headers.get('Authorization')).toBe('Bearer jwt-secret')
+    expect(headers.get('X-Trace-ID')).toBe('trace-job-1')
     const body = JSON.parse(fetchMock.mock.calls[0][1].body)
     expect(body).toMatchObject({ boundary_name: 'plugin-card', trace_id: 'trace-job-1', plugin_id: 'omics' })
     expect(body).not.toHaveProperty('token')

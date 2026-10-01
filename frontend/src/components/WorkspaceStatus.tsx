@@ -27,7 +27,7 @@ export function PipelineMetric({ label, value }: { label: string; value: unknown
 }
 
 export function StatusBadge({ status }: { status: string }) {
-  const style = status === 'completed' ? 'status-ok' : status === 'failed' || status === 'cancelled' ? 'status-failed' : status === 'running' ? 'status-running' : 'status-queued'
+  const style = status === 'completed' ? 'status-ok' : status === 'failed' || status === 'cancelled' || status === 'indeterminate' ? 'status-failed' : status === 'running' ? 'status-running' : 'status-queued'
   return <span className={`status-badge ${style}`}><span className="size-1.5 rounded-full bg-current" />{status === 'cancelled' ? '已取消' : statusLabels[status] || status}</span>
 }
 

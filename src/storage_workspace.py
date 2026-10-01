@@ -5,6 +5,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 CHUNK_SIZE = 1024 * 1024
@@ -14,6 +15,40 @@ S3_REFERENCE_SCHEME = 'bio+s3'
 
 class StorageIntegrityError(RuntimeError):
     pass
+
+
+class StorageQuotaExceededError(StorageIntegrityError):
+    pass
+
+
+def _quota_limit(value):
+    if value is not None and (type(value) is not int or value < 0):
+        raise ValueError('materialization quota must be a non-negative integer')
+    return value
+
+
+class _ChecksumWriter:
+    def __init__(self, handle, expected_size):
+        self._handle = handle
+        self._expected_size = expected_size
+        self._lock = Lock()
+        self.digest = hashlib.sha256()
+        self.size_bytes = 0
+
+    def seekable(self):
+        # Multipart downloads must deliver chunks in file order for a whole-file digest.
+        return False
+
+    def write(self, data):
+        with self._lock:
+            if self.size_bytes + len(data) > self._expected_size:
+                raise StorageIntegrityError('downloaded input size verification failed')
+            written = self._handle.write(data)
+            if written != len(data):
+                raise StorageIntegrityError('downloaded input write was incomplete')
+            self.digest.update(data)
+            self.size_bytes += written
+            return written
 
 
 @dataclass(frozen=True)
@@ -86,7 +121,9 @@ def _verified_s3_download(
     configured_bucket=None,
     configured_prefix=None,
     expected_owner=None,
+    max_bytes=None,
 ):
+    max_bytes = _quota_limit(max_bytes)
     configured_bucket = (
         os.environ.get('S3_BUCKET', '').strip()
         if configured_bucket is None else str(configured_bucket).strip()
@@ -123,22 +160,33 @@ def _verified_s3_download(
         raise StorageIntegrityError('input object metadata checksum does not match its reference')
     if remote_size != reference.size_bytes:
         raise StorageIntegrityError('input object size does not match its reference')
+    if max_bytes is not None and remote_size > max_bytes:
+        raise StorageQuotaExceededError('materialized input quota exceeded')
     target.parent.mkdir(parents=True, exist_ok=False)
     extra_args = {'VersionId': reference.version_id}
     if expected_owner:
         extra_args['ExpectedBucketOwner'] = expected_owner
     try:
-        client.download_file(
-            reference.bucket,
-            reference.key,
-            str(target),
-            ExtraArgs=extra_args,
-        )
-        digest = hashlib.sha256()
-        with target.open('rb') as source:
-            for chunk in iter(lambda: source.read(CHUNK_SIZE), b''):
-                digest.update(chunk)
-        if target.stat().st_size != reference.size_bytes:
+        download_fileobj = getattr(client, 'download_fileobj', None)
+        if callable(download_fileobj):
+            with target.open('xb') as destination:
+                writer = _ChecksumWriter(destination, reference.size_bytes)
+                download_fileobj(
+                    reference.bucket, reference.key, writer, ExtraArgs=extra_args,
+                )
+            digest = writer.digest
+            size = writer.size_bytes
+        else:
+            client.download_file(
+                reference.bucket, reference.key, str(target), ExtraArgs=extra_args,
+            )
+            digest = hashlib.sha256()
+            size = 0
+            with target.open('rb') as source:
+                for chunk in iter(lambda: source.read(CHUNK_SIZE), b''):
+                    size += len(chunk)
+                    digest.update(chunk)
+        if size != reference.size_bytes or target.stat().st_size != reference.size_bytes:
             raise StorageIntegrityError('downloaded input size verification failed')
         if digest.hexdigest() != reference.sha256:
             raise StorageIntegrityError('downloaded input checksum verification failed')
@@ -159,12 +207,15 @@ def materialize_storage_references(
     configured_bucket=None,
     configured_prefix=None,
     expected_owner=None,
+    max_bytes=None,
 ):
     workspace = Path(workspace)
+    remaining = _quota_limit(max_bytes)
     client_holder = [client]
     materialized = {}
 
     def materialize(item):
+        nonlocal remaining
         if isinstance(item, str):
             reference = S3ObjectReference.parse(item)
             if reference is None:
@@ -183,7 +234,10 @@ def materialize_storage_references(
                 configured_bucket=configured_bucket,
                 configured_prefix=configured_prefix,
                 expected_owner=expected_owner,
+                max_bytes=remaining,
             ))
+            if remaining is not None:
+                remaining -= reference.size_bytes
             return materialized[item]
         if isinstance(item, dict):
             return {key: materialize(child) for key, child in item.items()}

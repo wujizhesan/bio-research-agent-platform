@@ -259,7 +259,7 @@ def route_request(method, target, payload=None, output_root=None, job_manager=No
         except ValueError as exc:
             status_code = 404 if str(exc).startswith('job not found:') else 400
             return status_code, {'status': 'error', 'error': str(exc)}
-        response_status = 'already_terminal' if record['status'] in {'completed', 'failed', 'cancelled'} else 'cancelled' if record['status'] == 'cancelled' else 'cancellation_requested'
+        response_status = 'already_terminal' if record['status'] in {'completed', 'failed', 'cancelled', 'indeterminate'} else 'cancelled' if record['status'] == 'cancelled' else 'cancellation_requested'
         return 202, {'status': response_status, 'job': record}
     if method == 'GET' and path == '/jobs':
         limit = parse_qs(parsed.query).get('limit', ['20'])[0]

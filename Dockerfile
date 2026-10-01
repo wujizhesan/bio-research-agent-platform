@@ -46,8 +46,8 @@ RUN if [ ! -f /app/tools/vina_1.2.7_linux_x86_64 ]; then \
       python -c "import hashlib,urllib.request; p='/app/tools/vina_1.2.7_linux_x86_64'; urllib.request.urlretrieve('$VINA_URL', p); assert hashlib.sha256(open(p,'rb').read()).hexdigest().upper() == '$VINA_SHA256'"; \
     fi \
     && chmod +x /app/tools/vina_1.2.7_linux_x86_64 \
-    && mkdir -p /app/output \
-    && chown bioagent:bioagent /app/output \
+    && mkdir -p /app/output /run/bioagent/plugin-exchange \
+    && chown bioagent:bioagent /app/output /run/bioagent/plugin-exchange \
     && chmod +x /app/docker-entrypoint.sh
 
 EXPOSE 8000

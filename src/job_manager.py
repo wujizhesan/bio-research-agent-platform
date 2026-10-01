@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import heapq
 from itertools import count
 import json
+import logging
 from pathlib import Path
 import sqlite3
 from threading import Condition, Lock, Thread
@@ -12,8 +13,13 @@ from time import perf_counter
 from uuid import uuid4
 
 try:
+    from .execution_semantics import ArtifactTransaction, execution_semantics, validate_required_artifacts
     from .domain_registry import run_tool, active_tool_specs, tool_specs
-    from .job_execution import InlineToolExecutor
+    from .job_execution import (
+        InlineToolExecutor,
+        public_execution_failure,
+        public_tool_failure,
+    )
     from .resource_scheduling import (
         ResourceCapacity,
         ResourcePool,
@@ -28,8 +34,13 @@ try:
         JOB_TRANSITIONS, log_event, trace_id as make_trace_id,
     )
 except ImportError:
+    from execution_semantics import ArtifactTransaction, execution_semantics, validate_required_artifacts
     from domain_registry import run_tool, active_tool_specs, tool_specs
-    from job_execution import InlineToolExecutor
+    from job_execution import (
+        InlineToolExecutor,
+        public_execution_failure,
+        public_tool_failure,
+    )
     from resource_scheduling import (
         ResourceCapacity,
         ResourcePool,
@@ -45,7 +56,7 @@ except ImportError:
     )
 
 
-TERMINAL_STATUSES = frozenset({'completed', 'failed', 'cancelled'})
+TERMINAL_STATUSES = frozenset({'completed', 'failed', 'cancelled', 'indeterminate'})
 
 
 def _now():
@@ -105,7 +116,8 @@ class JobManager:
                 'arguments_json TEXT, result_json TEXT, error TEXT, retry_of TEXT, '
                 'idempotency_key TEXT, cancel_requested INTEGER DEFAULT 0, '
                 'resources_json TEXT, priority INTEGER DEFAULT 0, '
-                'trace_id TEXT, request_id TEXT, run_context_json TEXT)'
+                'trace_id TEXT, request_id TEXT, run_context_json TEXT, '
+                'project_id TEXT)'
             )
             columns = {row[1] for row in connection.execute('PRAGMA table_info(jobs)').fetchall()}
             if 'arguments_json' not in columns:
@@ -126,6 +138,10 @@ class JobManager:
                 connection.execute('ALTER TABLE jobs ADD COLUMN request_id TEXT')
             if 'run_context_json' not in columns:
                 connection.execute('ALTER TABLE jobs ADD COLUMN run_context_json TEXT')
+            if 'resolution_json' not in columns:
+                connection.execute('ALTER TABLE jobs ADD COLUMN resolution_json TEXT')
+            if 'project_id' not in columns:
+                connection.execute('ALTER TABLE jobs ADD COLUMN project_id TEXT')
 
     def _persist(self, record):
         if not self._store_path:
@@ -136,8 +152,8 @@ class JobManager:
                 '(job_id, tool, status, created_at, started_at, finished_at, '
                 'arguments_json, result_json, error, retry_of, idempotency_key, '
                 'cancel_requested, resources_json, priority, trace_id, request_id, '
-                'run_context_json) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ',
+                'run_context_json, resolution_json, project_id) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ',
                 (
                     record['job_id'],
                     record['tool'],
@@ -158,6 +174,9 @@ class JobManager:
                     record.get('request_id'),
                     json.dumps(record.get('run_context'), ensure_ascii=False, default=str)
                     if record.get('run_context') else None,
+                    json.dumps(record.get('resolution'), ensure_ascii=False, default=str)
+                    if record.get('resolution') else None,
+                    record.get('project_id'),
                 ),
             )
 
@@ -167,12 +186,12 @@ class JobManager:
                 'SELECT job_id, tool, status, created_at, started_at, finished_at, '
                 'arguments_json, result_json, error, retry_of, idempotency_key, '
                 'cancel_requested, resources_json, priority, trace_id, request_id, '
-                'run_context_json FROM jobs'
+                'run_context_json, resolution_json, project_id FROM jobs'
             ).fetchall()
         interrupted_at = _now()
         resumable = []
         for row in rows:
-            job_id, tool, status, created_at, started_at, finished_at, arguments_json, result_json, error, retry_of, idempotency_key, cancel_requested, resources_json, priority, trace_value, request_value, run_context_json = row
+            job_id, tool, status, created_at, started_at, finished_at, arguments_json, result_json, error, retry_of, idempotency_key, cancel_requested, resources_json, priority, trace_value, request_value, run_context_json, resolution_json, project_id = row
             record = {
                 'job_id': job_id,
                 'tool': tool,
@@ -181,6 +200,7 @@ class JobManager:
                 'resources': json.loads(resources_json) if resources_json else ResourceRequest().as_dict(),
                 'priority': int(priority or 0),
                 'trace_id': trace_value or make_trace_id(),
+                'project_id': project_id,
             }
             if request_value:
                 record['request_id'] = request_value
@@ -191,6 +211,18 @@ class JobManager:
                     ).as_dict()
                 except (TypeError, ValueError, json.JSONDecodeError):
                     record.pop('run_context', None)
+            if resolution_json:
+                try:
+                    record['resolution'] = json.loads(resolution_json)
+                except json.JSONDecodeError:
+                    record.pop('resolution', None)
+            execution = (record.get('run_context') or {}).get('execution') or {}
+            record['_execution_key'] = str(
+                execution.get('execution_key') or uuid4().hex
+            )
+            record['execution_semantics'] = str(
+                execution.get('semantics') or 'pure'
+            )
             if arguments_json:
                 try:
                     record['_arguments'] = json.loads(arguments_json)
@@ -210,11 +242,27 @@ class JobManager:
                 record['idempotency_key'] = idempotency_key
             record['_cancel_requested'] = bool(cancel_requested)
             if status == 'running':
-                record.update({
-                    'status': 'failed',
-                    'finished_at': interrupted_at,
-                    'error': 'job interrupted by process restart',
-                })
+                if record['execution_semantics'] == 'side_effecting':
+                    record.update({
+                        'status': 'indeterminate',
+                        'finished_at': interrupted_at,
+                        'error_code': 'execution_indeterminate',
+                        'error': (
+                            'side-effecting job was interrupted; external state '
+                            'must be reviewed before manual retry'
+                        ),
+                        'indeterminate': {
+                            'requires_manual_review': True,
+                            'execution_key': record['_execution_key'],
+                            'semantics': record['execution_semantics'],
+                        },
+                    })
+                else:
+                    record.update({
+                        'status': 'failed',
+                        'finished_at': interrupted_at,
+                        'error': 'job interrupted by process restart',
+                    })
             elif status == 'queued':
                 if record.get('_cancel_requested'):
                     record.update({
@@ -279,8 +327,9 @@ class JobManager:
 
     def _create_job_locked(self, tool, arguments, resources, priority,
                            retry_of=None, idempotency_key=None, spec=None,
-                           parent_context=None):
+                           parent_context=None, project_id=None):
         job_id = uuid4().hex
+        execution_key = uuid4().hex
         run_context = build_run_context(
             tool,
             arguments,
@@ -291,6 +340,11 @@ class JobManager:
             retry_of=retry_of,
             parent=parent_context,
             run_id=uuid4().hex if parent_context is not None else None,
+            execution={
+                'execution_key': execution_key,
+                'idempotency_key': f'{job_id}:{execution_key}',
+                'semantics': str((spec or {}).get('execution_semantics') or 'pure'),
+            },
         ).as_dict()
         record = {
             'job_id': job_id,
@@ -299,10 +353,15 @@ class JobManager:
             'created_at': _now(),
             '_arguments': dict(arguments),
             '_cancel_requested': False,
+            '_execution_key': execution_key,
+            'execution_semantics': str(
+                (spec or {}).get('execution_semantics') or 'pure'
+            ),
             'resources': resources.as_dict(),
             'priority': priority,
             'trace_id': run_context['trace_id'],
             'run_context': run_context,
+            'project_id': project_id,
         }
         if run_context.get('request_id'):
             record['request_id'] = run_context['request_id']
@@ -333,7 +392,7 @@ class JobManager:
         return active[tool]
 
     def submit(self, tool, arguments, idempotency_key=None, resources=None,
-               priority=0):
+               priority=0, project_id=None):
         if not isinstance(tool, str) or not tool:
             raise ValueError('tool is required')
         if not isinstance(arguments, dict):
@@ -345,6 +404,7 @@ class JobManager:
             if len(idempotency_key) > 128:
                 raise ValueError('idempotency key is too long')
         spec = self._validate_tool_state(tool)
+        validate_required_artifacts(arguments, spec)
         request = merge_requests(spec.get('resources'), resources)
         priority = normalize_priority(priority)
         if not self._capacity.fits(request):
@@ -362,6 +422,7 @@ class JobManager:
                         or existing.get('_arguments') != arguments
                         or existing.get('resources') != request.as_dict()
                         or existing.get('priority', 0) != priority
+                        or existing.get('project_id') != project_id
                     ):
                         raise ValueError('idempotency key already used with different job payload')
                     output = self._public_record(existing)
@@ -374,6 +435,7 @@ class JobManager:
                 priority,
                 idempotency_key=idempotency_key,
                 spec=spec,
+                project_id=project_id,
             )
 
     def retry(self, job_id):
@@ -382,7 +444,16 @@ class JobManager:
             if original is None:
                 raise ValueError(f'job not found: {job_id}')
             if original.get('status') not in TERMINAL_STATUSES:
-                raise ValueError('only completed, failed or cancelled jobs can be retried')
+                raise ValueError(
+                    'only completed, failed, cancelled or indeterminate jobs can be retried'
+                )
+            if (
+                original.get('status') == 'indeterminate'
+                and (original.get('resolution') or {}).get('decision') != 'approve_retry'
+            ):
+                raise ValueError(
+                    'indeterminate job requires an approve_retry resolution before retry'
+                )
             arguments = original.get('_arguments')
             if arguments is None:
                 raise ValueError('job arguments are unavailable')
@@ -402,7 +473,41 @@ class JobManager:
                 retry_of=original['job_id'],
                 spec=spec,
                 parent_context=original.get('run_context'),
+                project_id=original.get('project_id'),
             )
+
+    def resolve_indeterminate(self, job_id, decision, reason, reviewer, evidence=None):
+        allowed = {'confirm_succeeded', 'confirm_failed', 'approve_retry'}
+        if decision not in allowed:
+            raise ValueError('invalid indeterminate job resolution decision')
+        with self._lock:
+            record = self._jobs.get(str(job_id))
+            if record is None:
+                raise ValueError(f'job not found: {job_id}')
+            if record.get('status') != 'indeterminate':
+                raise ValueError('only indeterminate jobs can be resolved')
+            if record.get('resolution'):
+                raise ValueError('indeterminate job has already been resolved')
+            resolution = {
+                'decision': decision,
+                'reason': str(reason),
+                'evidence': dict(evidence or {}),
+                'reviewer': str(reviewer),
+                'resolved_at': _now(),
+            }
+            record['resolution'] = resolution
+            if decision == 'confirm_succeeded':
+                record['status'] = 'completed'
+                record['result'] = {
+                    'status': 'confirmed_external_success',
+                    'resolution': resolution,
+                }
+                record.pop('error', None)
+            elif decision == 'confirm_failed':
+                record['status'] = 'failed'
+                record['error'] = str(reason)
+            self._persist(record)
+            return self._public_record(record)
 
     def _schedule_forever(self):
         while True:
@@ -495,36 +600,93 @@ class JobManager:
             JOB_TRANSITIONS.labels(self.backend, tool, 'running').inc()
             log_event('job.started', backend=self.backend)
             error_type = None
+            spec = self._validate_tool_state(tool)
+            semantics = execution_semantics(spec)
+            transaction = ArtifactTransaction.prepare(
+                arguments,
+                spec,
+                record['_execution_key'],
+            )
             try:
                 result = self._tool_executor.execute(
                     tool,
-                    arguments,
+                    transaction.arguments,
                     cancelled=lambda: self._is_cancel_requested(job_id),
                 )
                 failed = isinstance(result, dict) and result.get('status') == 'error'
+                if failed:
+                    log_event(
+                        'job.tool_reported_failure',
+                        level=logging.WARNING,
+                        error_detail=str(result.get('error') or ''),
+                    )
+                    transaction.rollback()
+                    result = public_tool_failure(result)
+                else:
+                    result = transaction.commit(result)
                 update = {
-                    'status': 'failed' if failed else 'completed',
+                    'status': (
+                        'indeterminate'
+                        if failed and semantics == 'side_effecting'
+                        else ('failed' if failed else 'completed')
+                    ),
                     'finished_at': _now(),
                     'result': result,
                 }
                 if failed:
-                    update['error'] = result.get('error', 'tool returned an error')
+                    update['error_code'] = result['error_code']
+                    update['error'] = (
+                        'side-effecting tool reported an error; external state '
+                        'must be reviewed before manual retry'
+                        if semantics == 'side_effecting'
+                        else result.get('error', 'tool returned an error')
+                    )
             except Exception as exc:
+                transaction.rollback()
                 error_type = type(exc).__name__
+                log_event(
+                    'job.execution.failed',
+                    level=logging.ERROR,
+                    error_type=error_type,
+                    error_detail=str(exc),
+                )
+                failure = public_execution_failure(exc)
                 update = {
-                    'status': 'failed',
+                    'status': (
+                        'indeterminate'
+                        if semantics == 'side_effecting' else 'failed'
+                    ),
                     'finished_at': _now(),
-                    'error': str(exc),
+                    'result': failure,
+                    'error_code': failure['error_code'],
+                    'error': (
+                        'side-effecting execution stopped without a durable result; '
+                        'external state must be reviewed before manual retry'
+                        if semantics == 'side_effecting' else failure['error']
+                    ),
                 }
             with self._condition:
                 record = self._jobs.get(job_id)
                 if record is not None:
                     if record.get('_cancel_requested'):
-                        update = {
-                            'status': 'cancelled',
-                            'finished_at': _now(),
-                            'error': 'job cancelled by user',
-                        }
+                        if semantics == 'side_effecting' and update['status'] == 'completed':
+                            update['cancellation_too_late'] = True
+                        elif semantics == 'side_effecting':
+                            update = {
+                                'status': 'indeterminate',
+                                'finished_at': _now(),
+                                'error_code': 'execution_indeterminate',
+                                'error': (
+                                    'side-effecting job was cancelled during execution; '
+                                    'external state must be reviewed before manual retry'
+                                ),
+                            }
+                        else:
+                            update = {
+                                'status': 'cancelled',
+                                'finished_at': _now(),
+                                'error': 'job cancelled by user',
+                            }
                     record.update(update)
                     self._persist(record)
                 self._futures.pop(job_id, None)

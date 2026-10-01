@@ -1,5 +1,10 @@
 """Local TF-IDF knowledge retrieval adapter for evidence-grounded Agent answers."""
+import hashlib
 import json
+from collections import Counter
+from copy import deepcopy
+from functools import lru_cache
+from math import log, sqrt
 import re
 from pathlib import Path
 
@@ -75,7 +80,15 @@ def knowledge_ingest_directory(input_dir, output_path='output/knowledge/index.js
         'retrieval': 'tfidf-cosine',
         'documents': documents,
     }
-    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    if len(documents) > 32:
+        payload['tfidf_index'] = _build_tfidf_index([
+            str(item.get('text', '')) for item in documents
+        ])
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+        if 'tfidf_index' in payload else json.dumps(payload, ensure_ascii=False, indent=2)
+    )
+    target.write_text(encoded + '\n', encoding='utf-8')
     return _envelope('ingest_directory', {
         'status': 'ok',
         'output_path': str(target),
@@ -93,14 +106,155 @@ def _snippet(text, query):
     return snippet + ('...' if start + 320 < len(text) else '')
 
 
+def _tfidf_terms(text):
+    words = re.findall(r'(?u)\b\w+\b', text.lower())
+    return Counter(words + [f'{left} {right}' for left, right in zip(words, words[1:])])
+
+
+def _document_frequencies(rows):
+    document_frequency = Counter()
+    for row in rows:
+        document_frequency.update(row.keys())
+    return document_frequency
+
+
+def _score_frequencies(rows, query_row, document_frequency):
+    document_frequency = Counter(document_frequency)
+    document_frequency.update(query_row.keys())
+    count = len(rows) + 1
+    weights = {
+        term: log((1 + count) / (1 + frequency)) + 1
+        for term, frequency in document_frequency.items()
+    }
+    query_norm = sqrt(sum(
+        (frequency * weights[term]) ** 2
+        for term, frequency in query_row.items()
+    ))
+    if not query_norm:
+        return [0.0] * len(rows)
+    scores = []
+    for row in rows:
+        if not any(term in row for term in query_row):
+            scores.append(0.0)
+            continue
+        document_norm = sqrt(sum(
+            (frequency * weights[term]) ** 2
+            for term, frequency in row.items()
+        ))
+        dot = sum(
+            frequency * query_row.get(term, 0) * weights[term] ** 2
+            for term, frequency in row.items()
+        )
+        scores.append(dot / (document_norm * query_norm) if document_norm else 0.0)
+    return scores
+
+
+def _small_corpus_scores(texts, query):
+    rows = [_tfidf_terms(text) for text in texts]
+    return _score_frequencies(rows, _tfidf_terms(query), _document_frequencies(rows))
+
+
+def _tfidf_digest(texts, statistics):
+    encoded = json.dumps(
+        [texts, statistics], ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+    ).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _build_tfidf_index(texts):
+    rows = [_tfidf_terms(text) for text in texts]
+    frequencies = _document_frequencies(rows)
+    vocabulary = list(frequencies)
+    columns = {term: column for column, term in enumerate(vocabulary)}
+    statistics = {
+        'version': 1,
+        'vocabulary': vocabulary,
+        'term_frequencies': [
+            [(columns[term], count) for term, count in row.items()] for row in rows
+        ],
+        'document_frequency': [frequencies[term] for term in vocabulary],
+    }
+    return {**statistics, 'digest': _tfidf_digest(texts, statistics)}
+
+
+def _prepare_tfidf_index(texts, index):
+    if not isinstance(index, dict) or index.get('version') != 1:
+        return None
+    statistics = {key: value for key, value in index.items() if key != 'digest'}
+    if index.get('digest') != _tfidf_digest(texts, statistics):
+        return None
+    try:
+        vocabulary = statistics['vocabulary']
+        frequencies = statistics['document_frequency']
+        if (
+            not isinstance(vocabulary, list)
+            or not all(isinstance(term, str) for term in vocabulary)
+            or len(set(vocabulary)) != len(vocabulary)
+            or not isinstance(frequencies, list)
+            or len(frequencies) != len(vocabulary)
+            or any(type(count) is not int or not 1 <= count <= len(texts) for count in frequencies)
+        ):
+            return None
+        stored_rows = statistics['term_frequencies']
+        if not isinstance(stored_rows, list) or len(stored_rows) != len(texts):
+            return None
+        rows = []
+        for stored in stored_rows:
+            row = {}
+            for column, count in stored:
+                if (
+                    type(column) is not int or not 0 <= column < len(vocabulary)
+                    or type(count) is not int or count < 1
+                ):
+                    return None
+                row[vocabulary[column]] = count
+            if len(row) != len(stored):
+                return None
+            rows.append(row)
+        return rows, dict(zip(vocabulary, frequencies))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _prepared_corpus_scores(query, prepared):
+    if prepared is None:
+        return None
+    rows, frequencies = prepared
+    query_row = _tfidf_terms(query)
+    if not frequencies and not query_row:
+        return None
+    return _score_frequencies(rows, query_row, frequencies)
+
+
+def _indexed_corpus_scores(texts, query, index):
+    return _prepared_corpus_scores(query, _prepare_tfidf_index(texts, index))
+
+
+def _decode_index(encoded):
+    payload = json.loads(encoded.decode('utf-8'))
+    documents = payload.get('documents', [])
+    texts = [str(item.get('text', '')) for item in documents]
+    prepared = (
+        _prepare_tfidf_index(texts, payload.get('tfidf_index')) if len(texts) > 32 else None
+    )
+    return documents, texts, prepared
+
+
+@lru_cache(maxsize=4)
+def _cached_index(encoded):
+    return _decode_index(encoded)
+
+
 def knowledge_search(query, index_path, top_k=5):
     if not isinstance(query, str) or not query.strip():
         raise ValueError('query must be a non-empty string')
     index_file = Path(index_path)
     if not index_file.exists():
         raise ValueError(f'knowledge index does not exist: {index_file}')
-    payload = json.loads(index_file.read_text(encoding='utf-8'))
-    documents = payload.get('documents', [])
+    encoded = index_file.read_bytes()
+    documents, texts, prepared = (
+        _cached_index(encoded) if len(encoded) <= 8 * 1024 * 1024 else _decode_index(encoded)
+    )
     if not documents:
         return _envelope('search', {
             'status': 'ok',
@@ -108,22 +262,26 @@ def knowledge_search(query, index_path, top_k=5):
             'matches': [],
             'n_matches': 0,
         })
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-    texts = [str(item.get('text', '')) for item in documents]
-    vectorizer = TfidfVectorizer(
-        lowercase=True,
-        ngram_range=(1, 2),
-        token_pattern=r'(?u)\b\w+\b',
-    )
-    matrix = vectorizer.fit_transform(texts + [query])
-    scores = cosine_similarity(matrix[-1], matrix[:-1]).ravel()
+    if len(texts) <= 32:
+        scores = _small_corpus_scores(texts, query)
+    else:
+        scores = _prepared_corpus_scores(query, prepared)
+        if scores is None:
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            from sklearn.metrics.pairwise import cosine_similarity
+            vectorizer = TfidfVectorizer(
+                lowercase=True,
+                ngram_range=(1, 2),
+                token_pattern=r'(?u)\b\w+\b',
+            )
+            matrix = vectorizer.fit_transform(texts + [query])
+            scores = cosine_similarity(matrix[-1], matrix[:-1]).ravel()
     ranked = sorted(enumerate(scores), key=lambda item: (-item[1], item[0]))
     matches = []
     for index, score in ranked[:max(1, int(top_k))]:
         if score <= 0:
             continue
-        document = documents[index]
+        document = deepcopy(documents[index])
         matches.append({
             'document_id': document.get('id'),
             'title': document.get('title'),

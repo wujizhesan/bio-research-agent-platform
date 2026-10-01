@@ -1,7 +1,13 @@
 """Optional LLM intent planner with deterministic workflow validation."""
 import json
-import os
 import urllib.request
+
+try:
+    from .external_service_policy import resilient_call
+    from .settings import PlatformSettings
+except ImportError:
+    from external_service_policy import resilient_call
+    from settings import PlatformSettings
 
 
 PLANNER_MODES = ('deterministic', 'auto', 'llm')
@@ -17,6 +23,7 @@ def _completion_url(value):
 
 
 def _config():
+    settings = PlatformSettings.from_env()
     try:
         from .config_loader import load_config
         configured = load_config()
@@ -27,15 +34,12 @@ def _config():
         llm = {}
     return {
         'base_url': _completion_url(
-            os.environ.get('RESEARCH_PLANNER_BASE_URL')
-            or os.environ.get('OPENAI_BASE_URL')
+            settings.research_planner_base_url
             or llm.get('base_url')
         ),
-        'model': os.environ.get('RESEARCH_PLANNER_MODEL') or llm.get('model') or DEFAULT_MODEL,
+        'model': settings.research_planner_model or llm.get('model') or DEFAULT_MODEL,
         'api_key': (
-            os.environ.get('RESEARCH_PLANNER_API_KEY')
-            or os.environ.get('CADD_API_KEY')
-            or os.environ.get('OPENAI_API_KEY')
+            settings.research_planner_api_key
             or llm.get('api_key')
         ),
     }
@@ -96,8 +100,11 @@ def _call_llm(task, available_domains, inputs, config):
         },
         method='POST',
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        body = json.loads(response.read().decode('utf-8'))
+    def execute():
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode('utf-8'))
+
+    body = resilient_call('research_planner', execute)
     choices = body.get('choices') if isinstance(body, dict) else None
     if not choices or not isinstance(choices[0], dict):
         raise ValueError('LLM planner response has no choices')

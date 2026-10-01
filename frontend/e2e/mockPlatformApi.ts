@@ -99,7 +99,7 @@ export async function mockPlatformApi(page: Page) {
         status: 200,
         contentType: 'text/html',
         headers: { 'Content-Disposition': 'inline; filename="smoke-report.html"' },
-        body: '<!doctype html><title>Smoke report</title><main>Report ready</main>',
+        body: '<!doctype html><title>Smoke report</title><main>Report ready</main><script>parent.localStorage.setItem("artifact-xss-sentinel","compromised");parent.document.body.dataset.artifactXss="compromised"</script>',
       })
       return
     }

@@ -1,0 +1,44 @@
+rule_files:
+  - storage-deletion-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: bio_agent_storage_deletion_backlog{resource_type="file",status="delete_dead_letter"}
+        values: 1x10
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: StorageDeletionDeadLettersPresent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: Storage deletion dead letters require manual intervention
+
+  - interval: 1m
+    input_series:
+      - series: bio_agent_storage_deletion_oldest_age_seconds{resource_type="job_artifact",status="delete_failed"}
+        values: 1000x20
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: StorageDeletionBacklogStuck
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: A storage deletion has not completed within 15 minutes
+
+  - interval: 1m
+    input_series:
+      - series: bio_agent_storage_deletion_event_count{resource_type="file",status="retry_requested"}
+        values: 0x16 30x10
+    alert_rule_test:
+      - eval_time: 22m
+        alertname: StorageDeletionRetryBurst
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: Storage deletion retries increased rapidly

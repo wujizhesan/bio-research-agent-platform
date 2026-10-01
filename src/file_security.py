@@ -1,20 +1,27 @@
 """Malware scanning and content disarm for uploaded research files."""
 
+import codecs
+from contextlib import suppress
 from dataclasses import dataclass
 import gzip
 from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import struct
+import zlib
 
 import yaml
 
 
 SCAN_CHUNK_SIZE = 1024 * 1024
 MAX_SCAN_REPLY_BYTES = 16 * 1024
-ALLOWED_TEXT_CONTROLS = frozenset({'\t', '\n', '\r'})
+TEXT_CONTROL_BATCH_CHARS = 64 * 1024
+TEXT_RECONSTRUCTION_CHUNK_BYTES = 64 * 1024
+UNSAFE_TEXT_CONTROL_PATTERN = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+VCF_GZIP_COMPRESSION_LEVEL = 6
 
 
 class FileSecurityError(ValueError):
@@ -110,11 +117,12 @@ class ContentDisarmReconstructor:
             text = content.decode('utf-8-sig')
         except UnicodeDecodeError as exc:
             raise FileSecurityError('CDR requires UTF-8 text content') from exc
-        if any(
-            ord(character) < 32 and character not in ALLOWED_TEXT_CONTROLS
-            for character in text
-        ):
-            raise FileSecurityError('CDR rejected unsafe control characters')
+        # Short regex calls let Python yield the GIL between batches.
+        for offset in range(0, len(text), TEXT_CONTROL_BATCH_CHARS):
+            if UNSAFE_TEXT_CONTROL_PATTERN.search(
+                text, offset, offset + TEXT_CONTROL_BATCH_CHARS,
+            ):
+                raise FileSecurityError('CDR rejected unsafe control characters')
         return text.replace('\r\n', '\n').replace('\r', '\n')
 
     def _reconstruct_text(self, content, extension):
@@ -142,27 +150,79 @@ class ContentDisarmReconstructor:
             return parser.text().encode('utf-8')
         return text.encode('utf-8')
 
+    def _text_chunks(self, source):
+        decoder = codecs.getincrementaldecoder('utf-8-sig')()
+        unicode_error = None
+        unsafe = False
+        pending_cr = False
+        while True:
+            chunk = source.read(TEXT_RECONSTRUCTION_CHUNK_BYTES)
+            final = not chunk
+            if unicode_error is None:
+                try:
+                    text = decoder.decode(chunk, final=final)
+                except UnicodeDecodeError as exc:
+                    unicode_error = exc
+                else:
+                    unsafe = unsafe or UNSAFE_TEXT_CONTROL_PATTERN.search(text) is not None
+                    if not unsafe:
+                        if pending_cr:
+                            text = '\r' + text
+                        pending_cr = text.endswith('\r')
+                        if pending_cr:
+                            text = text[:-1]
+                        yield text.replace('\r\n', '\n').replace('\r', '\n').encode('utf-8')
+            if final:
+                break
+        # Drain the source first so gzip errors precede UTF-8 and control errors.
+        if unicode_error is not None:
+            raise FileSecurityError('CDR requires UTF-8 text content') from unicode_error
+        if unsafe:
+            raise FileSecurityError('CDR rejected unsafe control characters')
+        if pending_cr:
+            yield b'\n'
+
+    def _reconstruct_stream(self, source, output, compressed=False):
+        if not compressed:
+            for chunk in self._text_chunks(source):
+                output.write(chunk)
+            return
+        level = VCF_GZIP_COMPRESSION_LEVEL
+        # Match gzip.compress headers across Python and zlib versions.
+        output.write(gzip.compress(b'', compresslevel=level, mtime=0)[:10])
+        compressor = zlib.compressobj(level, wbits=-15)
+        checksum = size = 0
+        for chunk in self._text_chunks(source):
+            checksum = zlib.crc32(chunk, checksum)
+            size += len(chunk)
+            output.write(compressor.compress(chunk))
+        output.write(compressor.flush())
+        output.write(struct.pack('<II', checksum, size & 0xffffffff))
+
     def reconstruct(self, path, filename):
         target = Path(path)
         lower_name = str(filename).lower()
+        extension = Path(lower_name).suffix
+        temporary = target.with_name(f'.{target.name}.cdr')
         try:
-            if lower_name.endswith('.vcf.gz'):
-                with gzip.open(target, 'rb') as source:
-                    content = source.read()
-                rebuilt = gzip.compress(
-                    self._reconstruct_text(content, '.vcf'), mtime=0
-                )
-            else:
+            compressed = lower_name.endswith('.vcf.gz')
+            if extension in {'.json', '.yaml', '.yml', '.html', '.htm'}:
                 rebuilt = self._reconstruct_text(
-                    target.read_bytes(), Path(lower_name).suffix
+                    target.read_bytes(), extension,
                 )
-            temporary = target.with_name(f'.{target.name}.cdr')
-            temporary.write_bytes(rebuilt)
+                temporary.write_bytes(rebuilt)
+            else:
+                opener = gzip.open if compressed else Path.open
+                with opener(target, 'rb') as source, temporary.open('wb') as output:
+                    self._reconstruct_stream(source, output, compressed)
             temporary.replace(target)
         except FileSecurityError:
             raise
         except (OSError, EOFError, gzip.BadGzipFile) as exc:
             raise FileSecurityError('CDR reconstruction failed') from exc
+        finally:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
         return 'reconstructed'
 
 
