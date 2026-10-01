@@ -132,6 +132,7 @@ class DeployTransactionTests(unittest.TestCase):
         (deploy / "release-images.next.env").write_text(
             "BACKEND_IMAGE=next-backend\nFRONTEND_IMAGE=next-frontend\n"
             "POSTGRES_IMAGE=next-postgres\n"
+            "REDIS_IMAGE=next-redis\n"
             "RELEASE_TAG=v0.2.0-rc.1\nGIT_SHA=" + "a" * 40 + "\n"
             "RELEASE_BUNDLE_DIR=release-bundles/candidate\n"
             f"RELEASE_BUNDLE_SHA256={bundle_digest(candidate)}\n",
@@ -165,6 +166,8 @@ if [[ "$1" == inspect ]]; then
       printf 'current-frontend\\n'
     elif [[ "$4" == container-db ]]; then
       printf 'current-postgres\\n'
+    elif [[ "$4" == container-redis ]]; then
+      printf 'current-redis\\n'
     else
       printf 'current-backend\\n'
     fi
@@ -325,7 +328,7 @@ exit "${VERIFY_EXIT:-0}"
             self.assertIn("rollback completed", result.stderr)
 
     def test_rejects_image_overrides_in_production_config(self):
-        for name in ("BACKEND_IMAGE", "FRONTEND_IMAGE", "POSTGRES_IMAGE"):
+        for name in ("BACKEND_IMAGE", "FRONTEND_IMAGE", "POSTGRES_IMAGE", "REDIS_IMAGE"):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
                 deploy, log, environment = self.prepare(directory)
                 config = deploy / ".env.production"
@@ -339,7 +342,7 @@ exit "${VERIFY_EXIT:-0}"
                 self.assertFalse(log.exists())
 
     def test_rejects_ambiguous_images_before_running_compose(self):
-        for name in ("BACKEND_IMAGE", "FRONTEND_IMAGE", "POSTGRES_IMAGE"):
+        for name in ("BACKEND_IMAGE", "FRONTEND_IMAGE", "POSTGRES_IMAGE", "REDIS_IMAGE"):
             for invalid in ("duplicate", "empty"):
                 with self.subTest(name=name, invalid=invalid), tempfile.TemporaryDirectory() as directory:
                     deploy, log, environment = self.prepare(directory)
@@ -376,6 +379,21 @@ exit "${VERIFY_EXIT:-0}"
                 "POSTGRES_IMAGE=next-postgres",
                 (deploy / "release-images.next.env").read_text(encoding="utf-8"),
             )
+
+    def test_rollback_preserves_previous_redis_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deploy, log, environment = self.prepare(directory, current=True, bootstrap_current=False)
+            state = deploy / "release-images.env"
+            state.write_text(state.read_text(encoding="utf-8") + "REDIS_IMAGE=current-redis\n", encoding="utf-8")
+            result = self.run_deploy(deploy, environment, bootstrap=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("ps -q redis", log.read_text(encoding="utf-8"))
+            environment["NEXT_UP_FAIL"] = "1"
+            result = self.run_deploy(deploy, environment)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("rollback completed", result.stderr)
+            self.assertIn("REDIS_IMAGE=current-redis", state.read_text(encoding="utf-8"))
+            self.assertIn("REDIS_IMAGE=next-redis", (deploy / "release-images.next.env").read_text(encoding="utf-8"))
 
     def test_existing_release_requires_explicit_config_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:

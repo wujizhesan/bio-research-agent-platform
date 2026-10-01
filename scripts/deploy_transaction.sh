@@ -121,12 +121,16 @@ write_release_state() {
   local output_path=$3
   local bundle_path=$4
   local monitoring_dir=$5
-  local backend_image frontend_image postgres_image release_tag git_sha bundle_digest secret_name expected_bundle_digest
+  local backend_image frontend_image postgres_image redis_image release_tag git_sha bundle_digest secret_name expected_bundle_digest
   backend_image=$(environment_value "$image_path" BACKEND_IMAGE)
   frontend_image=$(environment_value "$image_path" FRONTEND_IMAGE)
   postgres_image=
   if grep -q '^POSTGRES_IMAGE=' "$image_path"; then
     postgres_image=$(environment_value "$image_path" POSTGRES_IMAGE)
+  fi
+  redis_image=
+  if grep -q '^REDIS_IMAGE=' "$image_path"; then
+    redis_image=$(environment_value "$image_path" REDIS_IMAGE)
   fi
   release_tag=$(environment_value "$image_path" RELEASE_TAG)
   git_sha=$(environment_value "$image_path" GIT_SHA)
@@ -145,6 +149,9 @@ write_release_state() {
     "$bundle_path" "$bundle_digest" "$monitoring_dir" >> "$output_path"
   if test -n "$postgres_image"; then
     printf 'POSTGRES_IMAGE=%s\n' "$postgres_image" >> "$output_path"
+  fi
+  if test -n "$redis_image"; then
+    printf 'REDIS_IMAGE=%s\n' "$redis_image" >> "$output_path"
   fi
   for secret_name in "${release_secret_names[@]}"; do
     printf '%s_SHA256=%s\n' "$secret_name" \
@@ -199,12 +206,17 @@ verify_live_release() {
   if grep -q '^POSTGRES_IMAGE=' release-images.env; then
     services+=(db)
   fi
+  if grep -q '^REDIS_IMAGE=' release-images.env; then
+    services+=(redis)
+  fi
   for service in "${services[@]}"; do
     expected_image=$(environment_value release-images.env BACKEND_IMAGE)
     if test "$service" = web; then
       expected_image=$(environment_value release-images.env FRONTEND_IMAGE)
     elif test "$service" = db; then
       expected_image=$(environment_value release-images.env POSTGRES_IMAGE)
+    elif test "$service" = redis; then
+      expected_image=$(environment_value release-images.env REDIS_IMAGE)
     fi
     hash_line=$("${bootstrap_compose[@]}" config --hash "$service")
     expected_hash=${hash_line#"$service "}
@@ -283,7 +295,7 @@ if grep -Eq '^(POSTGRES_PASSWORD|CADD_JWT_SECRET|RLS_CONTEXT_SIGNING_KEY|PLUGIN_
   echo "production secrets must be supplied through *_FILE" >&2
   exit 1
 fi
-if grep -Eq '^(BACKEND_IMAGE|FRONTEND_IMAGE|POSTGRES_IMAGE|RELEASE_TAG|GIT_SHA|RELEASE_CONFIG_VERSION|RELEASE_BUNDLE_DIR|RELEASE_BUNDLE_SHA256|MONITORING_CONFIG_DIR|[A-Z0-9_]+_SHA256)=' .env.production; then
+if grep -Eq '^(BACKEND_IMAGE|FRONTEND_IMAGE|POSTGRES_IMAGE|REDIS_IMAGE|RELEASE_TAG|GIT_SHA|RELEASE_CONFIG_VERSION|RELEASE_BUNDLE_DIR|RELEASE_BUNDLE_SHA256|MONITORING_CONFIG_DIR|[A-Z0-9_]+_SHA256)=' .env.production; then
   echo "image and release-state fields must not be set in .env.production" >&2
   exit 1
 fi

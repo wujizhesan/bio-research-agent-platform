@@ -77,7 +77,7 @@ class SupplyChainConfigurationTests(unittest.TestCase):
             self.assertRegex(reference, SHA256_REFERENCE)
 
     def test_dockerfile_bases_use_digests(self):
-        for relative_path in ("Dockerfile", "frontend/Dockerfile", "Dockerfile.postgres"):
+        for relative_path in ("Dockerfile", "frontend/Dockerfile", "Dockerfile.postgres", "Dockerfile.redis"):
             content = (ROOT / relative_path).read_text(encoding="utf-8")
             references = re.findall(r"^FROM\s+([^\s]+)", content, re.MULTILINE)
             self.assertTrue(references)
@@ -132,6 +132,8 @@ class SupplyChainConfigurationTests(unittest.TestCase):
             if image["name"] == "postgres"
         )
         self.assertEqual(postgres["dockerfile"], "./Dockerfile.postgres")
+        redis = next(image for image in release["jobs"]["publish"]["strategy"]["matrix"]["include"] if image["name"] == "redis")
+        self.assertEqual(redis["dockerfile"], "./Dockerfile.redis")
 
     def test_production_deployment_requires_approval_and_verified_digests(self):
         workflow = yaml.safe_load(
@@ -164,6 +166,7 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn("--no-build", deployment_script)
         self.assertIn("verify_public_deployment", deployment_script)
         self.assertIn("POSTGRES_DIGEST", json.dumps(verify))
+        self.assertIn("REDIS_DIGEST", json.dumps(verify))
         for name in ("Verify release provenance", "Verify release SBOM attestations"):
             step = next(step for step in verify["steps"] if step["name"] == name)
             self.assertIn('"$POSTGRES_IMAGE"', step["run"])
@@ -171,6 +174,8 @@ class SupplyChainConfigurationTests(unittest.TestCase):
                 step["env"]["POSTGRES_IMAGE"],
                 "${{ steps.images.outputs.postgres_image }}",
             )
+            self.assertIn('"$REDIS_IMAGE"', step["run"])
+            self.assertEqual(step["env"]["REDIS_IMAGE"], "${{ steps.images.outputs.redis_image }}")
 
         compose = yaml.load(
             (ROOT / "docker-compose.deploy.yml").read_text(encoding="utf-8"),
@@ -180,6 +185,9 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertEqual(compose["services"]["db"]["image"], "${POSTGRES_IMAGE:?required}")
         self.assertEqual(compose["services"]["db"]["pull_policy"], "always")
         self.assertIsNone(compose["services"]["db"]["build"])
+        self.assertEqual(compose["services"]["redis"]["image"], "${REDIS_IMAGE:?required}")
+        self.assertEqual(compose["services"]["redis"]["pull_policy"], "always")
+        self.assertIsNone(compose["services"]["redis"]["build"])
         self.assertEqual(compose["services"]["worker"]["image"], "${BACKEND_IMAGE:?required}")
         self.assertEqual(
             compose["services"]["artifact-maintenance"]["image"],
@@ -478,7 +486,7 @@ class SupplyChainConfigurationTests(unittest.TestCase):
             {"redis", "postgres", "clamav", "prometheus", "alertmanager"},
         )
         for name, image in baseline["images"].items():
-            if name == "postgres":
+            if name in {"postgres", "redis"}:
                 self.assertEqual(image["exceptions"], [])
                 continue
             self.assertRegex(image["image_ref"], SHA256_REFERENCE)
@@ -504,10 +512,27 @@ class SupplyChainConfigurationTests(unittest.TestCase):
             self.assertEqual(db["image"], postgres["image_ref"])
             self.assertEqual(db["build"]["dockerfile"], postgres["dockerfile"])
         services = workflow["jobs"]["services"]
-        self.assertNotIn("postgres", services["services"])
+        self.assertNotIn("postgres", services.get("services", {}))
         start = next(step for step in services["steps"] if step["name"] == "Build and start patched PostgreSQL")
         self.assertIn(postgres["image_ref"], start["run"])
         self.assertIn("/proc/1", start["run"])
+
+    def test_redis_fix_is_used_by_all_stacks_and_scanned_without_exceptions(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+        redis = next(image for image in workflow["jobs"]["container"]["strategy"]["matrix"]["include"] if image["name"] == "redis")
+        self.assertEqual(redis["dockerfile"], "Dockerfile.redis")
+        self.assertEqual(redis["exit_code"], "1")
+        self.assertNotIn("pull_image", redis)
+        baseline = json.loads((ROOT / "security/container-vulnerability-baseline.json").read_text(encoding="utf-8"))
+        self.assertEqual(baseline["images"]["redis"], {"image_ref": redis["image_ref"], "exceptions": []})
+        for name in ("docker-compose.yml", "docker-compose.recovery.yml"):
+            service = yaml.safe_load((ROOT / name).read_text(encoding="utf-8"))["services"]["redis"]
+            self.assertEqual(service["image"], redis["image_ref"])
+            self.assertEqual(service["build"]["dockerfile"], redis["dockerfile"])
+            self.assertEqual(service["pull_policy"], "build")
+        self.assertNotIn("services", workflow["jobs"]["services"])
+        step = next(step for step in workflow["jobs"]["services"]["steps"] if step["name"] == "Build and start patched Redis")
+        self.assertIn(redis["image_ref"], step["run"])
 
     def test_dependency_license_and_signature_policy_is_enforced(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")

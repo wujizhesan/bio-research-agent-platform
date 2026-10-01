@@ -95,16 +95,6 @@ jobs:
     name: PostgreSQL, Redis and migrations
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    services:
-      redis:
-        image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 20
     env:
       CADD_SKIP_ASSETS: '1'
       AUTO_CREATE_SCHEMA: 'false'
@@ -121,6 +111,22 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Build and start patched Redis
+        run: |
+          docker build --file Dockerfile.redis --tag bio-research-redis:7.4.11-openssl3.3.7-r2 .
+          docker run -d --name bioagent-ci-redis -p 6379:6379 \
+            --health-cmd 'redis-cli ping' \
+            --health-interval 5s --health-timeout 3s --health-retries 20 \
+            bio-research-redis:7.4.11-openssl3.3.7-r2
+          for attempt in {1..60}; do
+            if [ "$(docker inspect --format '{{.State.Health.Status}}' bioagent-ci-redis)" = healthy ]; then
+              docker exec bioagent-ci-redis sh -ec 'test "$(stat -c %u /proc/1)" = "$(id -u redis)"'
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs bioagent-ci-redis
+          exit 1
       - name: Build and start patched PostgreSQL
         run: |
           docker build --file Dockerfile.postgres --tag bio-research-postgres:16.15-gosu1.19-r5 .
@@ -437,11 +443,13 @@ jobs:
             frontend/playwright-report
             frontend/test-results
           if-no-files-found: ignore
-      - name: Clean up integration PostgreSQL
+      - name: Clean up integration PostgreSQL and Redis
         if: always()
         run: |
           docker logs bioagent-ci-postgres || true
           docker rm -f bioagent-ci-postgres || true
+          docker logs bioagent-ci-redis || true
+          docker rm -f bioagent-ci-redis || true
 
   secure-plugin-e2e:
     name: Secure full-stack container execution
@@ -925,10 +933,11 @@ jobs:
             dockerfile: frontend/Dockerfile
             exit_code: '1'
           - name: redis
-            image_ref: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
-            pull_image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+            image_ref: bio-research-redis:7.4.11-openssl3.3.7-r2
+            build_context: .
+            dockerfile: Dockerfile.redis
             baseline_name: redis
-            exit_code: '0'
+            exit_code: '1'
           - name: postgres
             image_ref: bio-research-postgres:16.15-gosu1.19-r5
             build_context: .

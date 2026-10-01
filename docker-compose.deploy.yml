@@ -1,4 +1,9 @@
 services:
+  redis:
+    image: ${REDIS_IMAGE:?required}
+    pull_policy: always
+    build: !reset null
+
   db:
     image: ${POSTGRES_IMAGE:?required}
     pull_policy: always
