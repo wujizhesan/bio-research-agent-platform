@@ -521,7 +521,7 @@ pydantic-settings==2.15.0
     #   mcp
 pydeck==0.9.3
     # via streamlit
-pyjwt==2.13.0
+pyjwt==2.15.0
     # via
     #   bio-research-agent-platform
     #   chainlit
