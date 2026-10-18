@@ -1,4 +1,4 @@
-FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea AS builder
+FROM python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170 AS builder
 
 WORKDIR /build
 ARG UV_VERSION=0.11.30
@@ -9,7 +9,7 @@ RUN python -m pip install --no-cache-dir "uv==$UV_VERSION" \
     && uv sync --locked --no-dev --extra ui --no-install-project \
     && rm -rf /root/.cache/uv
 
-FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea AS runtime
+FROM python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170 AS runtime
 
 ARG INSTALL_DESEQ2=0
 ARG APP_UID=1000
