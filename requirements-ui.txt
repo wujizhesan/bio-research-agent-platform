@@ -208,7 +208,7 @@ numpy==2.5.3 ; python_full_version >= '3.12'
     #   scikit-learn
     #   scipy
     #   streamlit
-opentelemetry-api==1.44.0
+opentelemetry-api==1.45.1
     # via
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-exporter-otlp-proto-http
