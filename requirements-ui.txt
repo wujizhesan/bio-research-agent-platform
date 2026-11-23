@@ -156,7 +156,7 @@ lazify==0.4.0
     # via chainlit
 literalai==0.1.201
     # via chainlit
-mako==1.4.1
+mako==1.4.2
     # via alembic
 markupsafe==3.0.3
     # via
